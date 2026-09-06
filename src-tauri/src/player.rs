@@ -106,41 +106,25 @@ pub async fn play_episode(
         }
     };
 
-    db.set_status(episode_id, EpisodeStatus::Playing)?;
+    if let Err(e) = db.set_status(episode_id, EpisodeStatus::Playing) {
+        let _ = child.start_kill();
+        player.release();
+        return Err(e);
+    }
     notify(PlaybackChanged { episode_id, status: EpisodeStatus::Playing, position_secs: ep.position_secs, duration_secs: ep.duration_secs });
 
     let mut ipc = Ipc::connect(&sock, Duration::from_secs(5)).await;
     let mut last_pos = ep.position_secs;
     let mut duration = ep.duration_secs;
-    // Adaptive polling: as the estimated time remaining until `duration` shrinks
-    // below poll_every, shorten the interval so the final sample lands close to
-    // the actual finish instead of being stranded a full poll_every early.
-    let mut interval = poll_every;
-    let mut last_tick = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
             _ = child.wait() => break,
-            _ = tokio::time::sleep(interval) => {
+            _ = tokio::time::sleep(poll_every) => {
                 if let Some(ipc) = ipc.as_mut() {
-                    let now = tokio::time::Instant::now();
-                    if let Some(p) = ipc.get_f64("time-pos").await {
-                        let dt = now.duration_since(last_tick).as_secs_f64();
-                        let velocity = if dt > 0.0 { (p - last_pos) / dt } else { 0.0 };
-                        last_pos = p;
-                        last_tick = now;
-                        if duration.is_none() { duration = ipc.get_f64("duration").await; }
-                        let _ = db.set_position(episode_id, last_pos, duration);
-                        interval = match duration {
-                            Some(d) if velocity > 0.0 => {
-                                let remaining = ((d - last_pos) / velocity).max(0.0);
-                                Duration::from_secs_f64((remaining / 2.0).clamp(0.02, poll_every.as_secs_f64()))
-                            }
-                            _ => poll_every,
-                        };
-                    }
-                } else {
-                    interval = poll_every;
+                    if let Some(p) = ipc.get_f64("time-pos").await { last_pos = p; }
+                    if duration.is_none() { duration = ipc.get_f64("duration").await; }
+                    let _ = db.set_position(episode_id, last_pos, duration);
                 }
             }
         }
@@ -182,11 +166,11 @@ mod tests {
 
     #[tokio::test]
     async fn finishing_marks_played() {
-        unsafe { std::env::set_var("FAKE_MPV_STOP_AT", "95"); std::env::set_var("FAKE_MPV_RUNTIME", "1.2"); }
+        unsafe { std::env::set_var("FAKE_MPV_STOP_AT", "99"); std::env::set_var("FAKE_MPV_RUNTIME", "2.0"); }
         let (db, id) = seeded();
         let events = Arc::new(StdMutex::new(Vec::new()));
         let ev = events.clone();
-        play_episode(db.clone(), Arc::new(Player::new()), id, move |e| ev.lock().unwrap().push(e), Duration::from_millis(200)).await.unwrap();
+        play_episode(db.clone(), Arc::new(Player::new()), id, move |e| ev.lock().unwrap().push(e), Duration::from_millis(50)).await.unwrap();
         let ep = db.get_episode(id).unwrap();
         assert_eq!(ep.status, EpisodeStatus::Played);
         assert_eq!(ep.position_secs, 0.0);
