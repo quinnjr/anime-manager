@@ -23,7 +23,26 @@ pub fn is_video(path: &Path) -> bool {
 pub fn scan_dir(root: &Path, on_file: &mut dyn FnMut(&Path)) -> (Vec<RawFile>, Vec<String>) {
     let mut files = Vec::new();
     let mut errors = Vec::new();
-    for entry in WalkDir::new(root).follow_links(true) {
+    let is_hidden = |e: &walkdir::DirEntry| {
+        e.depth() > 0 && e.file_name().to_str().map(|n| n.starts_with('.')).unwrap_or(false)
+    };
+    // Guard against a directory tree that nests itself under the same name (seen on SMB
+    // shares where the server resolves a symlink loop into plain directories): allow
+    // "Show/Show" but refuse a third identical consecutive component.
+    let is_self_nested = |e: &walkdir::DirEntry| {
+        if !e.file_type().is_dir() { return false; }
+        let name = e.file_name();
+        let mut anc = e.path().ancestors().skip(1);
+        let parent = anc.next().and_then(|p| p.file_name());
+        let grand = anc.next().and_then(|p| p.file_name());
+        parent == Some(name) && grand == Some(name)
+    };
+    let walker = WalkDir::new(root)
+        .follow_links(true)
+        .max_depth(24)
+        .into_iter()
+        .filter_entry(|e| !is_hidden(e) && !is_self_nested(e));
+    for entry in walker {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => { errors.push(e.to_string()); continue; }
@@ -81,5 +100,34 @@ mod tests {
         let (files, errors) = scan_dir(Path::new("/definitely/not/here"), &mut |_| {});
         assert!(files.is_empty());
         assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn skips_hidden_directories_and_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("Show/.unwanted")).unwrap();
+        fs::write(dir.path().join("Show/.unwanted/Show - 03.mkv"), b"x").unwrap();
+        fs::write(dir.path().join("Show/.hidden.mkv"), b"x").unwrap();
+        fs::write(dir.path().join("Show/Show - 01.mkv"), b"x").unwrap();
+        let (files, errors) = scan_dir(dir.path(), &mut |_| {});
+        assert!(errors.is_empty(), "{errors:?}");
+        let names: Vec<_> = files.iter().map(|f| f.stem.clone()).collect();
+        assert_eq!(names, vec!["Show - 01"]);
+    }
+
+    #[test]
+    fn stops_descending_into_self_nesting_directory() {
+        // A NAS share that exposes "K-On!/K-On!/K-On!/K-On!/..." (a resolved symlink loop
+        // surfaced as ordinary directories) must not be walked forever. Two identical
+        // consecutive names are normal ("Show/Show/ep.mkv"); a third is treated as a loop.
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir.path().join("K-On!/K-On!/K-On!/K-On!/K-On!");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(dir.path().join("K-On!/K-On!/K-On! - 01.mkv"), b"x").unwrap();
+        fs::write(dir.path().join("K-On!/K-On!/K-On!/K-On! - 01.mkv"), b"x").unwrap();
+        fs::write(deep.join("K-On! - 01.mkv"), b"x").unwrap();
+        let (files, _) = scan_dir(dir.path(), &mut |_| {});
+        assert_eq!(files.len(), 1);
+        assert!(files[0].path.ends_with("K-On!/K-On!/K-On! - 01.mkv"));
     }
 }
