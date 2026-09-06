@@ -15,7 +15,7 @@ static BRACKET: Lazy<Regex> = Lazy::new(|| Regex::new(r"\[([^\]]*)\]|\(([^)]*)\)
 static CRC: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[0-9A-Fa-f]{8}$").unwrap());
 static RES: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\b(\d{3,4}p|\d{3,4}x\d{3,4})\b").unwrap());
 static SPECIAL: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)\b(NCOP|NCED|OVA|OAD|Special|Extra|Preview)").unwrap());
+    Lazy::new(|| Regex::new(r"(?i)\b(NCOP|NCED|OVA|OAD|Special|Extra|Preview)(?:\s|\d|$)").unwrap());
 static SXXEXX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bS(\d{1,2})[ ._]?E(\d{1,4})(?:v\d)?\b").unwrap());
 static NXNN: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\b(\d{1,2})x(\d{1,4})(?:v\d)?\b").unwrap());
 static DASH_EP: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\s-\s(\d{1,4})(?:v\d)?\b").unwrap());
@@ -275,5 +275,12 @@ mod tests {
     #[test]
     fn three_digit_episode() {
         assert_eq!(p("One Piece - 1071").episode, 1071);
+    }
+
+    #[test]
+    fn special_marker_must_be_a_whole_word() {
+        let r = p("Extraordinary You - 04");
+        assert_eq!(r.title, "Extraordinary You");
+        assert_eq!((r.season, r.episode), (1, 4));
     }
 }
