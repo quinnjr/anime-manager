@@ -18,13 +18,24 @@
   const season = $derived(show?.seasons[seasonIdx] ?? null);
 
   async function load() {
-    try { show = await api.getShow(id); if (seasonIdx >= show.seasons.length) seasonIdx = 0; } catch (e) { toasts.error(e); }
+    try {
+      show = await api.getShow(id);
+      if (seasonIdx >= show.seasons.length) seasonIdx = 0;
+      const len = show.seasons[seasonIdx]?.episodes.length ?? 0;
+      if (highlight >= len) highlight = Math.max(0, len - 1);
+    } catch (e) { toasts.error(e); }
   }
 
   function openRename(t: RenameTarget) { renameTarget = t; renameOpen = true; }
 
-  onMount(() => {
+  $effect(() => {
+    id; // track
+    seasonIdx = 0;
+    highlight = 0;
     load();
+  });
+
+  onMount(() => {
     const us = [onEvent('show-updated', load), onEvent('library-changed', load), onEvent('playback-changed', load)];
     const key = (e: KeyboardEvent) => {
       if (!season || rematchOpen || renameOpen) return;
