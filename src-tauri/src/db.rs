@@ -307,7 +307,7 @@ pub fn run_scan(db: &Db, on_progress: &mut dyn FnMut(ScanProgress)) -> Result<Sc
     for (i, f) in all_files.iter().enumerate() {
         summary.files_seen += 1;
         on_progress(ScanProgress { done: i + 1, total, current_path: f.path.to_string_lossy().to_string() });
-        let Some(parsed) = parser::parse(&f.stem, &f.parent_dir) else {
+        let Some(parsed) = parser::parse(&f.stem, &f.dirs) else {
             summary.errors.push(format!("could not parse: {}", f.path.display()));
             continue;
         };
@@ -362,7 +362,7 @@ mod tests {
         ParsedName { title: title.into(), season, episode: ep, release_group: Some("G".into()), resolution: Some("1080p".into()), crc: None }
     }
     fn rf(path: &str, size: u64, mtime: i64) -> RawFile {
-        RawFile { path: PathBuf::from(path), size, mtime, stem: "".into(), parent_dir: "".into() }
+        RawFile { path: PathBuf::from(path), size, mtime, stem: "".into(), dirs: vec![] }
     }
 
     #[test]

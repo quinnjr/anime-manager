@@ -10,7 +10,8 @@ pub struct RawFile {
     pub size: u64,
     pub mtime: i64,
     pub stem: String,
-    pub parent_dir: String,
+    /// Ancestor directory names, nearest first, up to and including the scan root.
+    pub dirs: Vec<String>,
 }
 
 pub fn is_video(path: &Path) -> bool {
@@ -60,7 +61,10 @@ pub fn scan_dir(root: &Path, on_file: &mut dyn FnMut(&Path)) -> (Vec<RawFile>, V
         on_file(&path);
         files.push(RawFile {
             stem: path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string(),
-            parent_dir: path.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()).unwrap_or("").to_string(),
+            dirs: path.ancestors().skip(1)
+                .take_while(|a| a.starts_with(root) )
+                .filter_map(|a| a.file_name().and_then(|s| s.to_str()).map(str::to_string))
+                .collect(),
             size: meta.len(),
             mtime,
             path,
@@ -91,7 +95,7 @@ mod tests {
         assert_eq!(seen, 2);
         let f = files.iter().find(|f| f.stem == "Show - 01").unwrap();
         assert_eq!(f.size, 3);
-        assert_eq!(f.parent_dir, "Season 2");
+        assert_eq!(f.dirs[0], "Season 2");
         assert!(f.mtime > 0);
     }
 

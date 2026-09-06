@@ -104,7 +104,7 @@ mod tests {
         let meta = fs::metadata(&path).unwrap();
         let mtime = meta.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
         let p = ParsedName { title: title.into(), season: 1, episode: ep, release_group: None, resolution: None, crc: None };
-        db.upsert_episode(&p, &RawFile { path: path.clone(), size: 1 + ep as u64, mtime, stem: "".into(), parent_dir: "".into() }).unwrap();
+        db.upsert_episode(&p, &RawFile { path: path.clone(), size: 1 + ep as u64, mtime, stem: "".into(), dirs: vec![] }).unwrap();
         db.with(|c| Ok(c.query_row("SELECT id FROM episodes WHERE path=?1", [path.to_str().unwrap()], |r| r.get(0))?)).unwrap()
     }
 
@@ -196,7 +196,7 @@ mod tests {
         fs::write(&path, b"xyz").unwrap();
         let mtime = fs::metadata(&path).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
         let p = ParsedName { title: "Show".into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
-        db.upsert_episode(&p, &RawFile { path: path.clone(), size: 3, mtime, stem: "".into(), parent_dir: "".into() }).unwrap();
+        db.upsert_episode(&p, &RawFile { path: path.clone(), size: 3, mtime, stem: "".into(), dirs: vec![] }).unwrap();
         let show_id = db.list_shows("").unwrap()[0].id;
         let plan = preview(&db, RenameTarget::Show(show_id)).unwrap();
         assert_eq!(plan.entries.len(), 2);

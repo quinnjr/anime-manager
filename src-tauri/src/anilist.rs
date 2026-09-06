@@ -129,7 +129,7 @@ mod tests {
         Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(body())).mount(&server).await;
         let db = Arc::new(Db::open_memory().unwrap());
         let p = |t: &str| ParsedName { title: t.into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
-        let f = |p: &str| RawFile { path: p.into(), size: 1, mtime: 1, stem: "".into(), parent_dir: "".into() };
+        let f = |p: &str| RawFile { path: p.into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
         db.upsert_episode(&p("frieren"), &f("/a/1.mkv")).unwrap();
         let matched = Arc::new(std::sync::Mutex::new(Vec::new()));
         let m = matched.clone();

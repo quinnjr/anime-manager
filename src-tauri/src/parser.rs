@@ -14,10 +14,11 @@ pub struct ParsedName {
 static BRACKET: Lazy<Regex> = Lazy::new(|| Regex::new(r"\[([^\]]*)\]|\(([^)]*)\)").unwrap());
 static CRC: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[0-9A-Fa-f]{8}$").unwrap());
 static RES: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\b(\d{3,4}p|\d{3,4}x\d{3,4})\b").unwrap());
+const SPECIAL_WORDS: &str = r"NCOP|NCED|NCI|Creditless\s?(?:Opening|Ending)|Clean\s?(?:Opening|Ending)|OVA|OAD|OP|ED|SP|Special|Extra|Preview|Recap|Menu|CM|PV|Teaser|Trailer|CharSong|Eyecatch(?:es)?";
 static SPECIAL: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)(?:\b|\d)(NCOP|NCED|OVA|OAD|SP|Special|Extra|Preview)(?:\s|\d|$)").unwrap());
+    Lazy::new(|| Regex::new(&format!(r"(?i)(?:\b|\d)({SPECIAL_WORDS})(?:\s|\d|v\d|$)")).unwrap());
 static SPECIAL_NUM: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)(?:\b|\d)(?:NCOP|NCED|OVA|OAD|SP|Special|Extra|Preview)\s?(\d{1,3})\b").unwrap());
+    Lazy::new(|| Regex::new(&format!(r"(?i)(?:\b|\d)(?:{SPECIAL_WORDS})\s?(\d{{1,3}})\b")).unwrap());
 static SXXEXX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bS(\d{1,2})[ ._]?E(\d{1,4})(?:v\d)?\b").unwrap());
 static NXNN: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\b(\d{1,2})x(\d{1,4})(?:v\d)?\b").unwrap());
 static DASH_EP: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\s-\s(\d{1,4})(?:v\d)?\b").unwrap());
@@ -31,10 +32,15 @@ static SEASON_SUFFIX: Lazy<Regex> = Lazy::new(|| {
         .unwrap()
 });
 static ROMAN_SUFFIX: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+(II|III|IV|V|VI|VII|VIII|IX)\s*$").unwrap());
-static DIR_SEASON: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^(?:Season\s*|S)(\d{1,2})$").unwrap());
+static DIR_SEASON: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^(?:Season\s*|S)(\d{1,2})(?:[^0-9]|$)").unwrap());
 static GENERIC_DIR: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)^(?:Extras?|SPs?|Specials?|NCs?|Bonus|OVAs?|OADs?|Movies?|\..*)$|^(?:Season\s*\d+|S\d+)\b").unwrap()
+    Regex::new(r"(?i)^(?:Extras?|SPs?|Specials?|NCs?|Bonus|OVAs?|OADs?|Movies?|The Movie|\..*)$|^(?:Season\s*\d+|S\d+)(?:[^0-9]|$)").unwrap()
 });
+/// Release-metadata words that commonly trail a title in folder or file names.
+static NOISE_TAIL: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:[\s\-]+(?:Complete|Batch|BD-?Rip|BD|Blu-?ray|WEB-?DL|WEB-?Rip|WEB|Dual[\s-]?Audio|x264|x265|HEVC|AVC|H\.?26[45]|AAC|FLAC|OPUS|AC3|10-?bits?|Hi10P?|DVD-?Rip|DVD|Uncensored|Subbed|Dubbed|Eng(?:lish)?\s*Subs?|Multi-?Subs?|Remux|\d{3,4}p|\(?(?:19|20)\d\d\)?))+\s*$").unwrap()
+});
+static JUNK_STEM: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^\s*(?:sample|test)\s*$").unwrap());
 static WS: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
 
 /// Bare 4-digit numbers in the 1900–2099 range are release years, not episode numbers.
@@ -52,6 +58,8 @@ fn roman(s: &str) -> u32 {
 fn clean_title(s: &str) -> String {
     let s = s.replace(['_', '.'], " ");
     let s = WS.replace_all(&s, " ");
+    let s = s.trim().trim_matches(|c| c == '-' || c == ' ').trim();
+    let s = NOISE_TAIL.replace(s, "");
     s.trim().trim_matches(|c| c == '-' || c == ' ').trim().to_string()
 }
 
@@ -75,31 +83,48 @@ fn strip_season_suffix(title: &mut String) -> Option<u32> {
     }
 }
 
-/// Derive a show title from the parent directory name when the file stem carries only an
-/// episode marker (e.g. "S01E07-Title" or "01 - Title"). Generic folders such as "Extras",
-/// "Season 1" or hidden ".unwanted" yield None.
-fn title_from_parent(parent_dir: &str) -> Option<(String, Option<u32>)> {
-    let parent = parent_dir.trim();
-    if parent.is_empty() || GENERIC_DIR.is_match(parent) { return None; }
-    let mut work = BRACKET.replace_all(parent, " ").to_string();
-    if let Some(m) = RES.find(&work.clone()) { work.truncate(m.start()); }
-    let mut title = clean_title(&work);
-    let season = strip_season_suffix(&mut title);
-    if title.is_empty() || GENERIC_DIR.is_match(&title) { return None; }
-    Some((title, season))
+/// Derive a show title from the nearest ancestor directory that is not a generic folder
+/// ("Extras", "Season 1", ".unwanted", ...). Used when the file stem carries only an episode
+/// marker such as "S01E07-Title" or "01 - Title".
+fn title_from_dirs(dirs: &[String]) -> Option<(String, Option<u32>)> {
+    for d in dirs {
+        let d = d.trim();
+        if d.is_empty() || GENERIC_DIR.is_match(d) { continue; }
+        let mut work = BRACKET.replace_all(d, " ").to_string();
+        if let Some(m) = RES.find(&work.clone()) { work.truncate(m.start()); }
+        let mut title = clean_title(&work);
+        let season = strip_season_suffix(&mut title);
+        if title.is_empty() || GENERIC_DIR.is_match(&title) { continue; }
+        return Some((title, season));
+    }
+    None
 }
 
-pub fn parse(stem: &str, parent_dir: &str) -> Option<ParsedName> {
-    // Pass 1: bracket tokens → group / crc / resolution
+fn season_from_dirs(dirs: &[String]) -> Option<u32> {
+    dirs.iter().find_map(|d| DIR_SEASON.captures(d.trim()).and_then(|c| c[1].parse().ok()))
+}
+
+/// Parse a video file stem. `dirs` are the ancestor directory names, nearest first, up to and
+/// including the scan root; they supply the season ("Season 2") and, when the stem has no title
+/// of its own, the show name.
+pub fn parse(stem: &str, dirs: &[String]) -> Option<ParsedName> {
+    if JUNK_STEM.is_match(stem) { return None; }
+    // Pass 1: bracket tokens → group / crc / resolution / special marker
     let mut release_group = None;
     let mut crc = None;
     let mut resolution = None;
+    let mut bracket_special: Option<Option<u32>> = None;
     for cap in BRACKET.captures_iter(stem) {
         let inner = cap.get(1).or_else(|| cap.get(2)).map(|m| m.as_str().trim()).unwrap_or("");
         if inner.is_empty() { continue; }
         if CRC.is_match(inner) { crc.get_or_insert(inner.to_string()); continue; }
         let spaced = inner.replace('_', " ");
         if let Some(m) = RES.find(&spaced) { resolution.get_or_insert(m.as_str().to_string()); continue; }
+        if SPECIAL.is_match(&spaced) && SPECIAL.find(&spaced).map(|m| m.start() == 0).unwrap_or(false) {
+            let n = SPECIAL_NUM.captures(&spaced).and_then(|c| c[1].parse().ok());
+            bracket_special.get_or_insert(n);
+            continue;
+        }
         if release_group.is_none() && cap.get(1).is_some() { release_group = Some(inner.to_string()); }
     }
     let work = BRACKET.replace_all(stem, " ").to_string();
@@ -113,7 +138,7 @@ pub fn parse(stem: &str, parent_dir: &str) -> Option<ParsedName> {
     // Strip a trailing "1080p WEB x264"-style tail: everything from the resolution token onward.
     if let Some(m) = RES.find(&work.clone()) { work.truncate(m.start()); }
 
-    let is_special = SPECIAL.is_match(&work);
+    let is_special = bracket_special.is_some() || SPECIAL.is_match(&work);
 
     // Pass 2: season/episode markers
     let mut season: Option<u32> = None;
@@ -153,9 +178,8 @@ pub fn parse(stem: &str, parent_dir: &str) -> Option<ParsedName> {
 
     // Specials: episode number is whatever digits trail the special marker, else 1
     if is_special && episode.is_none() {
-        episode = Some(1);
+        episode = bracket_special.flatten().or(Some(1));
     }
-    let episode = episode?;
 
     let mut title = work[..title_end].to_string();
     if is_special && let Some(m) = SPECIAL.find(&title) {
@@ -164,23 +188,31 @@ pub fn parse(stem: &str, parent_dir: &str) -> Option<ParsedName> {
 
     // Pass 3: season suffix in title
     let mut title = clean_title(&title);
+    let mut season_from_bare_s = false;
     if season.is_none() {
+        let had_s = SEASON_SUFFIX.captures(&title).map(|c| c.get(4).is_some()).unwrap_or(false);
         season = strip_season_suffix(&mut title);
+        season_from_bare_s = had_s && season.is_some();
     }
 
-    // Pass 4: stem carried no title → fall back to the parent directory name
+    // A bare "Show - S3" with no episode anywhere is a numbered special, not season 3.
+    let (is_special, episode) = match episode {
+        Some(e) => (is_special, e),
+        None if season_from_bare_s => (true, season.take().unwrap()),
+        // Title-only file (movie, one-shot): a single-episode show.
+        None if !title.is_empty() => (is_special, 1),
+        None => (is_special, 1),
+    };
+
+    // Pass 4: stem carried no title → fall back to the ancestor directories
     if title.is_empty() {
-        let (t, s) = title_from_parent(parent_dir)?;
+        let (t, s) = title_from_dirs(dirs)?;
         title = t;
         if season.is_none() { season = s; }
     }
 
     // Pass 5: fallbacks
-    let season = if is_special {
-        0
-    } else {
-        season.or_else(|| DIR_SEASON.captures(parent_dir.trim()).and_then(|c| c[1].parse().ok())).unwrap_or(1)
-    };
+    let season = if is_special { 0 } else { season.or_else(|| season_from_dirs(dirs)).unwrap_or(1) };
 
     if title.is_empty() { return None; }
 
@@ -191,7 +223,8 @@ pub fn parse(stem: &str, parent_dir: &str) -> Option<ParsedName> {
 mod tests {
     use super::*;
 
-    fn p(stem: &str) -> ParsedName { parse(stem, "").expect(stem) }
+    fn p(stem: &str) -> ParsedName { parse(stem, &[]).expect(stem) }
+    fn d(dir: &str) -> Vec<String> { vec![dir.to_string()] }
 
     #[test]
     fn subsplease_style() {
@@ -269,17 +302,17 @@ mod tests {
 
     #[test]
     fn season_from_parent_dir() {
-        let r = parse("Show - 03", "Season 3").unwrap();
+        let r = parse("Show - 03", &d("Season 3")).unwrap();
         assert_eq!(r.season, 3);
-        let r = parse("Show - 03", "S4").unwrap();
+        let r = parse("Show - 03", &d("S4")).unwrap();
         assert_eq!(r.season, 4);
-        let r = parse("Show - 03", "Show Name").unwrap();
+        let r = parse("Show - 03", &d("Show Name")).unwrap();
         assert_eq!(r.season, 1);
     }
 
     #[test]
     fn explicit_season_beats_parent_dir() {
-        let r = parse("Show S02E03", "Season 5").unwrap();
+        let r = parse("Show S02E03", &d("Season 5")).unwrap();
         assert_eq!(r.season, 2);
     }
 
@@ -304,8 +337,15 @@ mod tests {
     }
 
     #[test]
-    fn no_episode_returns_none() {
-        assert!(parse("random_video", "").is_none());
+    fn title_only_file_is_a_single_episode_show() {
+        let r = p("K-ON! The Movie");
+        assert_eq!(r.title, "K-ON! The Movie");
+        assert_eq!((r.season, r.episode), (1, 1));
+        let r = p("[B-Bass] Seitokai Yakuindomo The Movie [2EC03FB6]");
+        assert_eq!(r.title, "Seitokai Yakuindomo The Movie");
+        assert_eq!(r.crc.as_deref(), Some("2EC03FB6"));
+        assert!(parse("sample", &[]).is_none());
+        assert!(parse("random_video", &d("")).is_some());
     }
 
     #[test]
@@ -390,18 +430,18 @@ mod tests {
 
     #[test]
     fn stem_is_only_episode_uses_parent_dir_for_title() {
-        let r = parse("S01E07-Thus, the Sisters Trade Places [F29C75F9]", "Makina-san's a Love Bot S01 1080p Dual Audio WEBRip AAC x265-EMBER").unwrap();
+        let r = parse("S01E07-Thus, the Sisters Trade Places [F29C75F9]", &d("Makina-san's a Love Bot S01 1080p Dual Audio WEBRip AAC x265-EMBER")).unwrap();
         assert_eq!(r.title, "Makina-san's a Love Bot");
         assert_eq!((r.season, r.episode), (1, 7));
-        let r = parse("01- He woke up as a Bagel Girl [darkflux]", "Bagel Girl").unwrap();
+        let r = parse("01- He woke up as a Bagel Girl [darkflux]", &d("Bagel Girl")).unwrap();
         assert_eq!(r.title, "Bagel Girl");
         assert_eq!(r.episode, 1);
-        let r = parse("06 - Operation Seduce Sang Woo [darkflux]", "Bagel Girl").unwrap();
+        let r = parse("06 - Operation Seduce Sang Woo [darkflux]", &d("Bagel Girl")).unwrap();
         assert_eq!(r.episode, 6);
-        let r = parse("05_The Strange Tale of Maison Izumo_KDG", "Sekirei").unwrap();
+        let r = parse("05_The Strange Tale of Maison Izumo_KDG", &d("Sekirei")).unwrap();
         assert_eq!(r.title, "Sekirei");
         assert_eq!(r.episode, 5);
-        let r = parse("[WBDP] 02 - Fever - Campaigning for Love [BD][1080p-FLAC][HEVC] [3B622F30]", "[WBDP] Yagate Kimi ni Naru [BD][1080p-FLAC][HEVC]").unwrap();
+        let r = parse("[WBDP] 02 - Fever - Campaigning for Love [BD][1080p-FLAC][HEVC] [3B622F30]", &d("[WBDP] Yagate Kimi ni Naru [BD][1080p-FLAC][HEVC]")).unwrap();
         assert_eq!(r.title, "Yagate Kimi ni Naru");
         assert_eq!(r.episode, 2);
         assert_eq!(r.release_group.as_deref(), Some("WBDP"));
@@ -409,11 +449,12 @@ mod tests {
 
     #[test]
     fn empty_title_and_generic_parent_is_unparseable() {
-        assert!(parse("NCED1", "Extra").is_none());
-        assert!(parse("NCED - 01", "NC").is_none());
-        assert!(parse("S01E02", "Season 1").is_none());
-        assert!(parse("Episode 4", "Extras").is_none());
-        assert!(parse("00_OVA_Two-Topic Gossip_KDG", "Season2_Pure Engagement").is_none());
+        assert!(parse("NCED1", &d("Extra")).is_none());
+        assert!(parse("NCED - 01", &d("NC")).is_none());
+        assert!(parse("S01E02", &d("Season 1")).is_none());
+        assert!(parse("Episode 4", &d("Extras")).is_none());
+        assert!(parse("00_OVA_Two-Topic Gossip_KDG", &d("Season2_Pure Engagement")).is_none());
+        assert!(parse("K-ON! The Movie", &d("The Movie")).is_some());
     }
 
     #[test]
@@ -447,8 +488,63 @@ mod tests {
     }
 
     #[test]
-    fn year_is_not_an_episode() {
-        assert!(parse("Akira (1988) [30th Anniversary Blu-ray] [1080p x265 HEVC 10bit 5.1 AAC][RecMan]", "").is_none());
-        assert!(parse("Cosmic.Princess.Kaguya.2026.1080p.NF.WEB-DL.DUAL.DDP5.1.H.264-VARYG", "").is_none());
+    fn year_is_not_an_episode_and_is_dropped_from_title() {
+        let r = p("Akira (1988) [30th Anniversary Blu-ray] [1080p x265 HEVC 10bit 5.1 AAC][RecMan]");
+        assert_eq!(r.title, "Akira");
+        assert_eq!((r.season, r.episode), (1, 1));
+        let r = p("Cosmic.Princess.Kaguya.2026.1080p.NF.WEB-DL.DUAL.DDP5.1.H.264-VARYG");
+        assert_eq!(r.title, "Cosmic Princess Kaguya");
+        assert_eq!((r.season, r.episode), (1, 1));
+    }
+
+    #[test]
+    fn title_from_grandparent_when_parent_is_a_season_folder() {
+        let dirs = vec!["Season1".to_string(), "Sekirei Complete BDrip 1080p Dual-Audio x265".to_string()];
+        let r = parse("05_The Strange Tale of Maison Izumo_KDG", &dirs).unwrap();
+        assert_eq!(r.title, "Sekirei");
+        assert_eq!((r.season, r.episode), (1, 5));
+        let dirs = vec!["Season2_Pure Engagement".to_string(), "Sekirei Complete BDrip 1080p Dual-Audio x265".to_string()];
+        let r = parse("01_Silent Omen_KDG", &dirs).unwrap();
+        assert_eq!(r.title, "Sekirei");
+        assert_eq!((r.season, r.episode), (2, 1));
+        let r = parse("00_OVA_Two-Topic Gossip_KDG", &dirs).unwrap();
+        assert_eq!((r.title.as_str(), r.season, r.episode), ("Sekirei", 0, 0));
+        let dirs = vec!["NC".into(), "Extras".into(), "[KH] Why the Hell are You Here Teacher (BD 1080p) [Dual-Audio]".into()];
+        let r = parse("NCED - 03", &dirs).unwrap();
+        assert_eq!((r.title.as_str(), r.season, r.episode), ("Why the Hell are You Here Teacher", 0, 3));
+        let dirs = vec!["Extra".into(), "S2".into(), "K-On!".into()];
+        let r = parse("NCED2", &dirs).unwrap();
+        assert_eq!((r.title.as_str(), r.season, r.episode), ("K-On!", 0, 2));
+    }
+
+    #[test]
+    fn op_ed_and_bracketed_special_words() {
+        let r = p("(Hi10)_High_School_DxD_New_-_OP1_(BD_1080p)_(FFF)");
+        assert_eq!((r.title.as_str(), r.season, r.episode), ("High School DxD New", 0, 1));
+        let r = p("[Exiled-Destiny]_UFO_Ultramaiden_Valkyrie_2_Clean_Ending_(FFAE0F4B)");
+        assert_eq!((r.title.as_str(), r.season), ("UFO Ultramaiden Valkyrie 2", 0));
+        let r = p("[grimf] Ichigo Mashimaro CharSong3 Matsuri");
+        assert_eq!((r.title.as_str(), r.season, r.episode), ("Ichigo Mashimaro", 0, 3));
+        let r = p("[Airota&VCB-Studio] Asagao to Kase-san. [Teaser][Ma10p_1080p][x265_flac]");
+        assert_eq!((r.title.as_str(), r.season, r.episode), ("Asagao to Kase-san", 0, 1));
+        let r = p("[Doki] Mayo Chiki! - NCEDv2 (1920x1080 Hi10P BD FLAC) [DB77308F]");
+        assert_eq!((r.title.as_str(), r.season, r.episode), ("Mayo Chiki!", 0, 1));
+        let r = p("[Scum] Girlish Number - NCI [BD][4BE57A27]");
+        assert_eq!((r.title.as_str(), r.season), ("Girlish Number", 0));
+    }
+
+    #[test]
+    fn bare_s_number_without_episode_is_a_special() {
+        let r = p("(Hi10)_High_School_DxD_BorN_-_S5_(BD_1080p)_(CBM)");
+        assert_eq!((r.title.as_str(), r.season, r.episode), ("High School DxD BorN", 0, 5));
+    }
+
+    #[test]
+    fn noise_tail_stripped_from_title() {
+        let r = p("[Exiled-Destiny]_Aria_Season_1_The_Animation_Ep01_Subbed_(9A11D5BB)");
+        assert_eq!(r.title, "Aria Season 1 The Animation");
+        assert_eq!(r.episode, 1);
+        let r = p("Sekirei Complete BDrip 1080p Dual-Audio x265 - 03");
+        assert_eq!(r.title, "Sekirei");
     }
 }

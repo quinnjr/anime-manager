@@ -69,22 +69,36 @@ Display title = `user_title_override` ?? `canonical_title` ?? `parsed_title`.
 
 ## Parser
 
-Input: file stem plus parent directory name. Output: `ParsedName` struct.
+Input: file stem plus the ancestor directory names (nearest first, up to and including
+the scan root). Output: `ParsedName` struct.
 
 Ordered passes (each a precompiled regex):
 
 1. Bracketed/parenthesized tokens → extract release group (first `[...]`), CRC
-   (8 hex chars), resolution (`\d{3,4}p`, `1920x1080`); remove all bracket tokens.
-2. Episode + season markers: `S(\d+)E(\d+)`, `(\d+)x(\d+)`, ` - (\d+)`, `Ep?\.? ?(\d+)`,
-   `第(\d+)話`. Strip a trailing `v\d` version suffix.
+   (8 hex chars), resolution (`\d{3,4}p`, `1920x1080`), and special markers
+   (`[Teaser]`, `[Menu]`, ...); remove all bracket tokens. Normalise `_` and `.` to
+   spaces before any marker regex runs.
+2. Episode + season markers, first match wins: `S(\d+)E(\d+)`, `(\d+)x(\d+)`,
+   `第(\d+)話`, ` - (\d+)`, `(Episode|Ep?)\.? ?(\d+)`, a number glued to a special
+   word (`S01OVA01`, `SP1`), a trailing standalone integer, a leading integer
+   (`01 - Title`), then the first standalone 2–3 digit integer mid-title. Strip a
+   trailing `v\d` version suffix. A bare 4-digit number in 1900–2099 is a year, never
+   an episode.
 3. Season from title suffixes: `2nd Season`, `Season 2`, `Part 2`, `S2`, roman
-   numerals `II`–`IX` as the final token. Remove from title.
-4. Title cleanup: `_` and `.` → space, trim dashes/whitespace, collapse spaces.
-5. Fallbacks: no episode → last standalone integer in the stem; no season →
-   parent dir matching `Season (\d+)` / `S(\d+)`, else 1.
+   numerals `II`–`IX` as the final token. Remove from title. A bare `S(\d)` suffix
+   with no episode anywhere is a numbered special, not a season.
+4. Title cleanup: `_` and `.` → space, trim dashes/whitespace, collapse spaces, drop a
+   trailing run of release noise (`Complete`, `BDRip`, `Dual-Audio`, `x265`, a year, ...).
+5. Fallbacks: no title in the stem (`S01E07-Title`, `01 - Title`) → title from the
+   nearest ancestor directory that is not generic (`Extras`, `NC`, `SPs`, `Season N`,
+   hidden); no season → nearest ancestor matching `Season (\d+)` / `S(\d+)`, else 1.
+   A stem with a title but no episode marker (movie, one-shot) is episode 1.
+   Stems `sample`/`test` are rejected.
 
-Special files matching `NCOP`, `NCED`, `OVA`, `Special`, `Extra`, `Preview` are
-placed in season 0.
+Special files matching `NCOP`, `NCED`, `NCI`, `OP`, `ED`, `Clean/Creditless
+Opening|Ending`, `OVA`, `OAD`, `SP`, `Special`, `Extra`, `Preview`, `Recap`, `Menu`, `CM`,
+`PV`, `Teaser`, `Trailer`, `CharSong`, `Eyecatch` are placed in season 0 with the number
+that trails the marker, else 1.
 
 Tests: table-driven, at least 40 real-world filenames, exact struct equality.
 
