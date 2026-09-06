@@ -270,6 +270,35 @@ impl Db {
     }
 }
 
+pub fn run_scan(db: &Db, on_progress: &mut dyn FnMut(ScanProgress)) -> Result<ScanSummary> {
+    use crate::{parser, scanner};
+    let mut summary = ScanSummary::default();
+    let mut all_files = Vec::new();
+    for root in db.list_roots()? {
+        let (files, errors) = scanner::scan_dir(Path::new(&root.path), &mut |_| {});
+        summary.errors.extend(errors);
+        all_files.extend(files);
+    }
+    let total = all_files.len();
+    let mut seen_paths = Vec::with_capacity(total);
+    for (i, f) in all_files.iter().enumerate() {
+        summary.files_seen += 1;
+        on_progress(ScanProgress { done: i + 1, total, current_path: f.path.to_string_lossy().to_string() });
+        let Some(parsed) = parser::parse(&f.stem, &f.parent_dir) else {
+            summary.errors.push(format!("could not parse: {}", f.path.display()));
+            continue;
+        };
+        seen_paths.push(f.path.to_string_lossy().to_string());
+        match db.upsert_episode(&parsed, f) {
+            Ok(Upsert::Added) => summary.episodes_added += 1,
+            Ok(Upsert::Updated) => summary.episodes_updated += 1,
+            Err(e) => summary.errors.push(format!("{}: {e}", f.path.display())),
+        }
+    }
+    summary.episodes_missing = db.mark_missing_except(&seen_paths)?;
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,6 +430,27 @@ mod tests {
         assert_eq!(d.total_episodes, Some(28));
         db.clear_anilist(id).unwrap();
         assert_eq!(db.display_title(id).unwrap(), "sousou no frieren");
+    }
+
+    #[test]
+    fn run_scan_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = dir.path().join("[Grp] Frieren");
+        std::fs::create_dir_all(&s).unwrap();
+        std::fs::write(s.join("[Grp] Frieren - 01 [1080p].mkv"), b"1").unwrap();
+        std::fs::write(s.join("[Grp] Frieren - 02 [1080p].mkv"), b"22").unwrap();
+        std::fs::write(s.join("readme.txt"), b"x").unwrap();
+        let db = Db::open_memory().unwrap();
+        db.add_root(dir.path().to_str().unwrap()).unwrap();
+        let mut progress = 0;
+        let summary = run_scan(&db, &mut |_p| progress += 1).unwrap();
+        assert_eq!(summary.files_seen, 2);
+        assert_eq!(summary.episodes_added, 2);
+        assert_eq!(progress, 2);
+        std::fs::remove_file(s.join("[Grp] Frieren - 02 [1080p].mkv")).unwrap();
+        let summary = run_scan(&db, &mut |_| {}).unwrap();
+        assert_eq!(summary.episodes_updated, 1);
+        assert_eq!(summary.episodes_missing, 1);
     }
 
     #[test]
