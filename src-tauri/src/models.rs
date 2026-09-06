@@ -89,6 +89,21 @@ pub struct ScanSummary {
     pub episodes_updated: usize,
     pub episodes_missing: usize,
     pub errors: Vec<String>,
+    /// Immediate parent folders of files the parser was unsure about (candidates for LLM assist).
+    #[serde(default)]
+    pub low_confidence_folders: Vec<String>,
+}
+
+/// A decision (from the LLM or the user) that outranks the regex parser for one file path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ParseOverride {
+    pub path: String,
+    pub title: String,
+    pub season: u32,
+    pub number: u32,
+    /// "episode" | "special" | "movie" | "ignore"
+    pub kind: String,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -139,4 +154,21 @@ pub struct RenameResult {
 pub enum RenameTarget {
     Show(i64),
     Episode(i64),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InspectChange {
+    pub path: String,
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct InspectReport {
+    pub folders: usize,
+    pub ignored: usize,
+    pub changes: Vec<InspectChange>,
+    pub notes: Vec<String>,
+    /// Where the inspected show's files ended up (it may have merged into another show).
+    pub show_id: Option<i64>,
 }

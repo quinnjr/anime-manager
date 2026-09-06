@@ -1,5 +1,6 @@
 use crate::anilist::{self, AniList};
 use crate::db::{self, Db};
+use crate::llm::{self, Llm};
 use crate::error::Result;
 use crate::models::*;
 use crate::player::{self, Player};
@@ -33,6 +34,22 @@ pub async fn scan(app: AppHandle, state: State<'_, AppState>) -> Result<ScanSumm
     .await
     .map_err(|e| crate::error::AppError::Io(e.to_string()))??;
     let _ = app.emit("scan-finished", &summary);
+    // Optional LLM second opinion on folders the parser was unsure about.
+    let assist_on = state.db.get_setting("llm_assist_on_scan")?.map(|v| v != "false").unwrap_or(true);
+    if assist_on && let Ok(l) = Llm::from_db(&state.db) && l.configured() && !summary.low_confidence_folders.is_empty() {
+        let db_l = state.db.clone();
+        let app_l = app.clone();
+        let folders: Vec<String> = summary.low_confidence_folders.iter().take(llm::MAX_FOLDERS_PER_SCAN).cloned().collect();
+        tauri::async_runtime::spawn(async move {
+            match llm::inspect_folders(db_l, Arc::new(l), folders, "llm").await {
+                Ok(report) => {
+                    let _ = app_l.emit("llm-assist", &report);
+                    if !report.changes.is_empty() { let _ = app_l.emit("library-changed", ()); }
+                }
+                Err(e) => { let _ = app_l.emit("error", e); }
+            }
+        });
+    }
     let db2 = state.db.clone();
     let api = state.anilist.clone();
     let app3 = app.clone();
@@ -66,6 +83,10 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String
     let mut m = HashMap::new();
     m.insert("played_threshold".into(), state.db.played_threshold()?.to_string());
     m.insert("mpv_path".into(), state.db.get_setting("mpv_path")?.unwrap_or_else(|| "mpv".into()));
+    m.insert("llm_api_key".into(), state.db.get_setting("llm_api_key")?.unwrap_or_default());
+    m.insert("llm_model".into(), state.db.get_setting("llm_model")?.unwrap_or_else(|| llm::DEFAULT_MODEL.into()));
+    m.insert("llm_base_url".into(), state.db.get_setting("llm_base_url")?.unwrap_or_else(|| llm::DEFAULT_BASE_URL.into()));
+    m.insert("llm_assist_on_scan".into(), state.db.get_setting("llm_assist_on_scan")?.unwrap_or_else(|| "true".into()));
     Ok(m)
 }
 
@@ -133,4 +154,18 @@ pub fn undo_rename(app: AppHandle, state: State<'_, AppState>) -> Result<RenameR
     let r = rename::undo(&state.db)?;
     let _ = app.emit("library-changed", ());
     Ok(r)
+}
+
+#[tauri::command]
+pub async fn inspect_show(app: AppHandle, state: State<'_, AppState>, show_id: i64) -> Result<InspectReport> {
+    let l = Arc::new(Llm::from_db(&state.db)?);
+    let report = llm::inspect_show(state.db.clone(), l, show_id).await?;
+    let _ = app.emit("library-changed", ());
+    if let Some(id) = report.show_id { let _ = app.emit("show-updated", id); }
+    Ok(report)
+}
+
+#[tauri::command]
+pub async fn llm_test(state: State<'_, AppState>) -> Result<String> {
+    Llm::from_db(&state.db)?.test().await
 }

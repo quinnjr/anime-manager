@@ -102,6 +102,44 @@ that trails the marker, else 1.
 
 Tests: table-driven, at least 40 real-world filenames, exact struct equality.
 
+## LLM folder assist (OpenCode Zen)
+
+An optional, free LLM second opinion for folders the regex parser is unsure about.
+
+Provider: OpenCode Zen, OpenAI-compatible `POST {base_url}/chat/completions`,
+`Authorization: Bearer <key>`. Settings keys: `llm_api_key` (empty = disabled),
+`llm_model` (default `big-pickle`), `llm_base_url` (default
+`https://opencode.ai/zen/v1`), `llm_assist_on_scan` (`true`/`false`, default `true`).
+
+Low-confidence parse = any of: title taken from an ancestor directory; stem had a
+title but no episode marker (movie/one-shot); episode came from the leading- or
+mid-title-number fallback.
+
+Triggers:
+1. Scan: after the regex pass, files that are low-confidence and have no override
+   are grouped by immediate parent folder; up to 25 folders per scan are sent to the
+   model in the background (`llm-assist` event with counts when done).
+2. On demand: `inspect_show(show_id)` sends every folder of that show.
+
+Request: one folder per call. Content is the ancestor path (relative to the root),
+the file names (max 200, sorted), and the regex parser's current guess per file.
+The model returns JSON only:
+`{ "title": str, "season": int|null, "files": [ { "name": str, "kind":
+"episode"|"special"|"movie"|"ignore", "season": int, "episode": int, "title": str|null } ],
+"notes": str }`. Code fences are tolerated; anything unparseable is a `Parse` error
+and the folder is left as the regex saw it.
+
+Persistence: `parse_overrides(path PRIMARY KEY, title, season, number, kind, source,
+created_at)`. `run_scan` consults it before the regex parser for every file, so an
+LLM (or later, user) decision survives rescans and is never re-requested. `kind =
+ignore` deletes the episode row and skips the file on future scans; the file on disk is
+untouched. Applying overrides re-upserts the affected episodes and prunes empty
+seasons and shows.
+
+`llm_test()` sends a one-line prompt and returns the model's reply, for the settings
+drawer's "Test connection" button. Network failures are logged and non-fatal during
+scans; on-demand failures surface as toasts.
+
 ## Playback
 
 1. `play(episode_id)`: reject if another episode is `playing`. Set `playing`, emit

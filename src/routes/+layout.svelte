@@ -1,7 +1,7 @@
 <script lang="ts">
   import '../app.css';
   import { onMount } from 'svelte';
-  import { onEvent, type PlaybackChanged, type AppError } from '$lib/api';
+  import { onEvent, type PlaybackChanged, type AppError, type InspectReport } from '$lib/api';
   import { playback } from '$lib/stores/playback.svelte';
   import { toasts } from '$lib/stores/toasts.svelte';
   import Toasts from '$lib/components/Toasts.svelte';
@@ -13,7 +13,11 @@
   onMount(() => {
     const unlisteners = [
       onEvent<PlaybackChanged>('playback-changed', (ev) => playback.apply(ev)),
-      onEvent<AppError>('error', (e) => toasts.error(e))
+      onEvent<AppError>('error', (e) => toasts.error(e)),
+      onEvent<InspectReport>('llm-assist', (r) => {
+        if (r.folders === 0 && r.notes.length === 0) return;
+        toasts.push('info', `AI checked ${r.folders} uncertain folder(s): ${r.changes.length} file(s) re-homed, ${r.ignored} ignored`);
+      })
     ];
     return () => { unlisteners.forEach((p) => p.then((u) => u())); };
   });

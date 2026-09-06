@@ -104,11 +104,25 @@ fn season_from_dirs(dirs: &[String]) -> Option<u32> {
     dirs.iter().find_map(|d| DIR_SEASON.captures(d.trim()).and_then(|c| c[1].parse().ok()))
 }
 
+/// A parse result plus whether it came from a weak heuristic worth a second opinion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parsed {
+    pub name: ParsedName,
+    /// True when the title came from an ancestor directory, the stem had no episode marker
+    /// (movie / one-shot), or the episode came from the leading- or mid-number fallback.
+    pub low_confidence: bool,
+}
+
 /// Parse a video file stem. `dirs` are the ancestor directory names, nearest first, up to and
 /// including the scan root; they supply the season ("Season 2") and, when the stem has no title
 /// of its own, the show name.
 pub fn parse(stem: &str, dirs: &[String]) -> Option<ParsedName> {
+    parse_with_confidence(stem, dirs).map(|p| p.name)
+}
+
+pub fn parse_with_confidence(stem: &str, dirs: &[String]) -> Option<Parsed> {
     if JUNK_STEM.is_match(stem) { return None; }
+    let mut low_confidence = false;
     // Pass 1: bracket tokens → group / crc / resolution / special marker
     let mut release_group = None;
     let mut crc = None;
@@ -171,9 +185,11 @@ pub fn parse(stem: &str, dirs: &[String]) -> Option<ParsedName> {
     } else if let Some(c) = LEADING_NUM.captures(&work).filter(|c| c[1].parse().ok().and_then(not_year).is_some()) {
         episode = Some(c[1].parse().ok()?);
         title_end = 0;
+        low_confidence = true;
     } else if let Some(c) = MID_NUM.captures(&work).filter(|c| c[1].parse().ok().and_then(not_year).is_some()) {
         episode = Some(c[1].parse().ok()?);
         title_end = c.get(0).unwrap().start();
+        low_confidence = true;
     }
 
     // Specials: episode number is whatever digits trail the special marker, else 1
@@ -200,8 +216,10 @@ pub fn parse(stem: &str, dirs: &[String]) -> Option<ParsedName> {
         Some(e) => (is_special, e),
         None if season_from_bare_s => (true, season.take().unwrap()),
         // Title-only file (movie, one-shot): a single-episode show.
-        None if !title.is_empty() => (is_special, 1),
-        None => (is_special, 1),
+        None => {
+            if !is_special { low_confidence = true; }
+            (is_special, 1)
+        }
     };
 
     // Pass 4: stem carried no title → fall back to the ancestor directories
@@ -209,6 +227,7 @@ pub fn parse(stem: &str, dirs: &[String]) -> Option<ParsedName> {
         let (t, s) = title_from_dirs(dirs)?;
         title = t;
         if season.is_none() { season = s; }
+        low_confidence = true;
     }
 
     // Pass 5: fallbacks
@@ -216,7 +235,7 @@ pub fn parse(stem: &str, dirs: &[String]) -> Option<ParsedName> {
 
     if title.is_empty() { return None; }
 
-    Some(ParsedName { title, season, episode, release_group, resolution, crc })
+    Some(Parsed { name: ParsedName { title, season, episode, release_group, resolution, crc }, low_confidence })
 }
 
 #[cfg(test)]
@@ -546,5 +565,20 @@ mod tests {
         assert_eq!(r.episode, 1);
         let r = p("Sekirei Complete BDrip 1080p Dual-Audio x265 - 03");
         assert_eq!(r.title, "Sekirei");
+    }
+
+    #[test]
+    fn confidence_flags_weak_heuristics() {
+        let lc = |stem: &str, dirs: &[&str]| {
+            let d: Vec<String> = dirs.iter().map(|s| s.to_string()).collect();
+            parse_with_confidence(stem, &d).expect(stem).low_confidence
+        };
+        assert!(!lc("[SubsPlease] Frieren - 05 (1080p) [A1B2C3D4]", &[]));
+        assert!(!lc("Mob.Psycho.100.S02E07.1080p.WEB.x264", &[]));
+        assert!(!lc("[Group] Show - NCOP1 [1080p]", &[]));
+        assert!(lc("K-ON! The Movie", &[]));
+        assert!(lc("S01E07-Thus, the Sisters Trade Places", &["Makina-san's a Love Bot S01"]));
+        assert!(lc("01- He woke up as a Bagel Girl [darkflux]", &["Bagel Girl"]));
+        assert!(lc("Tamako Market 01 That Girl is the Cute Daughter of a Mochi Shop Owner", &[]));
     }
 }

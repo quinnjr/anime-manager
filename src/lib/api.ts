@@ -16,7 +16,9 @@ export interface ShowDetail {
   user_title_override: string | null; seasons: SeasonDetail[];
 }
 export interface ShowCard { id: number; display_title: string; cover_url: string | null; episode_count: number; unwatched_count: number }
-export interface ScanSummary { files_seen: number; episodes_added: number; episodes_updated: number; episodes_missing: number; errors: string[] }
+export interface ScanSummary { files_seen: number; episodes_added: number; episodes_updated: number; episodes_missing: number; errors: string[]; low_confidence_folders: string[] }
+export interface InspectChange { path: string; from: string; to: string }
+export interface InspectReport { folders: number; ignored: number; changes: InspectChange[]; notes: string[]; show_id: number | null }
 export interface ScanProgress { done: number; total: number; current_path: string }
 export interface PlaybackChanged { episode_id: number; status: EpisodeStatus; position_secs: number; duration_secs: number | null }
 export interface AniListHit { id: number; title_romaji: string; title_english: string | null; cover_url: string | null; episodes: number | null }
@@ -41,7 +43,9 @@ export const api = {
   undoRename: () => invoke<RenameResult>('undo_rename'),
   getSettings: () => invoke<Record<string, string>>('get_settings'),
   setSetting: (key: string, value: string) => invoke<void>('set_setting', { key, value }),
-  purgeMissing: () => invoke<number>('purge_missing')
+  purgeMissing: () => invoke<number>('purge_missing'),
+  inspectShow: (showId: number) => invoke<InspectReport>('inspect_show', { showId }),
+  llmTest: () => invoke<string>('llm_test')
 };
 
 export function onEvent<T>(name: string, cb: (payload: T) => void): Promise<UnlistenFn> {

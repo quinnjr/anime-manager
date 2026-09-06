@@ -34,6 +34,10 @@ CREATE TABLE IF NOT EXISTS rename_log (
   episode_id INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
   old_path TEXT NOT NULL, new_path TEXT NOT NULL, applied_at INTEGER NOT NULL, reverted_at INTEGER);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS parse_overrides (
+  path TEXT PRIMARY KEY, title TEXT NOT NULL, season INTEGER NOT NULL, number INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('episode','special','movie','ignore')),
+  source TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_episodes_season ON episodes(season_id);
 CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status);
 "#;
@@ -150,6 +154,85 @@ impl Db {
                     Ok(Upsert::Added)
                 }
             }
+        })
+    }
+
+    // ---- parse overrides (LLM / user decisions that outrank the regex parser) ----
+    pub fn set_override(&self, o: &ParseOverride) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO parse_overrides(path, title, season, number, kind, source, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)
+                 ON CONFLICT(path) DO UPDATE SET title=excluded.title, season=excluded.season, number=excluded.number,
+                 kind=excluded.kind, source=excluded.source, created_at=excluded.created_at",
+                params![o.path, o.title, o.season, o.number, o.kind, o.source, now()])?;
+            Ok(())
+        })
+    }
+
+    pub fn get_override(&self, path: &str) -> Result<Option<ParseOverride>> {
+        self.with(|c| Ok(c.query_row(
+            "SELECT path, title, season, number, kind, source FROM parse_overrides WHERE path = ?1", params![path],
+            |r| Ok(ParseOverride { path: r.get(0)?, title: r.get(1)?, season: r.get::<_, i64>(2)? as u32, number: r.get::<_, i64>(3)? as u32, kind: r.get(4)?, source: r.get(5)? }))
+            .optional()?))
+    }
+
+    pub fn clear_overrides(&self, source: Option<&str>) -> Result<usize> {
+        self.with(|c| Ok(match source {
+            Some(s) => c.execute("DELETE FROM parse_overrides WHERE source = ?1", params![s])?,
+            None => c.execute("DELETE FROM parse_overrides", [])?,
+        }))
+    }
+
+    /// Re-home an existing episode row under (title, season, number). Returns false if no row has that path.
+    pub fn reassign_episode(&self, path: &str, title: &str, season: u32, number: u32) -> Result<bool> {
+        self.with(|c| {
+            let Some(id) = c.query_row("SELECT id FROM episodes WHERE path = ?1", params![path], |r| r.get::<_, i64>(0)).optional()? else { return Ok(false) };
+            c.execute("INSERT OR IGNORE INTO shows(parsed_title, created_at) VALUES (?1, ?2)", params![title, now()])?;
+            let show_id: i64 = c.query_row("SELECT id FROM shows WHERE parsed_title = ?1", params![title], |r| r.get(0))?;
+            c.execute("INSERT OR IGNORE INTO seasons(show_id, number) VALUES (?1, ?2)", params![show_id, season])?;
+            let season_id: i64 = c.query_row("SELECT id FROM seasons WHERE show_id = ?1 AND number = ?2", params![show_id, season], |r| r.get(0))?;
+            c.execute("UPDATE episodes SET season_id = ?2, number = ?3 WHERE id = ?1", params![id, season_id, number])?;
+            Ok(true)
+        })
+    }
+
+    pub fn delete_episode_by_path(&self, path: &str) -> Result<bool> {
+        self.with(|c| Ok(c.execute("DELETE FROM episodes WHERE path = ?1", params![path])? > 0))
+    }
+
+    /// Drop seasons and shows that no longer hold any episode.
+    pub fn prune_empty(&self) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM seasons WHERE id NOT IN (SELECT DISTINCT season_id FROM episodes)", [])?;
+            c.execute("DELETE FROM shows WHERE id NOT IN (SELECT DISTINCT show_id FROM seasons)", [])?;
+            Ok(())
+        })
+    }
+
+    pub fn show_id_for_path(&self, path: &str) -> Result<Option<i64>> {
+        self.with(|c| Ok(c.query_row(
+            "SELECT se.show_id FROM episodes e JOIN seasons se ON e.season_id = se.id WHERE e.path = ?1", params![path], |r| r.get(0)).optional()?))
+    }
+
+    /// (path, show parsed_title, season number, episode number) for files directly inside `folder`.
+    pub fn episodes_in_folder(&self, folder: &str) -> Result<Vec<(String, String, u32, u32)>> {
+        let prefix = format!("{}/", folder.trim_end_matches('/'));
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT e.path, s.parsed_title, se.number, e.number FROM episodes e
+                 JOIN seasons se ON e.season_id = se.id JOIN shows s ON se.show_id = s.id
+                 WHERE substr(e.path, 1, length(?1)) = ?1 AND instr(substr(e.path, length(?1) + 1), '/') = 0
+                 ORDER BY e.path")?;
+            let rows = st.query_map(params![prefix], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u32, r.get::<_, i64>(3)? as u32)))?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
+        })
+    }
+
+    pub fn episode_paths_for_show(&self, show_id: i64) -> Result<Vec<String>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT e.path FROM episodes e JOIN seasons se ON e.season_id = se.id WHERE se.show_id = ?1 ORDER BY e.path")?;
+            let rows = st.query_map(params![show_id], |r| r.get(0))?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
         })
     }
 
@@ -294,8 +377,11 @@ impl Db {
 }
 
 pub fn run_scan(db: &Db, on_progress: &mut dyn FnMut(ScanProgress)) -> Result<ScanSummary> {
-    use crate::{parser, scanner};
+    use crate::parser::{self, ParsedName};
+    use crate::scanner;
+    use std::collections::BTreeSet;
     let mut summary = ScanSummary::default();
+    let mut low_conf_folders = BTreeSet::new();
     let mut all_files = Vec::new();
     for root in db.list_roots()? {
         let (files, errors) = scanner::scan_dir(Path::new(&root.path), &mut |_| {});
@@ -307,11 +393,32 @@ pub fn run_scan(db: &Db, on_progress: &mut dyn FnMut(ScanProgress)) -> Result<Sc
     for (i, f) in all_files.iter().enumerate() {
         summary.files_seen += 1;
         on_progress(ScanProgress { done: i + 1, total, current_path: f.path.to_string_lossy().to_string() });
-        let Some(parsed) = parser::parse(&f.stem, &f.dirs) else {
-            summary.errors.push(format!("could not parse: {}", f.path.display()));
-            continue;
+        let path_str = f.path.to_string_lossy().to_string();
+        let parsed = match db.get_override(&path_str)? {
+            Some(o) if o.kind == "ignore" => { seen_paths.push(path_str); continue; }
+            Some(o) => {
+                let base = parser::parse(&f.stem, &f.dirs);
+                ParsedName {
+                    title: o.title, season: o.season, episode: o.number,
+                    release_group: base.as_ref().and_then(|b| b.release_group.clone()),
+                    resolution: base.as_ref().and_then(|b| b.resolution.clone()),
+                    crc: base.and_then(|b| b.crc),
+                }
+            }
+            None => match parser::parse_with_confidence(&f.stem, &f.dirs) {
+                Some(p) => {
+                    if p.low_confidence && let Some(parent) = f.path.parent() {
+                        low_conf_folders.insert(parent.to_string_lossy().to_string());
+                    }
+                    p.name
+                }
+                None => {
+                    summary.errors.push(format!("could not parse: {}", f.path.display()));
+                    continue;
+                }
+            },
         };
-        seen_paths.push(f.path.to_string_lossy().to_string());
+        seen_paths.push(path_str);
         match db.upsert_episode(&parsed, f) {
             Ok(Upsert::Added) => summary.episodes_added += 1,
             Ok(Upsert::Updated) => summary.episodes_updated += 1,
@@ -319,6 +426,7 @@ pub fn run_scan(db: &Db, on_progress: &mut dyn FnMut(ScanProgress)) -> Result<Sc
         }
     }
     summary.episodes_missing = db.mark_missing_except(&seen_paths)?;
+    summary.low_confidence_folders = low_conf_folders.into_iter().collect();
     Ok(summary)
 }
 
@@ -486,5 +594,61 @@ mod tests {
         assert_eq!(season, 3);
         db.update_episode_path(id, "/z/renamed.mkv").unwrap();
         assert_eq!(db.get_episode(id).unwrap().path, "/z/renamed.mkv");
+    }
+
+    #[test]
+    fn override_outranks_parser_and_ignore_skips_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Show - 01.mkv"), b"x").unwrap();
+        std::fs::write(dir.path().join("Show - 02.mkv"), b"x").unwrap();
+        std::fs::write(dir.path().join("Show - 03.mkv"), b"x").unwrap();
+        let db = Db::open_memory().unwrap();
+        db.add_root(dir.path().to_str().unwrap()).unwrap();
+        let p2 = dir.path().join("Show - 02.mkv").to_string_lossy().to_string();
+        let p3 = dir.path().join("Show - 03.mkv").to_string_lossy().to_string();
+        db.set_override(&ParseOverride { path: p2.clone(), title: "Other".into(), season: 0, number: 7, kind: "special".into(), source: "llm".into() }).unwrap();
+        db.set_override(&ParseOverride { path: p3.clone(), title: "".into(), season: 0, number: 0, kind: "ignore".into(), source: "llm".into() }).unwrap();
+        let s = run_scan(&db, &mut |_| {}).unwrap();
+        assert_eq!(s.episodes_added, 2);
+        assert!(s.errors.is_empty(), "{:?}", s.errors);
+        let shows = db.list_shows("").unwrap();
+        let titles: Vec<_> = shows.iter().map(|s| s.display_title.clone()).collect();
+        assert_eq!(titles, vec!["Other", "Show"]);
+        let other = db.get_show(shows[0].id).unwrap();
+        assert_eq!((other.seasons[0].number, other.seasons[0].episodes[0].number), (0, 7));
+        assert!(db.show_id_for_path(&p3).unwrap().is_none());
+        assert_eq!(db.get_override(&p2).unwrap().unwrap().kind, "special");
+        assert_eq!(db.clear_overrides(Some("llm")).unwrap(), 2);
+    }
+
+    #[test]
+    fn scan_reports_low_confidence_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("Bagel Girl")).unwrap();
+        std::fs::write(dir.path().join("Bagel Girl/01 - He woke up.mkv"), b"x").unwrap();
+        std::fs::create_dir_all(dir.path().join("Frieren")).unwrap();
+        std::fs::write(dir.path().join("Frieren/[SubsPlease] Frieren - 01 (1080p).mkv"), b"x").unwrap();
+        let db = Db::open_memory().unwrap();
+        db.add_root(dir.path().to_str().unwrap()).unwrap();
+        let s = run_scan(&db, &mut |_| {}).unwrap();
+        assert_eq!(s.low_confidence_folders, vec![dir.path().join("Bagel Girl").to_string_lossy().to_string()]);
+    }
+
+    #[test]
+    fn reassign_moves_episode_and_prune_drops_empty_show() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Wrong Title", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
+        let old_id = db.list_shows("").unwrap()[0].id;
+        assert!(db.reassign_episode("/a/1.mkv", "Right Title", 0, 3).unwrap());
+        assert!(!db.reassign_episode("/nope.mkv", "X", 1, 1).unwrap());
+        db.prune_empty().unwrap();
+        let shows = db.list_shows("").unwrap();
+        assert_eq!(shows.len(), 1);
+        assert_ne!(shows[0].id, old_id);
+        assert_eq!(shows[0].display_title, "Right Title");
+        assert_eq!(db.episode_paths_for_show(shows[0].id).unwrap(), vec!["/a/1.mkv"]);
+        assert!(db.delete_episode_by_path("/a/1.mkv").unwrap());
+        db.prune_empty().unwrap();
+        assert!(db.list_shows("").unwrap().is_empty());
     }
 }

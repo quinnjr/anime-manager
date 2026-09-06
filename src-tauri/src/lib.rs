@@ -2,6 +2,7 @@ pub mod anilist;
 pub mod commands;
 pub mod db;
 pub mod error;
+pub mod llm;
 pub mod models;
 pub mod parser;
 pub mod player;
@@ -27,6 +28,7 @@ pub fn run() {
             commands::get_settings, commands::set_setting, commands::purge_missing,
             commands::play, commands::search_anilist, commands::rematch,
             commands::preview_rename, commands::apply_rename, commands::undo_rename,
+            commands::inspect_show, commands::llm_test,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

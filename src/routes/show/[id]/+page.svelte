@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { page } from '$app/state';
+  import { goto } from '$app/navigation';
   import { api, onEvent, type ShowDetail, type RenameTarget } from '$lib/api';
   import { toasts } from '$lib/stores/toasts.svelte';
   import EpisodeRow from '$lib/components/EpisodeRow.svelte';
@@ -14,6 +15,7 @@
   let rematchOpen = $state(false);
   let renameOpen = $state(false);
   let renameTarget = $state<RenameTarget | null>(null);
+  let inspecting = $state(false);
 
   const season = $derived(show?.seasons[seasonIdx] ?? null);
 
@@ -27,6 +29,22 @@
   }
 
   function openRename(t: RenameTarget) { renameTarget = t; renameOpen = true; }
+
+  async function inspect() {
+    if (!show) return;
+    inspecting = true;
+    try {
+      const r = await api.inspectShow(show.id);
+      const summary = r.changes.length
+        ? `AI inspected ${r.folders} folder(s): ${r.changes.length} file(s) re-homed, ${r.ignored} ignored`
+        : `AI inspected ${r.folders} folder(s): parser was already right`;
+      toasts.push('success', summary);
+      for (const n of r.notes.slice(0, 3)) toasts.push('info', n);
+      if (r.show_id != null && r.show_id !== show.id) await goto(`/show/${r.show_id}`);
+      else if (r.show_id == null) await goto('/');
+      else await load();
+    } catch (e) { toasts.error(e); } finally { inspecting = false; }
+  }
 
   $effect(() => {
     id; // track
@@ -59,6 +77,7 @@
       <div class="mt-3 flex gap-2">
         <button class="rounded bg-zinc-800 px-3 py-1 text-sm hover:bg-zinc-700" onclick={() => (rematchOpen = true)}>Re-match</button>
         <button class="rounded bg-zinc-800 px-3 py-1 text-sm hover:bg-zinc-700" onclick={() => openRename({ type: 'show', id: show!.id })}>Rename files</button>
+        <button class="rounded bg-zinc-800 px-3 py-1 text-sm hover:bg-zinc-700 disabled:opacity-50" disabled={inspecting} title="Ask the configured LLM to check this show's folders" onclick={inspect}>{inspecting ? 'Inspecting…' : 'Inspect with AI'}</button>
       </div>
     </div>
   </div>
