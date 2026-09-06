@@ -1,3 +1,4 @@
+use crate::anilist::{self, AniList};
 use crate::db::{self, Db};
 use crate::error::Result;
 use crate::models::*;
@@ -9,6 +10,7 @@ use tauri::{AppHandle, Emitter, State};
 pub struct AppState {
     pub db: Arc<Db>,
     pub player: Arc<Player>,
+    pub anilist: Arc<AniList>,
 }
 
 #[tauri::command]
@@ -30,6 +32,15 @@ pub async fn scan(app: AppHandle, state: State<'_, AppState>) -> Result<ScanSumm
     .await
     .map_err(|e| crate::error::AppError::Io(e.to_string()))??;
     let _ = app.emit("scan-finished", &summary);
+    let db2 = state.db.clone();
+    let api = state.anilist.clone();
+    let app3 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        anilist::auto_match_all(db2, api, move |id| {
+            let _ = app3.emit("show-updated", id);
+        })
+        .await;
+    });
     Ok(summary)
 }
 
@@ -82,4 +93,26 @@ pub async fn play(app: AppHandle, state: State<'_, AppState>, episode_id: i64) -
         }
     });
     Ok(())
+}
+
+#[tauri::command]
+pub async fn search_anilist(state: State<'_, AppState>, query: String) -> Result<Vec<AniListHit>> {
+    state.anilist.search(&query).await
+}
+
+#[tauri::command]
+pub async fn rematch(app: AppHandle, state: State<'_, AppState>, show_id: i64, anilist_id: Option<i64>) -> Result<ShowDetail> {
+    match anilist_id {
+        Some(id) => {
+            let hit = state
+                .anilist
+                .by_id(id)
+                .await?
+                .ok_or_else(|| crate::error::AppError::Network(format!("no AniList entry {id}")))?;
+            state.db.set_anilist(show_id, &hit)?;
+        }
+        None => state.db.clear_anilist(show_id)?,
+    }
+    let _ = app.emit("show-updated", show_id);
+    state.db.get_show(show_id)
 }

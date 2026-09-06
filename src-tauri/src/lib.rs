@@ -1,3 +1,4 @@
+pub mod anilist;
 pub mod commands;
 pub mod db;
 pub mod error;
@@ -18,12 +19,12 @@ pub fn run() {
     db.reset_playing().expect("reset playing rows");
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(commands::AppState { db, player: Arc::new(player::Player::new()) })
+        .manage(commands::AppState { db, player: Arc::new(player::Player::new()), anilist: Arc::new(anilist::AniList::new()) })
         .invoke_handler(tauri::generate_handler![
             commands::add_root, commands::remove_root, commands::list_roots, commands::scan,
             commands::list_shows, commands::get_show, commands::set_status,
             commands::get_settings, commands::set_setting, commands::purge_missing,
-            commands::play,
+            commands::play, commands::search_anilist, commands::rematch,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
