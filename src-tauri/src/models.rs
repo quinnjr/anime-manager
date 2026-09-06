@@ -172,3 +172,11 @@ pub struct InspectReport {
     /// Where the inspected show's files ended up (it may have merged into another show).
     pub show_id: Option<i64>,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AssistProgress {
+    pub done: usize,
+    pub total: usize,
+    pub folder: String,
+    pub running: bool,
+}

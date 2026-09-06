@@ -1,6 +1,6 @@
 use crate::anilist::{self, AniList};
 use crate::db::{self, Db};
-use crate::llm::{self, Llm};
+use crate::llm::{self, AssistQueue, Llm};
 use crate::error::Result;
 use crate::models::*;
 use crate::player::{self, Player};
@@ -13,6 +13,7 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub player: Arc<Player>,
     pub anilist: Arc<AniList>,
+    pub assist: Arc<AssistQueue>,
 }
 
 #[tauri::command]
@@ -34,21 +35,26 @@ pub async fn scan(app: AppHandle, state: State<'_, AppState>) -> Result<ScanSumm
     .await
     .map_err(|e| crate::error::AppError::Io(e.to_string()))??;
     let _ = app.emit("scan-finished", &summary);
-    // Optional LLM second opinion on folders the parser was unsure about.
+    // Optional LLM second opinion on folders the parser was unsure about: queue them all and
+    // let a single background worker drain the queue (a running worker picks up new entries).
     let assist_on = state.db.get_setting("llm_assist_on_scan")?.map(|v| v != "false").unwrap_or(true);
     if assist_on && let Ok(l) = Llm::from_db(&state.db) && l.configured() && !summary.low_confidence_folders.is_empty() {
-        let db_l = state.db.clone();
-        let app_l = app.clone();
-        let folders: Vec<String> = summary.low_confidence_folders.iter().take(llm::MAX_FOLDERS_PER_SCAN).cloned().collect();
-        tauri::async_runtime::spawn(async move {
-            match llm::inspect_folders(db_l, Arc::new(l), folders, "llm").await {
-                Ok(report) => {
-                    let _ = app_l.emit("llm-assist", &report);
-                    if !report.changes.is_empty() { let _ = app_l.emit("library-changed", ()); }
-                }
-                Err(e) => { let _ = app_l.emit("error", e); }
-            }
-        });
+        state.assist.enqueue(summary.low_confidence_folders.iter().cloned());
+        let _ = app.emit("llm-assist-progress", state.assist.progress());
+        if state.assist.try_start() {
+            let db_l = state.db.clone();
+            let app_l = app.clone();
+            let queue = state.assist.clone();
+            tauri::async_runtime::spawn(async move {
+                let app_p = app_l.clone();
+                let report = queue.run(db_l, Arc::new(l), "llm", &move |p| {
+                    let _ = app_p.emit("llm-assist-progress", &p);
+                    let _ = app_p.emit("library-changed", ());
+                }).await;
+                let _ = app_l.emit("llm-assist-progress", AssistProgress::default());
+                let _ = app_l.emit("llm-assist", &report);
+            });
+        }
     }
     let db2 = state.db.clone();
     let api = state.anilist.clone();
@@ -87,6 +93,7 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String
     m.insert("llm_model".into(), state.db.get_setting("llm_model")?.unwrap_or_else(|| llm::DEFAULT_MODEL.into()));
     m.insert("llm_base_url".into(), state.db.get_setting("llm_base_url")?.unwrap_or_else(|| llm::DEFAULT_BASE_URL.into()));
     m.insert("llm_assist_on_scan".into(), state.db.get_setting("llm_assist_on_scan")?.unwrap_or_else(|| "true".into()));
+    m.insert("llm_delay_ms".into(), state.db.get_setting("llm_delay_ms")?.unwrap_or_else(|| llm::DEFAULT_DELAY_MS.to_string()));
     Ok(m)
 }
 
@@ -169,3 +176,6 @@ pub async fn inspect_show(app: AppHandle, state: State<'_, AppState>, show_id: i
 pub async fn llm_test(state: State<'_, AppState>) -> Result<String> {
     Llm::from_db(&state.db)?.test().await
 }
+
+#[tauri::command]
+pub fn assist_progress(state: State<'_, AppState>) -> Result<AssistProgress> { Ok(state.assist.progress()) }

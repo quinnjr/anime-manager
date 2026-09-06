@@ -11,6 +11,7 @@
   let llmModel = $state('big-pickle');
   let llmBaseUrl = $state('https://opencode.ai/zen/v1');
   let llmOnScan = $state(true);
+  let llmDelay = $state('500');
   let testing = $state(false);
 
   $effect(() => { if (open) load(); });
@@ -25,6 +26,7 @@
       llmModel = s.llm_model ?? 'big-pickle';
       llmBaseUrl = s.llm_base_url ?? 'https://opencode.ai/zen/v1';
       llmOnScan = (s.llm_assist_on_scan ?? 'true') !== 'false';
+      llmDelay = s.llm_delay_ms ?? '500';
     } catch (e) { toasts.error(e); }
   }
   async function save() {
@@ -37,6 +39,7 @@
       await api.setSetting('llm_model', llmModel.trim());
       await api.setSetting('llm_base_url', llmBaseUrl.trim());
       await api.setSetting('llm_assist_on_scan', llmOnScan ? 'true' : 'false');
+      await api.setSetting('llm_delay_ms', String(Math.max(0, Number(llmDelay) || 0)));
       toasts.push('success', 'Settings saved');
     } catch (e) { toasts.error(e); }
   }
@@ -102,6 +105,8 @@
       <label class="block text-sm"><span class="text-zinc-300">Base URL</span>
         <input bind:value={llmBaseUrl} class="mt-1 w-full rounded bg-zinc-800 px-2 py-1 text-sm" /></label>
       <label class="flex items-center gap-2 text-sm"><input type="checkbox" bind:checked={llmOnScan} /> <span class="text-zinc-300">Consult during scans for uncertain folders</span></label>
+      <label class="block text-sm"><span class="text-zinc-300">Pause between folders (ms)</span>
+        <input bind:value={llmDelay} class="mt-1 w-full rounded bg-zinc-800 px-2 py-1 text-sm" /></label>
       <div class="flex gap-2">
         <button class="rounded bg-indigo-600 px-3 py-1 text-sm" onclick={save}>Save</button>
         <button class="rounded bg-zinc-800 px-3 py-1 text-sm hover:bg-zinc-700 disabled:opacity-50" disabled={testing || !llmKey.trim()} onclick={testLlm}>{testing ? 'Testing…' : 'Test connection'}</button>

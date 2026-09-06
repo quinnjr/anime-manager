@@ -109,7 +109,7 @@ An optional, free LLM second opinion for folders the regex parser is unsure abou
 Provider: OpenCode Zen, OpenAI-compatible `POST {base_url}/chat/completions`,
 `Authorization: Bearer <key>`. Settings keys: `llm_api_key` (empty = disabled),
 `llm_model` (default `big-pickle`), `llm_base_url` (default
-`https://opencode.ai/zen/v1`), `llm_assist_on_scan` (`true`/`false`, default `true`).
+`https://opencode.ai/zen/v1`), `llm_assist_on_scan` (`true`/`false`, default `true`), `llm_delay_ms` (default `500`).
 
 Low-confidence parse = any of: title taken from an ancestor directory; stem had a
 title but no episode marker (movie/one-shot); episode came from the leading- or
@@ -117,8 +117,14 @@ mid-title-number fallback.
 
 Triggers:
 1. Scan: after the regex pass, files that are low-confidence and have no override
-   are grouped by immediate parent folder; up to 25 folders per scan are sent to the
-   model in the background (`llm-assist` event with counts when done).
+   are grouped by immediate parent folder and appended to a single in-process
+   `AssistQueue`. One background worker drains it a folder at a time (no cap), pausing
+   `llm_delay_ms` (default 500) between folders; a scan that lands while the worker
+   runs extends the same run. 429/5xx/transport errors retry up to 6 times with
+   exponential backoff honouring `Retry-After`; 4xx auth errors fail immediately.
+   Events: `llm-assist-progress {done,total,folder,running}` after each folder (also
+   readable via `assist_progress()` on startup), `library-changed` as folders change,
+   `llm-assist` with the report when the queue is empty.
 2. On demand: `inspect_show(show_id)` sends every folder of that show.
 
 Request: one folder per call. Content is the ancestor path (relative to the root),
