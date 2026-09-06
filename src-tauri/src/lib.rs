@@ -5,6 +5,7 @@ pub mod error;
 pub mod models;
 pub mod parser;
 pub mod player;
+pub mod rename;
 pub mod scanner;
 
 use std::sync::Arc;
@@ -25,6 +26,7 @@ pub fn run() {
             commands::list_shows, commands::get_show, commands::set_status,
             commands::get_settings, commands::set_setting, commands::purge_missing,
             commands::play, commands::search_anilist, commands::rematch,
+            commands::preview_rename, commands::apply_rename, commands::undo_rename,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -268,6 +268,29 @@ impl Db {
     pub fn update_episode_path(&self, id: i64, path: &str) -> Result<()> {
         self.with(|c| { c.execute("UPDATE episodes SET path=?2 WHERE id=?1", params![id, path])?; Ok(()) })
     }
+
+    pub fn log_rename(&self, batch_id: &str, episode_id: i64, old_path: &str, new_path: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("INSERT INTO rename_log(batch_id, episode_id, old_path, new_path, applied_at) VALUES (?1,?2,?3,?4,?5)",
+                params![batch_id, episode_id, old_path, new_path, now()])?;
+            Ok(())
+        })
+    }
+
+    pub fn latest_unreverted_batch(&self) -> Result<Option<(String, Vec<(i64, String, String)>)>> {
+        self.with(|c| {
+            let batch: Option<String> = c.query_row(
+                "SELECT batch_id FROM rename_log WHERE reverted_at IS NULL ORDER BY applied_at DESC, id DESC LIMIT 1", [], |r| r.get(0)).optional()?;
+            let Some(batch) = batch else { return Ok(None) };
+            let mut st = c.prepare("SELECT episode_id, old_path, new_path FROM rename_log WHERE batch_id=?1 AND reverted_at IS NULL ORDER BY id")?;
+            let rows = st.query_map(params![batch], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?;
+            Ok(Some((batch, rows)))
+        })
+    }
+
+    pub fn mark_batch_reverted(&self, batch_id: &str) -> Result<()> {
+        self.with(|c| { c.execute("UPDATE rename_log SET reverted_at=?2 WHERE batch_id=?1", params![batch_id, now()])?; Ok(()) })
+    }
 }
 
 pub fn run_scan(db: &Db, on_progress: &mut dyn FnMut(ScanProgress)) -> Result<ScanSummary> {

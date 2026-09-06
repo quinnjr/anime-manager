@@ -3,6 +3,7 @@ use crate::db::{self, Db};
 use crate::error::Result;
 use crate::models::*;
 use crate::player::{self, Player};
+use crate::rename;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
@@ -115,4 +116,21 @@ pub async fn rematch(app: AppHandle, state: State<'_, AppState>, show_id: i64, a
     }
     let _ = app.emit("show-updated", show_id);
     state.db.get_show(show_id)
+}
+
+#[tauri::command]
+pub fn preview_rename(state: State<'_, AppState>, target: RenameTarget) -> Result<RenamePlan> { rename::preview(&state.db, target) }
+
+#[tauri::command]
+pub fn apply_rename(app: AppHandle, state: State<'_, AppState>, plan: RenamePlan) -> Result<RenameResult> {
+    let r = rename::apply(&state.db, plan)?;
+    let _ = app.emit("library-changed", ());
+    Ok(r)
+}
+
+#[tauri::command]
+pub fn undo_rename(app: AppHandle, state: State<'_, AppState>) -> Result<RenameResult> {
+    let r = rename::undo(&state.db)?;
+    let _ = app.emit("library-changed", ());
+    Ok(r)
 }
