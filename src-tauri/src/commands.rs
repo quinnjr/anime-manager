@@ -1,12 +1,14 @@
 use crate::db::{self, Db};
 use crate::error::Result;
 use crate::models::*;
+use crate::player::{self, Player};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
 pub struct AppState {
     pub db: Arc<Db>,
+    pub player: Arc<Player>,
 }
 
 #[tauri::command]
@@ -60,3 +62,24 @@ pub fn set_setting(state: State<'_, AppState>, key: String, value: String) -> Re
 
 #[tauri::command]
 pub fn purge_missing(state: State<'_, AppState>) -> Result<usize> { state.db.purge_missing() }
+
+#[tauri::command]
+pub async fn play(app: AppHandle, state: State<'_, AppState>, episode_id: i64) -> Result<()> {
+    let db = state.db.clone();
+    let player = state.player.clone();
+    if player.current().is_some() {
+        return Err(crate::error::AppError::Player("another episode is already playing".into()));
+    }
+    // Validate launch synchronously so the caller sees "mpv not found" immediately.
+    let bin = player::mpv_binary(&db);
+    if std::process::Command::new(&bin).arg("--version").output().is_err() {
+        return Err(crate::error::AppError::Player(format!("mpv not found at '{bin}'; install mpv or set mpv_path in settings")));
+    }
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = player::play_episode(db, player, episode_id, move |ev| { let _ = app2.emit("playback-changed", ev); }, std::time::Duration::from_secs(5)).await {
+            let _ = app.emit("error", e);
+        }
+    });
+    Ok(())
+}
