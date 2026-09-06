@@ -40,6 +40,14 @@ pub fn preview(db: &Db, target: RenameTarget) -> Result<RenamePlan> {
             if let Some(e) = entry_for(&ep, &show, season) { entries.push(e); }
         }
     }
+    let mut seen = std::collections::HashSet::new();
+    for e in &mut entries {
+        if e.conflict.is_none() {
+            if !seen.insert(e.new_path.clone()) {
+                e.conflict = Some("duplicate target within plan".into());
+            }
+        }
+    }
     Ok(RenamePlan { entries })
 }
 
@@ -69,14 +77,17 @@ pub fn apply(db: &Db, plan: RenamePlan) -> Result<RenameResult> {
 
 pub fn undo(db: &Db) -> Result<RenameResult> {
     let mut result = RenameResult::default();
-    let Some((batch, entries)) = db.latest_unreverted_batch()? else { return Ok(result) };
-    for (episode_id, old_path, new_path) in entries {
+    let Some((_batch, entries)) = db.latest_unreverted_batch()? else { return Ok(result) };
+    for (log_id, episode_id, old_path, new_path) in entries {
         match std::fs::rename(&new_path, &old_path) {
-            Ok(()) => { db.update_episode_path(episode_id, &old_path)?; result.renamed += 1; }
+            Ok(()) => {
+                db.update_episode_path(episode_id, &old_path)?;
+                db.mark_log_entry_reverted(log_id)?;
+                result.renamed += 1;
+            }
             Err(err) => result.skipped.push(format!("{new_path}: {err}")),
         }
     }
-    db.mark_batch_reverted(&batch)?;
     Ok(result)
 }
 
@@ -150,5 +161,46 @@ mod tests {
         let _ = seed(&db, dir.path(), "Show", 1, "Show - S01E01.mkv");
         let show_id = db.list_shows("").unwrap()[0].id;
         assert!(preview(&db, RenameTarget::Show(show_id)).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn undo_leaves_failed_entries_revertable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_memory().unwrap();
+        let e1 = seed(&db, dir.path(), "Show", 1, "[G] Show - 01.mkv");
+        let e2 = seed(&db, dir.path(), "Show", 2, "[G] Show - 02.mkv");
+        let show_id = db.list_shows("").unwrap()[0].id;
+        apply(&db, preview(&db, RenameTarget::Show(show_id)).unwrap()).unwrap();
+        // user moves one renamed file away before undo
+        fs::rename(dir.path().join("Show - S01E02.mkv"), dir.path().join("elsewhere.mkv")).unwrap();
+        let res = undo(&db).unwrap();
+        assert_eq!(res.renamed, 1);
+        assert_eq!(res.skipped.len(), 1);
+        assert!(db.get_episode(e1).unwrap().path.ends_with("[G] Show - 01.mkv"));
+        assert!(db.get_episode(e2).unwrap().path.ends_with("Show - S01E02.mkv"));
+        // put the file back; a second undo retries only the failed entry
+        fs::rename(dir.path().join("elsewhere.mkv"), dir.path().join("Show - S01E02.mkv")).unwrap();
+        let res = undo(&db).unwrap();
+        assert_eq!(res.renamed, 1);
+        assert!(db.get_episode(e2).unwrap().path.ends_with("[G] Show - 02.mkv"));
+        assert_eq!(undo(&db).unwrap().renamed, 0);
+    }
+
+    #[test]
+    fn preview_flags_duplicate_targets_within_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_memory().unwrap();
+        let _e1 = seed(&db, dir.path(), "Show", 1, "[A] Show - 01.mkv");
+        // second release of the same episode: same season/number, different size so it is a distinct row
+        let path = dir.path().join("[B] Show - 01.mkv");
+        fs::write(&path, b"xyz").unwrap();
+        let mtime = fs::metadata(&path).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let p = ParsedName { title: "Show".into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
+        db.upsert_episode(&p, &RawFile { path: path.clone(), size: 3, mtime, stem: "".into(), parent_dir: "".into() }).unwrap();
+        let show_id = db.list_shows("").unwrap()[0].id;
+        let plan = preview(&db, RenameTarget::Show(show_id)).unwrap();
+        assert_eq!(plan.entries.len(), 2);
+        assert!(plan.entries[0].conflict.is_none());
+        assert_eq!(plan.entries[1].conflict.as_deref(), Some("duplicate target within plan"));
     }
 }

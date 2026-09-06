@@ -277,19 +277,19 @@ impl Db {
         })
     }
 
-    pub fn latest_unreverted_batch(&self) -> Result<Option<(String, Vec<(i64, String, String)>)>> {
+    pub fn latest_unreverted_batch(&self) -> Result<Option<(String, Vec<(i64, i64, String, String)>)>> {
         self.with(|c| {
             let batch: Option<String> = c.query_row(
                 "SELECT batch_id FROM rename_log WHERE reverted_at IS NULL ORDER BY applied_at DESC, id DESC LIMIT 1", [], |r| r.get(0)).optional()?;
             let Some(batch) = batch else { return Ok(None) };
-            let mut st = c.prepare("SELECT episode_id, old_path, new_path FROM rename_log WHERE batch_id=?1 AND reverted_at IS NULL ORDER BY id")?;
-            let rows = st.query_map(params![batch], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?;
+            let mut st = c.prepare("SELECT id, episode_id, old_path, new_path FROM rename_log WHERE batch_id=?1 AND reverted_at IS NULL ORDER BY id")?;
+            let rows = st.query_map(params![batch], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<std::result::Result<_, _>>()?;
             Ok(Some((batch, rows)))
         })
     }
 
-    pub fn mark_batch_reverted(&self, batch_id: &str) -> Result<()> {
-        self.with(|c| { c.execute("UPDATE rename_log SET reverted_at=?2 WHERE batch_id=?1", params![batch_id, now()])?; Ok(()) })
+    pub fn mark_log_entry_reverted(&self, log_id: i64) -> Result<()> {
+        self.with(|c| { c.execute("UPDATE rename_log SET reverted_at=?2 WHERE id=?1", params![log_id, now()])?; Ok(()) })
     }
 }
 
