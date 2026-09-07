@@ -37,3 +37,6 @@ with `git flow feature start <name>`; `main` only receives release and hotfix me
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+Bundled third-party material — the application icon and the self-hosted typefaces — carries its
+own licences. See [NOTICE](NOTICE).
