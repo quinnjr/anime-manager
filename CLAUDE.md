@@ -85,6 +85,23 @@ cargo run --manifest-path src-tauri/Cargo.toml --example parse_dump -- /path/to/
 
 It prints one tab-separated line per file, `OK / title / S<n> / E<n> / group / path`, or `FAIL` with the path. Watch the unparsed count, the distinct-title count, and which files moved in or out of season 0. Unit tests alone have missed regressions this caught.
 
+## Release builds
+
+`scripts/build-release.sh` produces the `.deb`, `.rpm` and `.AppImage` into `dist/` with a
+`SHA256SUMS.txt`; `.github/workflows/release.yml` does the same on a `v*` tag push and uploads
+them to the GitHub release. Both run the test suites first.
+
+AppImage bundling needs two environment variables that the script sets and CI sets in part:
+
+- `APPIMAGE_EXTRACT_AND_RUN=1` — linuxdeploy is itself an AppImage and cannot self-mount
+  without usable FUSE.
+- `NO_STRIP=1` — linuxdeploy bundles an old binutils whose `strip` aborts on the DT_RELR
+  relocations (`.relr.dyn`) that Arch and recent Fedora use, which fails the whole bundle.
+  CI leaves stripping on because ubuntu-22.04 predates that and the artifact is ~30 MB smaller.
+
+`--bundles` is passed explicitly rather than relying on `tauri.conf.json`'s `"targets": "all"`,
+so a format is never silently skipped; both paths fail loudly if one is missing.
+
 ## Packaging
 
 `packaging/arch/PKGBUILD` builds from `main` on GitHub and runs both test suites in `check()`. Override `ANIME_MANAGER_REPO` / `ANIME_MANAGER_BRANCH` to build a local clone or another branch. On a machine where pnpm is installed outside pacman, `makepkg -s` fails on file conflicts; build with `makepkg -f --nodeps`.

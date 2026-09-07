@@ -21,7 +21,10 @@ The Rust suite must run single-threaded: the player tests drive a fake mpv throu
 process-global environment variables.
 
 ## Build
-    pnpm tauri build
+    pnpm tauri build --no-bundle          # binary only
+    ./scripts/build-release.sh            # .deb, .rpm and .AppImage into dist/
+
+Tagged releases are built by CI and attached to the GitHub release page.
 
 Data lives in `~/.local/share/anime-manager/db.sqlite`. Files on disk are only changed by the explicit Rename feature, which is undoable.
 

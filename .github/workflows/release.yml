@@ -1,0 +1,99 @@
+name: Release
+
+# Builds the Linux bundles and attaches them to the GitHub release for a tag.
+# Runs on tag push (the normal path, driven by `git flow release finish`) and can be
+# re-run by hand against an existing tag if a build needs repeating.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and attach artifacts to (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  bundles:
+    # Pinned to the oldest runner Tauri 2 supports: the glibc it links against sets the
+    # floor for every distro the .deb, .rpm and AppImage will run on.
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            build-essential \
+            patchelf \
+            file wget curl
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Test
+        # Single-threaded: the player tests drive a fake mpv through process-global env vars.
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1
+          pnpm test
+          pnpm check
+
+      - name: Build bundles
+        env:
+          # Runners have no usable FUSE, so linuxdeploy and appimagetool must unpack
+          # themselves instead of mounting.
+          APPIMAGE_EXTRACT_AND_RUN: 1
+          # Stripping is left on here: 22.04's libraries predate the DT_RELR relocations that
+          # break linuxdeploy's bundled `strip` on Arch and recent Fedora, and it saves ~30 MB.
+          # If a future runner image starts failing on `.relr.dyn`, set NO_STRIP: 1.
+        run: pnpm tauri build --bundles deb,rpm,appimage
+
+      - name: Collect artifacts
+        id: collect
+        run: |
+          mkdir -p dist
+          find src-tauri/target/release/bundle \
+            \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) \
+            -exec cp {} dist/ \;
+          ls -l dist
+          # Fail loudly rather than publishing a release with a format silently missing.
+          for ext in deb rpm AppImage; do
+            compgen -G "dist/*.$ext" > /dev/null || { echo "::error::no .$ext produced"; exit 1; }
+          done
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-bundles
+          path: dist/*
+
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
