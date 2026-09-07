@@ -204,6 +204,21 @@ pub struct InspectReport {
     pub show_id: Option<i64>,
 }
 
+/// Progress of the background match-and-artwork pass, so a long run over a large library is
+/// visible rather than silent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MatchProgress {
+    pub done: usize,
+    pub total: usize,
+    /// What is being looked up or fetched right now.
+    pub title: String,
+    /// "matching" while titles are resolved, "artwork" while covers download.
+    pub phase: String,
+    /// The show whose row changed at this step, so a caller can refresh just that one.
+    pub changed: Option<i64>,
+    pub running: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AssistProgress {
     pub done: usize,

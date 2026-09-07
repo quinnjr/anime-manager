@@ -20,6 +20,7 @@ export interface ShowDetail {
 export interface ShowCard { id: number; display_title: string; cover_url: string | null; cover_path: string | null; episode_count: number; unwatched_count: number }
 export interface ScanSummary { files_seen: number; episodes_added: number; episodes_updated: number; episodes_missing: number; errors: string[]; low_confidence_folders: string[] }
 export interface InspectChange { path: string; from: string; to: string }
+export interface MatchProgress { done: number; total: number; title: string; phase: string; changed: number | null; running: boolean }
 export interface AssistProgress { done: number; total: number; folder: string; running: boolean }
 export interface InspectReport { folders: number; ignored: number; changes: InspectChange[]; notes: string[]; show_id: number | null }
 export interface ScanProgress { done: number; total: number; current_path: string }
@@ -57,6 +58,8 @@ export const api = {
   llmTest: () => invoke<string>('llm_test'),
   assistProgress: () => invoke<AssistProgress>('assist_progress'),
   clearAiDecisions: () => invoke<number>('clear_ai_decisions'),
+  matchLibrary: () => invoke<number>('match_library'),
+  matchRunning: () => invoke<boolean>('match_progress'),
   setShowTitle: (showId: number, title: string | null) => invoke<ShowDetail>('set_show_title', { showId, title })
 };
 

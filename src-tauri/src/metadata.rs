@@ -70,21 +70,34 @@ impl Providers {
 pub async fn auto_match_all(
     db: std::sync::Arc<crate::db::Db>,
     providers: std::sync::Arc<Providers>,
-    notify: impl Fn(i64) + Send + 'static,
-) {
+    on_progress: impl Fn(crate::models::MatchProgress) + Send + 'static,
+) -> usize {
     let pending = match db.shows_needing_match() {
         Ok(p) => p,
-        Err(_) => return,
+        Err(_) => return 0,
     };
-    for (show_id, title) in pending {
-        if let Some(hit) = providers.best(&title).await
-            && db.set_anilist(show_id, &hit).is_ok()
-        {
-            notify(show_id);
-        }
+    let total = pending.len();
+    let mut matched = 0;
+    for (i, (show_id, title)) in pending.into_iter().enumerate() {
+        let changed = match providers.best(&title).await {
+            Some(hit) if db.set_anilist(show_id, &hit).is_ok() => {
+                matched += 1;
+                Some(show_id)
+            }
+            _ => None,
+        };
+        on_progress(crate::models::MatchProgress {
+            done: i + 1,
+            total,
+            title,
+            phase: "matching".into(),
+            changed,
+            running: true,
+        });
         // Stay well under AniList's 90 requests/minute; Kitsu is slower than that anyway.
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
     }
+    matched
 }
 
 #[cfg(test)]
@@ -139,6 +152,33 @@ mod tests {
         assert!(hits.is_empty());
         assert_eq!(errors.len(), 2);
         assert!(p.best("Frieren").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn matching_reports_every_step_and_counts_what_it_applied() {
+        use crate::parser::ParsedName;
+        use crate::scanner::RawFile;
+        let (dead, live) = one_provider_down().await;
+        let db = std::sync::Arc::new(crate::db::Db::open_memory().unwrap());
+        for t in ["Sousou no Frieren", "Definitely Not A Real Anime XYZQ"] {
+            let pn = ParsedName { title: t.into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
+            db.upsert_episode(&pn, &RawFile { path: format!("/a/{t}.mkv").into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] }).unwrap();
+        }
+        let p = std::sync::Arc::new(Providers {
+            anilist: AniList::with_endpoint(dead.uri()).with_retry_base(std::time::Duration::from_millis(1)),
+            kitsu: Kitsu::with_endpoint(live.uri()),
+        });
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s2 = seen.clone();
+        let matched = auto_match_all(db.clone(), p, move |pr| s2.lock().unwrap().push(pr)).await;
+        assert_eq!(matched, 1, "only the real title matches");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "every show reports, matched or not");
+        assert_eq!((seen[0].done, seen[0].total), (1, 2));
+        assert_eq!(seen[1].done, 2);
+        assert_eq!(seen.iter().filter(|p| p.changed.is_some()).count(), 1);
+        assert_eq!(db.shows_needing_match().unwrap().len(), 1, "the unmatched one stays pending");
+        assert!(seen.iter().all(|p| p.running && p.phase == "matching"));
     }
 
     #[tokio::test]
