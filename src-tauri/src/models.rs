@@ -34,6 +34,22 @@ pub struct Root {
     pub id: i64,
     pub path: String,
     pub added_at: i64,
+    /// Result of the most recent scan of this root, or None if it has never been scanned.
+    pub last_scan: Option<RootScan>,
+}
+
+/// What the last scan of one root did, so Settings can show when a folder was last read and
+/// whether it was reachable, without rescanning it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RootScan {
+    pub at: i64,
+    pub files_seen: i64,
+    pub added: i64,
+    pub updated: i64,
+    pub missing: i64,
+    pub errors: i64,
+    /// False when the folder could not be read, in which case its episodes were left untouched.
+    pub readable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -3,7 +3,8 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
 export type EpisodeStatus = 'unplayed' | 'playing' | 'played' | 'missing';
 export interface AppError { kind: 'Io' | 'Db' | 'Parse' | 'Network' | 'Player'; message: string }
-export interface Root { id: number; path: string; added_at: number }
+export interface RootScan { at: number; files_seen: number; added: number; updated: number; missing: number; errors: number; readable: boolean }
+export interface Root { id: number; path: string; added_at: number; last_scan: RootScan | null }
 export interface Episode {
   id: number; season_id: number; number: number; path: string; size: number; mtime: number;
   release_group: string | null; resolution: string | null; crc: string | null;

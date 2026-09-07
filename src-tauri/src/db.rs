@@ -20,7 +20,10 @@ pub fn now() -> i64 {
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS roots (
-  id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, added_at INTEGER NOT NULL);
+  id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, added_at INTEGER NOT NULL,
+  -- result of the most recent scan of this root; NULL until it has been scanned once
+  last_scan_at INTEGER, last_files_seen INTEGER, last_added INTEGER, last_updated INTEGER,
+  last_missing INTEGER, last_errors INTEGER, last_readable INTEGER);
 CREATE TABLE IF NOT EXISTS shows (
   id INTEGER PRIMARY KEY, parsed_title TEXT NOT NULL UNIQUE,
   anilist_id INTEGER, canonical_title TEXT, cover_url TEXT, total_episodes INTEGER,
@@ -51,7 +54,7 @@ CREATE INDEX IF NOT EXISTS idx_episodes_season ON episodes(season_id);
 CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status);
 "#;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Bring an existing database up to `SCHEMA_VERSION`. Fresh databases get the current shape
 /// from SCHEMA directly; older ones are altered in place so no user data is lost.
@@ -74,6 +77,11 @@ fn upgrade(conn: &Connection) -> Result<()> {
     }
     if !has("shows", "anilist_cleared")? {
         conn.execute_batch("ALTER TABLE shows ADD COLUMN anilist_cleared INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    for col in ["last_scan_at", "last_files_seen", "last_added", "last_updated", "last_missing", "last_errors", "last_readable"] {
+        if !has("roots", col)? {
+            conn.execute_batch(&format!("ALTER TABLE roots ADD COLUMN {col} INTEGER;"))?;
+        }
     }
     // rename_log's foreign key cannot be altered in place; rebuild the table when it still
     // carries the old NOT NULL / ON DELETE CASCADE definition.
@@ -125,6 +133,27 @@ fn escape_like(s: &str) -> String {
     out
 }
 
+const ROOT_COLS: &str = "id, path, added_at, last_scan_at, last_files_seen, last_added, last_updated, last_missing, last_errors, last_readable";
+
+fn row_to_root(r: &rusqlite::Row) -> rusqlite::Result<Root> {
+    // last_scan_at is NULL until the root has been scanned once; the rest travel with it.
+    let at: Option<i64> = r.get(3)?;
+    Ok(Root {
+        id: r.get(0)?,
+        path: r.get(1)?,
+        added_at: r.get(2)?,
+        last_scan: at.map(|at| RootScan {
+            at,
+            files_seen: r.get(4).unwrap_or(0),
+            added: r.get(5).unwrap_or(0),
+            updated: r.get(6).unwrap_or(0),
+            missing: r.get(7).unwrap_or(0),
+            errors: r.get(8).unwrap_or(0),
+            readable: r.get::<_, Option<i64>>(9).unwrap_or(Some(1)).unwrap_or(1) != 0,
+        }),
+    })
+}
+
 fn display_title_sql() -> &'static str { "COALESCE(user_title_override, canonical_title, parsed_title)" }
 
 impl Db {
@@ -151,8 +180,7 @@ impl Db {
     pub fn add_root(&self, path: &str) -> Result<Root> {
         self.with(|c| {
             c.execute("INSERT OR IGNORE INTO roots(path, added_at) VALUES (?1, ?2)", params![path, now()])?;
-            Ok(c.query_row("SELECT id, path, added_at FROM roots WHERE path = ?1", params![path],
-                |r| Ok(Root { id: r.get(0)?, path: r.get(1)?, added_at: r.get(2)? }))?)
+            Ok(c.query_row(&format!("SELECT {ROOT_COLS} FROM roots WHERE path = ?1"), params![path], row_to_root)?)
         })
     }
 
@@ -162,13 +190,24 @@ impl Db {
 
     pub fn list_roots(&self) -> Result<Vec<Root>> {
         self.with(|c| {
-            let mut st = c.prepare("SELECT id, path, added_at FROM roots ORDER BY id")?;
-            let rows = st.query_map([], |r| Ok(Root { id: r.get(0)?, path: r.get(1)?, added_at: r.get(2)? }))?;
+            let mut st = c.prepare(&format!("SELECT {ROOT_COLS} FROM roots ORDER BY id"))?;
+            let rows = st.query_map([], row_to_root)?;
             Ok(rows.collect::<std::result::Result<_, _>>()?)
         })
     }
 
     // ---- settings ----
+    /// Record what the latest scan of one root did, so Settings can report it later.
+    pub fn record_root_scan(&self, root_id: i64, s: &RootScan) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE roots SET last_scan_at=?2, last_files_seen=?3, last_added=?4, last_updated=?5,
+                 last_missing=?6, last_errors=?7, last_readable=?8 WHERE id=?1",
+                params![root_id, s.at, s.files_seen, s.added, s.updated, s.missing, s.errors, s.readable as i64])?;
+            Ok(())
+        })
+    }
+
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         self.with(|c| Ok(c.query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| r.get(0)).optional()?))
     }
@@ -523,69 +562,113 @@ pub fn run_scan(db: &Db, on_progress: &mut dyn FnMut(ScanProgress)) -> Result<Sc
     use crate::parser::{self, ParsedName};
     use crate::scanner;
     use std::collections::BTreeSet;
+
+    /// One root's files plus what walking it cost, kept separate so each root's result can be
+    /// recorded against it rather than only rolled into the library-wide summary.
+    struct RootWork {
+        root: Root,
+        files: Vec<scanner::RawFile>,
+        readable: bool,
+        errors: i64,
+    }
+
     let mut summary = ScanSummary::default();
     let mut low_conf_folders = BTreeSet::new();
-    let mut all_files = Vec::new();
+    let mut work: Vec<RootWork> = Vec::new();
+
     // Only roots that were actually readable may drive missing-detection. An unmounted share
     // returns zero files plus an error, and marking its whole library missing would let the
     // Settings purge delete every watched flag, resume position and AniList match.
-    let mut trusted_roots: Vec<String> = Vec::new();
     for root in db.list_roots()? {
         let dir = Path::new(&root.path);
         let (files, errors) = scanner::scan_dir(dir);
         let unreadable = !dir.is_dir() || (files.is_empty() && !errors.is_empty());
+        let mut error_count = errors.len() as i64;
         summary.errors.extend(errors);
         if unreadable {
             summary.errors.push(format!("root is unreadable, its episodes were left untouched: {}", root.path));
-        } else {
-            trusted_roots.push(root.path.clone());
+            error_count += 1;
         }
-        all_files.extend(files);
+        work.push(RootWork { root, files, readable: !unreadable, errors: error_count });
     }
-    let total = all_files.len();
+
+    let total: usize = work.iter().map(|w| w.files.len()).sum();
     let mut seen_paths = Vec::with_capacity(total);
-    for (i, f) in all_files.iter().enumerate() {
-        summary.files_seen += 1;
-        on_progress(ScanProgress { done: i + 1, total, current_path: f.path.to_string_lossy().to_string() });
-        // A lossy path would be stored with U+FFFD and could never be opened, renamed or
-        // de-duplicated, so such files are reported rather than silently corrupted.
-        let path_str = match path_to_str(&f.path) {
-            Ok(p) => p,
-            Err(e) => { summary.errors.push(e.to_string()); continue; }
+    let mut done = 0usize;
+    let mut per_root: Vec<(i64, RootScan)> = Vec::new();
+
+    for w in &work {
+        let mut scan = RootScan {
+            at: now(),
+            files_seen: 0,
+            added: 0,
+            updated: 0,
+            missing: 0,
+            errors: w.errors,
+            readable: w.readable,
         };
-        let parsed = match db.get_override(&path_str)? {
-            Some(o) if o.kind == "ignore" => { seen_paths.push(path_str); continue; }
-            Some(o) => {
-                let base = parser::parse(&f.stem, &f.dirs);
-                ParsedName {
-                    title: o.title, season: o.season, episode: o.number,
-                    release_group: base.as_ref().and_then(|b| b.release_group.clone()),
-                    resolution: base.as_ref().and_then(|b| b.resolution.clone()),
-                    crc: base.and_then(|b| b.crc),
+        for f in &w.files {
+            done += 1;
+            summary.files_seen += 1;
+            scan.files_seen += 1;
+            on_progress(ScanProgress { done, total, current_path: f.path.to_string_lossy().to_string() });
+            // A lossy path would be stored with U+FFFD and could never be opened, renamed or
+            // de-duplicated, so such files are reported rather than silently corrupted.
+            let path_str = match path_to_str(&f.path) {
+                Ok(p) => p,
+                Err(e) => { summary.errors.push(e.to_string()); scan.errors += 1; continue; }
+            };
+            let parsed = match db.get_override(&path_str)? {
+                Some(o) if o.kind == "ignore" => { seen_paths.push(path_str); continue; }
+                Some(o) => {
+                    let base = parser::parse(&f.stem, &f.dirs);
+                    ParsedName {
+                        title: o.title, season: o.season, episode: o.number,
+                        release_group: base.as_ref().and_then(|b| b.release_group.clone()),
+                        resolution: base.as_ref().and_then(|b| b.resolution.clone()),
+                        crc: base.and_then(|b| b.crc),
+                    }
+                }
+                None => match parser::parse_with_confidence(&f.stem, &f.dirs) {
+                    Some(p) => {
+                        if p.low_confidence && let Some(parent) = f.path.parent() {
+                            low_conf_folders.insert(parent.to_string_lossy().to_string());
+                        }
+                        p.name
+                    }
+                    None => {
+                        summary.errors.push(format!("could not parse: {}", f.path.display()));
+                        scan.errors += 1;
+                        continue;
+                    }
+                },
+            };
+            seen_paths.push(path_str);
+            match db.upsert_episode(&parsed, f) {
+                Ok(Upsert::Added) => { summary.episodes_added += 1; scan.added += 1; }
+                Ok(Upsert::Updated) => { summary.episodes_updated += 1; scan.updated += 1; }
+                Err(e) => {
+                    summary.errors.push(format!("{}: {e}", f.path.display()));
+                    scan.errors += 1;
                 }
             }
-            None => match parser::parse_with_confidence(&f.stem, &f.dirs) {
-                Some(p) => {
-                    if p.low_confidence && let Some(parent) = f.path.parent() {
-                        low_conf_folders.insert(parent.to_string_lossy().to_string());
-                    }
-                    p.name
-                }
-                None => {
-                    summary.errors.push(format!("could not parse: {}", f.path.display()));
-                    continue;
-                }
-            },
-        };
-        seen_paths.push(path_str);
-        match db.upsert_episode(&parsed, f) {
-            Ok(Upsert::Added) => summary.episodes_added += 1,
-            Ok(Upsert::Updated) => summary.episodes_updated += 1,
-            Err(e) => summary.errors.push(format!("{}: {e}", f.path.display())),
+        }
+        per_root.push((w.root.id, scan));
+    }
+
+    // Missing-detection is per root so each root's count is its own, and an unreadable root is
+    // simply not asked.
+    for (w, (_, scan)) in work.iter().zip(per_root.iter_mut()) {
+        if w.readable {
+            let n = db.mark_missing_within(std::slice::from_ref(&w.root.path), &seen_paths)?;
+            scan.missing = n as i64;
+            summary.episodes_missing += n;
         }
     }
-    summary.episodes_missing = db.mark_missing_within(&trusted_roots, &seen_paths)?;
     db.prune_empty()?;
+    for (root_id, scan) in &per_root {
+        db.record_root_scan(*root_id, scan)?;
+    }
     summary.low_confidence_folders = low_conf_folders.into_iter().collect();
     Ok(summary)
 }
@@ -943,5 +1026,56 @@ mod tests {
         let s = run_scan(&db, &mut |_| {}).unwrap();
         assert_eq!(s.episodes_added, 1, "only the valid file is stored");
         assert!(s.errors.iter().any(|e| e.contains("not valid UTF-8")), "{:?}", s.errors);
+    }
+
+    #[test]
+    fn each_root_records_its_own_scan_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("Alpha - 01.mkv"), b"x").unwrap();
+        std::fs::write(a.join("Alpha - 02.mkv"), b"x").unwrap();
+        std::fs::write(b.join("Beta - 01.mkv"), b"x").unwrap();
+        let db = Db::open_memory().unwrap();
+        db.add_root(a.to_str().unwrap()).unwrap();
+        db.add_root(b.to_str().unwrap()).unwrap();
+        assert!(db.list_roots().unwrap().iter().all(|r| r.last_scan.is_none()), "never scanned yet");
+
+        run_scan(&db, &mut |_| {}).unwrap();
+        let roots = db.list_roots().unwrap();
+        let sa = roots[0].last_scan.clone().expect("root a scanned");
+        let sb = roots[1].last_scan.clone().expect("root b scanned");
+        assert_eq!((sa.files_seen, sa.added, sa.errors, sa.readable), (2, 2, 0, true));
+        assert_eq!((sb.files_seen, sb.added, sb.errors, sb.readable), (1, 1, 0, true));
+        assert!(sa.at > 0);
+
+        // A file removed from one root counts as missing against that root only.
+        std::fs::remove_file(a.join("Alpha - 02.mkv")).unwrap();
+        run_scan(&db, &mut |_| {}).unwrap();
+        let roots = db.list_roots().unwrap();
+        assert_eq!(roots[0].last_scan.as_ref().unwrap().missing, 1);
+        assert_eq!(roots[1].last_scan.as_ref().unwrap().missing, 0);
+        assert_eq!(roots[0].last_scan.as_ref().unwrap().files_seen, 1);
+    }
+
+    #[test]
+    fn an_unreadable_root_is_recorded_as_such() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        std::fs::create_dir_all(&gone).unwrap();
+        std::fs::write(gone.join("Show - 01.mkv"), b"x").unwrap();
+        let db = Db::open_memory().unwrap();
+        db.add_root(gone.to_str().unwrap()).unwrap();
+        run_scan(&db, &mut |_| {}).unwrap();
+        assert!(db.list_roots().unwrap()[0].last_scan.as_ref().unwrap().readable);
+
+        std::fs::remove_dir_all(&gone).unwrap();
+        run_scan(&db, &mut |_| {}).unwrap();
+        let s = db.list_roots().unwrap()[0].last_scan.clone().unwrap();
+        assert!(!s.readable, "an unmounted share must be recorded as unreadable");
+        assert_eq!(s.missing, 0, "and must not have marked anything missing");
+        assert!(s.errors > 0);
     }
 }
