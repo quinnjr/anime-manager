@@ -4,3 +4,5 @@
 /.svelte-kit
 /src-tauri/target
 /src-tauri/gen
+/dist
+/.worktrees

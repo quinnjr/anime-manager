@@ -1,4 +1,5 @@
-use crate::anilist::{self, AniList};
+use crate::anilist;
+use crate::metadata::{self, Providers};
 use crate::db::{self, Db};
 use crate::llm::{self, AssistQueue, Llm};
 use crate::error::Result;
@@ -12,7 +13,9 @@ use tauri::{AppHandle, Emitter, State};
 pub struct AppState {
     pub db: Arc<Db>,
     pub player: Arc<Player>,
-    pub anilist: Arc<AniList>,
+    pub providers: Arc<Providers>,
+    /// Guards the background match-and-cover pass so repeated scans cannot stack it.
+    pub matching: Arc<AssistQueue>,
     pub assist: Arc<AssistQueue>,
 }
 
@@ -59,17 +62,49 @@ pub async fn scan(app: AppHandle, state: State<'_, AppState>) -> Result<ScanSumm
             });
         }
     }
-    let db2 = state.db.clone();
-    let api = state.anilist.clone();
-    let app3 = app.clone();
-    tauri::async_runtime::spawn(async move {
-        anilist::auto_match_all(db2, api, move |id| {
-            let _ = app3.emit("show-updated", id);
-        })
-        .await;
-    });
+    spawn_match_pass(&app, &state);
     Ok(summary)
 }
+
+/// Resolve every unmatched show and fetch any missing cover art, in the background.
+/// Guarded so repeated calls cannot stack a second pass over the same shows.
+fn spawn_match_pass(app: &AppHandle, state: &State<'_, AppState>) {
+    let db = state.db.clone();
+    let providers = state.providers.clone();
+    let matching = state.matching.clone();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(_guard) = matching.try_start() else { return };
+        let a = app.clone();
+        metadata::auto_match_all(db.clone(), providers.clone(), move |p| {
+            if let Some(id) = p.changed { let _ = a.emit("show-updated", id); }
+            let _ = a.emit("match-progress", &p);
+        })
+        .await;
+        let a = app.clone();
+        // Cover art comes second: the URLs only exist once a match has been applied.
+        anilist::download_missing_covers(db, providers.anilist.client().clone(), move |p| {
+            if let Some(id) = p.changed { let _ = a.emit("show-updated", id); }
+            let _ = a.emit("match-progress", &p);
+        })
+        .await;
+        let _ = app.emit("match-progress", MatchProgress::default());
+        let _ = app.emit("library-changed", ());
+    });
+}
+
+/// Run matching and artwork without re-walking the library. Recovering from a provider outage
+/// otherwise meant a full rescan of every file, which is slow over a network share and has
+/// nothing to do with matching. Returns how many shows are pending.
+#[tauri::command]
+pub fn match_library(app: AppHandle, state: State<'_, AppState>) -> Result<usize> {
+    let pending = state.db.shows_needing_match()?.len() + state.db.shows_needing_cover()?.len();
+    spawn_match_pass(&app, &state);
+    Ok(pending)
+}
+
+#[tauri::command]
+pub fn match_progress(state: State<'_, AppState>) -> Result<bool> { Ok(state.matching.is_running()) }
 
 #[tauri::command]
 pub fn list_shows(state: State<'_, AppState>, filter: Option<String>) -> Result<Vec<ShowCard>> {
@@ -128,20 +163,37 @@ pub async fn play(app: AppHandle, state: State<'_, AppState>, episode_id: i64) -
 }
 
 #[tauri::command]
-pub async fn search_anilist(state: State<'_, AppState>, query: String) -> Result<Vec<AniListHit>> {
-    state.anilist.search(&query).await
+pub async fn search_metadata(state: State<'_, AppState>, query: String) -> Result<SearchResult> {
+    // A provider being down is a warning, not a failure: the other may legitimately have zero
+    // matches for this query, and reporting that as an error left stale hits on screen.
+    let (hits, warnings) = state.providers.search(&query).await;
+    Ok(SearchResult { hits, warnings })
 }
 
 #[tauri::command]
-pub async fn rematch(app: AppHandle, state: State<'_, AppState>, show_id: i64, anilist_id: Option<i64>) -> Result<ShowDetail> {
-    match anilist_id {
+pub async fn rematch(app: AppHandle, state: State<'_, AppState>, show_id: i64, match_id: Option<i64>, source: Option<String>) -> Result<ShowDetail> {
+    match match_id {
         Some(id) => {
+            let source = source.unwrap_or_else(|| crate::anilist::SOURCE.to_string());
             let hit = state
-                .anilist
-                .by_id(id)
+                .providers
+                .by_id(&source, id)
                 .await?
-                .ok_or_else(|| crate::error::AppError::Network(format!("no AniList entry {id}")))?;
+                .ok_or_else(|| crate::error::AppError::Network(format!("no {source} entry {id}")))?;
             state.db.set_anilist(show_id, &hit)?;
+            // Fetch the art in the background: it is a network round trip on someone else's CDN
+            // and must not hold the modal open, nor let a stalled fetch block the command.
+            if let Some(url) = hit.cover_url.clone() {
+                let db = state.db.clone();
+                let client = state.providers.anilist.client().clone();
+                let app_c = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    match anilist::download_cover(&db, &client, show_id, &url).await {
+                        Ok(_) => { let _ = app_c.emit("show-updated", show_id); }
+                        Err(e) => eprintln!("cover {show_id}: {e}"),
+                    }
+                });
+            }
         }
         None => state.db.clear_anilist(show_id)?,
     }

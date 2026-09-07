@@ -24,6 +24,20 @@
     finally { scanning = false; progress = null; }
   }
 
+  let matchingNow = $state(false);
+
+  // Matching used to ride along with a scan, so recovering from a provider outage meant
+  // re-walking every file. This asks for titles and art on their own.
+  async function matchLibrary() {
+    matchingNow = true;
+    try {
+      const pending = await api.matchLibrary();
+      toasts.push(pending === 0 ? 'info' : 'success',
+        pending === 0 ? 'Everything is already matched.' : `Matching ${pending} show${pending === 1 ? '' : 's'} in the background.`);
+    } catch (e) { toasts.error(e); }
+    finally { matchingNow = false; }
+  }
+
   async function addFolder() {
     const dir = await open({ directory: true, multiple: false });
     if (!dir) return;
@@ -31,13 +45,19 @@
   }
 </script>
 
-<div class="flex items-center gap-3">
-  <button class="rounded bg-zinc-800 px-3 py-1 text-sm hover:bg-zinc-700" onclick={addFolder}>Add folder</button>
-  <button class="rounded bg-zinc-800 px-3 py-1 text-sm hover:bg-zinc-700 disabled:opacity-50" disabled={scanning} onclick={rescan}>Rescan</button>
+<div class="flex items-center gap-2">
+  <button class="btn btn-key" onclick={addFolder}>Add folder</button>
+  <button class="btn" disabled={scanning} onclick={rescan}>{scanning ? 'Scanning' : 'Rescan'}</button>
+  <button class="btn" disabled={matchingNow} onclick={matchLibrary} title="Look up titles and cover art without re-reading every file">
+    Match &amp; fetch art
+  </button>
   {#if progress}
-    <div class="h-2 w-48 overflow-hidden rounded bg-zinc-800">
-      <div class="h-full bg-indigo-500" style="width: {progress.total ? (100 * progress.done) / progress.total : 0}%"></div>
+    <div class="ml-2 flex items-center gap-2">
+      <!-- A read head crossing the shelf, not a generic loading bar. -->
+      <div class="relative h-[3px] w-40 bg-edge">
+        <div class="absolute inset-y-0 left-0 bg-sub" style="width: {progress.total ? (100 * progress.done) / progress.total : 0}%"></div>
+      </div>
+      <span class="tag tabular-nums">{progress.done}/{progress.total}</span>
     </div>
-    <span class="truncate text-xs text-zinc-400">{progress.done}/{progress.total}</span>
   {/if}
 </div>

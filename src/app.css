@@ -1,1 +1,174 @@
 @import "tailwindcss";
+
+/* ---------------------------------------------------------------------------
+   Spine & Subtitle — a visual identity for a personal anime archive.
+
+   Two things are true about this collection that no streaming UI accounts for:
+   the shelf is physical in feel (long romaji titles compressed onto narrow
+   spines) and the files are fansub releases (their names carry group tags,
+   resolutions and CRCs that matter to the person who curated them).
+
+   So: a condensed display face for titles, monospace for the release metadata
+   the app would otherwise hide, and a warm archival dark that lets the cover
+   art be the only real colour on screen.
+   --------------------------------------------------------------------------- */
+
+@font-face {
+  font-family: 'Archivo';
+  src: url('/fonts/archivo.woff2') format('woff2-variations');
+  font-weight: 400 900;
+  font-stretch: 62% 125%;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Public Sans';
+  src: url('/fonts/publicsans.woff2') format('woff2-variations');
+  font-weight: 300 700;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Plex Mono';
+  src: url('/fonts/plexmono-400.woff2') format('woff2');
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Plex Mono';
+  src: url('/fonts/plexmono-600.woff2') format('woff2');
+  font-weight: 600;
+  font-display: swap;
+}
+
+@theme {
+  /* Warm archival dark: an archive box, not a blue-black void. The covers are
+     the only saturated thing on screen and the chrome stays out of their way. */
+  --color-ink: #14100e;
+  --color-board: #1d1815;
+  --color-riser: #241d19;
+  --color-edge: #342b25;
+  --color-paper: #efe8dc;
+  --color-muted: #9c8e7f;
+  --color-faint: #6b6157;
+  /* State, not decoration: yellow is the colour of a subtitle track and marks
+     anything unwatched or actionable; teal marks something in flight. */
+  --color-sub: #f0c24b;
+  --color-live: #6fc3b2;
+  --color-alarm: #e0705f;
+
+  --font-display: 'Archivo', 'DejaVu Sans Condensed', system-ui, sans-serif;
+  --font-sans: 'Public Sans', system-ui, sans-serif;
+  --font-mono: 'Plex Mono', 'DejaVu Sans Mono', monospace;
+}
+
+html { background: var(--color-ink); }
+
+body {
+  font-family: var(--font-sans);
+  font-weight: 400;
+  color: var(--color-paper);
+  background: var(--color-ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Spine lettering: the width axis earns its keep here. A long romaji title has
+   to survive a narrow column the way it survives a narrow BD spine. */
+.spine {
+  font-family: var(--font-display);
+  font-stretch: 74%;
+  font-weight: 700;
+  letter-spacing: 0.005em;
+  line-height: 1.04;
+}
+.spine-wide {
+  font-family: var(--font-display);
+  font-stretch: 108%;
+  font-weight: 800;
+}
+
+/* The signature: a show title set the way a fansub subtitle sits on a frame —
+   warm white, hard outline, riding the lower third of the artwork. Used once
+   per screen, never twice. */
+.subtitle-type {
+  font-family: var(--font-display);
+  font-stretch: 80%;
+  font-weight: 800;
+  color: #fff;
+  -webkit-text-stroke: 0.14em rgba(0, 0, 0, 0.92);
+  paint-order: stroke fill;
+  text-shadow: 0 0.06em 0.12em rgba(0, 0, 0, 0.55);
+  letter-spacing: 0.004em;
+}
+
+/* Release metadata is machine output; it should read as such. */
+.tag {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  letter-spacing: 0.02em;
+  color: var(--color-muted);
+}
+.tag-chip {
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-muted);
+  border: 1px solid var(--color-edge);
+  border-radius: 2px;
+  padding: 0.05rem 0.3rem;
+}
+
+/* Section eyebrows label a region; they are not sequence markers, because
+   nothing on these screens is a sequence. */
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--color-faint);
+}
+
+/* Controls */
+.btn {
+  font-family: var(--font-sans);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  padding: 0.34rem 0.7rem;
+  border-radius: 3px;
+  border: 1px solid var(--color-edge);
+  background: var(--color-riser);
+  color: var(--color-paper);
+  transition: border-color 120ms ease, background 120ms ease, color 120ms ease;
+}
+.btn:hover:not(:disabled) { border-color: var(--color-muted); background: #2b231e; }
+.btn:disabled { opacity: 0.42; }
+.btn-key {
+  background: var(--color-sub);
+  border-color: var(--color-sub);
+  color: #1b1408;
+}
+.btn-key:hover:not(:disabled) { background: #f8d067; border-color: #f8d067; }
+
+.field {
+  font-family: var(--font-sans);
+  font-size: 0.8125rem;
+  background: var(--color-ink);
+  color: var(--color-paper);
+  border: 1px solid var(--color-edge);
+  border-radius: 3px;
+  padding: 0.34rem 0.55rem;
+}
+.field:focus { outline: none; border-color: var(--color-sub); }
+
+/* One focus treatment everywhere, always visible. */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-sub);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

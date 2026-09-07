@@ -63,6 +63,71 @@ scanner::scan_dir → per file: db.get_override() → parser::parse_with_confide
 
 **Frontend contract.** `src/lib/api.ts` is the only place that calls `invoke`; keep the TS interfaces in step with `models.rs`. Tauri maps camelCase JS args to snake_case Rust params automatically. Events (`scan-progress`, `library-changed`, `show-updated`, `playback-changed`, `llm-assist-progress`, `llm-assist`, `error`) are subscribed in `+layout.svelte` and the route components. Stores are Svelte 5 runes in `.svelte.ts` files.
 
+## Metadata providers
+
+`metadata::Providers` cross-searches AniList and Kitsu and merges the results; a provider that
+errors is skipped rather than failing the search. This is not hypothetical redundancy — AniList
+disabled its API outright in September 2026 (403, "temporarily disabled due to severe stability
+issues") and Jikan was returning 504 at the same time, while Kitsu stayed up. Kitsu needs no key.
+
+`shows.match_source` records which provider matched, and `anilist_id` holds *that provider's* id,
+so it is only an AniList id when `match_source = 'anilist'`. Auto-match is gated on
+`match_source IS NULL`, not `anilist_id IS NULL`, or a Kitsu-matched show would be re-searched on
+every scan. Ranking is the shared similarity threshold, so a strong Kitsu hit beats a weak
+AniList one rather than losing on provider order.
+
+## Matching is separate from scanning
+
+`commands::match_library` runs the match-and-artwork pass on its own (`spawn_match_pass`, shared
+with `scan`). Matching used to ride along with a scan only, so recovering from a provider outage
+meant re-walking every file — slow over a network share and unrelated to matching. Cover art has
+no URL until a match is applied, so an unmatched library has nothing to download: "covers are
+missing" almost always means "nothing is matched". Both phases report `match-progress`
+`{done, total, title, phase, changed, running}`; `changed` names the one show to refresh.
+
+## Cover art
+
+AniList cover URLs are downloaded to `$XDG_DATA_HOME/anime-manager/covers/<show id>.<ext>`
+after matching (`anilist::download_missing_covers`, and directly on a manual re-match), so the
+library still renders offline. The webview reads them through Tauri's asset protocol, which
+needs three things in agreement: the `protocol-asset` cargo feature, `app.security.assetProtocol`
+in `tauri.conf.json`, and a scope covering the directory (`$DATA` is `dirs::data_dir()`, the same
+base the database uses). There is no `core:asset:*` capability permission — adding one fails the
+build.
+
+`Cover.svelte` walks `coverSources()` on image error, local copy first and the remote URL second,
+so a scope or protocol mistake degrades to fetching from AniList rather than showing nothing.
+
+## Visual identity
+
+"Spine & Subtitle", in `src/app.css`. Two facts about this collection drive it: long romaji
+titles compress onto narrow spines, and the files are fansub releases whose group tags,
+resolutions and CRCs matter to whoever curated them.
+
+- **Type.** Archivo (variable, the width axis exploited for spine-condensed titles), Public Sans
+  for UI prose, IBM Plex Mono for anything the machine produced — paths, groups, resolutions,
+  counts. Self-hosted in `static/fonts` (148 KB): this app is offline-capable, so it must not
+  reach out to a font CDN.
+- **Colour carries state, never decoration.** The ground is a warm archival dark so cover art is
+  the only saturated thing on screen. Yellow (`--color-sub`) means unwatched or the action you
+  most likely want; teal (`--color-live`) means in flight; red (`--color-alarm`) means the file
+  is gone. A Play button is only yellow when its episode is unwatched — if the accent appears on
+  every row it stops meaning anything.
+- **The signature is `.subtitle-type`**: a show title set as a fansub subtitle, hard-outlined
+  over its own artwork. It appears once per screen, on the show page hero, and nowhere else.
+
+Use `.spine` for titles, `.tag`/`.tag-chip` for release metadata, `.eyebrow` for region labels,
+`.btn`/`.field` for controls. Numbered markers are deliberately absent: nothing on these screens
+is a sequence, so numbering would decorate rather than inform.
+
+## Platform quirks
+
+`lib::apply_dmabuf_workaround` sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` when running under
+Wayland on the proprietary NVIDIA driver, before GTK initialises. Without it WebKitGTK fails
+to allocate GBM buffers, issues an invalid Wayland request, and the compositor drops the client
+with `Error 71 (Protocol error)` before the window is ever mapped — the app looks like it
+crashes instantly. An explicit setting from the environment always wins.
+
 ## Invariants that look like dead code
 
 These exist because their absence destroyed data in review. Do not "simplify" them away:
@@ -84,6 +149,23 @@ cargo run --manifest-path src-tauri/Cargo.toml --example parse_dump -- /path/to/
 ```
 
 It prints one tab-separated line per file, `OK / title / S<n> / E<n> / group / path`, or `FAIL` with the path. Watch the unparsed count, the distinct-title count, and which files moved in or out of season 0. Unit tests alone have missed regressions this caught.
+
+## Release builds
+
+`scripts/build-release.sh` produces the `.deb`, `.rpm` and `.AppImage` into `dist/` with a
+`SHA256SUMS.txt`; `.github/workflows/release.yml` does the same on a `v*` tag push and uploads
+them to the GitHub release. Both run the test suites first.
+
+AppImage bundling needs two environment variables that the script sets and CI sets in part:
+
+- `APPIMAGE_EXTRACT_AND_RUN=1` — linuxdeploy is itself an AppImage and cannot self-mount
+  without usable FUSE.
+- `NO_STRIP=1` — linuxdeploy bundles an old binutils whose `strip` aborts on the DT_RELR
+  relocations (`.relr.dyn`) that Arch and recent Fedora use, which fails the whole bundle.
+  CI leaves stripping on because ubuntu-22.04 predates that and the artifact is ~30 MB smaller.
+
+`--bundles` is passed explicitly rather than relying on `tauri.conf.json`'s `"targets": "all"`,
+so a format is never silently skipped; both paths fail loudly if one is missing.
 
 ## Packaging
 

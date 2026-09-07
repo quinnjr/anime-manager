@@ -3,7 +3,8 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
 export type EpisodeStatus = 'unplayed' | 'playing' | 'played' | 'missing';
 export interface AppError { kind: 'Io' | 'Db' | 'Parse' | 'Network' | 'Player'; message: string }
-export interface Root { id: number; path: string; added_at: number }
+export interface RootScan { at: number; files_seen: number; added: number; updated: number; missing: number; errors: number; readable: boolean }
+export interface Root { id: number; path: string; added_at: number; last_scan: RootScan | null }
 export interface Episode {
   id: number; season_id: number; number: number; path: string; size: number; mtime: number;
   release_group: string | null; resolution: string | null; crc: string | null;
@@ -12,17 +13,24 @@ export interface Episode {
 export interface SeasonDetail { id: number; number: number; episodes: Episode[] }
 export interface ShowDetail {
   id: number; parsed_title: string; display_title: string; canonical_title: string | null;
-  anilist_id: number | null; cover_url: string | null; total_episodes: number | null;
+  anilist_id: number | null; match_source: MetadataSource | null;
+  cover_url: string | null; cover_path: string | null; total_episodes: number | null;
   user_title_override: string | null; seasons: SeasonDetail[];
 }
-export interface ShowCard { id: number; display_title: string; cover_url: string | null; episode_count: number; unwatched_count: number }
+export interface ShowCard { id: number; display_title: string; cover_url: string | null; cover_path: string | null; episode_count: number; unwatched_count: number }
 export interface ScanSummary { files_seen: number; episodes_added: number; episodes_updated: number; episodes_missing: number; errors: string[]; low_confidence_folders: string[] }
 export interface InspectChange { path: string; from: string; to: string }
+export interface MatchProgress { done: number; total: number; title: string; phase: string; changed: number | null; running: boolean }
 export interface AssistProgress { done: number; total: number; folder: string; running: boolean }
 export interface InspectReport { folders: number; ignored: number; changes: InspectChange[]; notes: string[]; show_id: number | null }
 export interface ScanProgress { done: number; total: number; current_path: string }
 export interface PlaybackChanged { episode_id: number; status: EpisodeStatus; position_secs: number; duration_secs: number | null }
-export interface AniListHit { id: number; title_romaji: string; title_english: string | null; cover_url: string | null; episodes: number | null }
+export type MetadataSource = 'anilist' | 'kitsu';
+export interface MetadataHit {
+  id: number; source: MetadataSource; title_romaji: string; title_english: string | null;
+  cover_url: string | null; episodes: number | null;
+}
+export interface SearchResult { hits: MetadataHit[]; warnings: string[] }
 export interface RenameEntry { episode_id: number; old_path: string; new_path: string; conflict: string | null }
 export interface RenamePlan { entries: RenameEntry[] }
 export interface RenameResult { renamed: number; skipped: string[] }
@@ -37,8 +45,9 @@ export const api = {
   getShow: (id: number) => invoke<ShowDetail>('get_show', { id }),
   play: (episodeId: number) => invoke<void>('play', { episodeId }),
   setStatus: (episodeId: number, status: EpisodeStatus) => invoke<void>('set_status', { episodeId, status }),
-  rematch: (showId: number, anilistId: number | null) => invoke<ShowDetail>('rematch', { showId, anilistId }),
-  searchAnilist: (query: string) => invoke<AniListHit[]>('search_anilist', { query }),
+  rematch: (showId: number, matchId: number | null, source: MetadataSource | null = null) =>
+    invoke<ShowDetail>('rematch', { showId, matchId, source }),
+  searchMetadata: (query: string) => invoke<SearchResult>('search_metadata', { query }),
   previewRename: (target: RenameTarget) => invoke<RenamePlan>('preview_rename', { target }),
   applyRename: (plan: RenamePlan) => invoke<RenameResult>('apply_rename', { plan }),
   undoRename: () => invoke<RenameResult>('undo_rename'),
@@ -49,6 +58,8 @@ export const api = {
   llmTest: () => invoke<string>('llm_test'),
   assistProgress: () => invoke<AssistProgress>('assist_progress'),
   clearAiDecisions: () => invoke<number>('clear_ai_decisions'),
+  matchLibrary: () => invoke<number>('match_library'),
+  matchRunning: () => invoke<boolean>('match_progress'),
   setShowTitle: (showId: number, title: string | null) => invoke<ShowDetail>('set_show_title', { showId, title })
 };
 
