@@ -63,6 +63,14 @@ scanner::scan_dir → per file: db.get_override() → parser::parse_with_confide
 
 **Frontend contract.** `src/lib/api.ts` is the only place that calls `invoke`; keep the TS interfaces in step with `models.rs`. Tauri maps camelCase JS args to snake_case Rust params automatically. Events (`scan-progress`, `library-changed`, `show-updated`, `playback-changed`, `llm-assist-progress`, `llm-assist`, `error`) are subscribed in `+layout.svelte` and the route components. Stores are Svelte 5 runes in `.svelte.ts` files.
 
+## Platform quirks
+
+`lib::apply_dmabuf_workaround` sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` when running under
+Wayland on the proprietary NVIDIA driver, before GTK initialises. Without it WebKitGTK fails
+to allocate GBM buffers, issues an invalid Wayland request, and the compositor drops the client
+with `Error 71 (Protocol error)` before the window is ever mapped — the app looks like it
+crashes instantly. An explicit setting from the environment always wins.
+
 ## Invariants that look like dead code
 
 These exist because their absence destroyed data in review. Do not "simplify" them away:
