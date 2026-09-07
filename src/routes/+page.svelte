@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, onEvent, type ShowCard as ShowCardT } from '$lib/api';
+  import { api, onEvent, SHOW_SORTS, type ShowCard as ShowCardT, type ShowSort } from '$lib/api';
   import { isTypingTarget } from '$lib/keys';
   import { toasts } from '$lib/stores/toasts.svelte';
   import ShowCard from '$lib/components/ShowCard.svelte';
@@ -8,6 +8,7 @@
 
   let shows = $state<ShowCardT[]>([]);
   let filter = $state('');
+  let sort = $state<ShowSort>('title');
   let search: HTMLInputElement | undefined = $state();
 
   // Each keystroke starts a request; without a generation guard the slowest (broadest) reply
@@ -18,7 +19,7 @@
   async function load() {
     const mine = ++generation;
     try {
-      const rows = await api.listShows(filter);
+      const rows = await api.listShows(filter, sort);
       if (mine === generation) shows = rows;
     } catch (e) { if (mine === generation) toasts.error(e); }
   }
@@ -28,8 +29,21 @@
     debounce = setTimeout(load, 120);
   }
 
-  onMount(() => {
+  // The chosen order is worth remembering; re-picking it every launch is pure friction.
+  async function changeSort(next: ShowSort) {
+    sort = next;
     load();
+    try { await api.setSetting('library_sort', next); } catch { /* ordering still applied */ }
+  }
+
+  onMount(() => {
+    api.getSettings()
+      .then((s) => {
+        const saved = s.library_sort as ShowSort | undefined;
+        if (saved && SHOW_SORTS.some((o) => o.value === saved)) sort = saved;
+      })
+      .catch(() => {})
+      .finally(load);
     const us = [
       onEvent('show-updated', load),
       onEvent('library-changed', load),
@@ -54,6 +68,17 @@
   <span class="hidden h-8 w-px bg-edge sm:block"></span>
   <ScanBar onFinished={load} />
   <span class="flex-1"></span>
+  <label class="flex items-center gap-2">
+    <span class="eyebrow">order</span>
+    <select
+      class="field"
+      aria-label="Sort shows"
+      value={sort}
+      onchange={(e) => changeSort(e.currentTarget.value as ShowSort)}
+    >
+      {#each SHOW_SORTS as o (o.value)}<option value={o.value}>{o.label}</option>{/each}
+    </select>
+  </label>
   <input
     bind:this={search}
     bind:value={filter}

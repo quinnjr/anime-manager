@@ -436,14 +436,14 @@ mod tests {
         db.upsert_episode(&pn("Season1", 1, 1), &rf("/lib/Sekirei Complete/Season1/01_Sekirei_KDG.mkv")).unwrap();
         db.upsert_episode(&pn("Season1", 1, 2), &rf("/lib/Sekirei Complete/Season1/OVA_Kusano.mkv")).unwrap();
         db.upsert_episode(&pn("Season1", 1, 3), &rf("/lib/Sekirei Complete/Season1/sample.mkv")).unwrap();
-        let wrong_id = db.list_shows("").unwrap()[0].id;
+        let wrong_id = db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].id;
         let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()));
         let r = inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), wrong_id).await.unwrap();
         assert_eq!(r.folders, 1);
         assert_eq!(r.ignored, 1);
         assert_eq!(r.changes.len(), 3);
         assert_eq!(r.notes, vec!["Sekirei Complete/Season1: first season"]);
-        let shows = db.list_shows("").unwrap();
+        let shows = db.list_shows("", crate::models::ShowSort::Title).unwrap();
         assert_eq!(shows.len(), 1);
         assert_eq!(shows[0].display_title, "Sekirei");
         assert_eq!(r.show_id, Some(shows[0].id));
@@ -507,7 +507,7 @@ mod tests {
         assert_eq!((seen[n].done, seen[n].total), (n + 1, n + 1));
         assert!(!q.is_running());
         assert_eq!(q.progress().total, 0);
-        assert_eq!(db.list_shows("").unwrap().len(), 1, "all merged into T");
+        assert_eq!(db.list_shows("", crate::models::ShowSort::Title).unwrap().len(), 1, "all merged into T");
     }
 
     #[tokio::test]
@@ -522,7 +522,7 @@ mod tests {
         assert_eq!(r.folders, 0);
         assert_eq!(r.notes.len(), 1);
         assert!(r.notes[0].contains("parse"));
-        assert_eq!(db.list_shows("").unwrap()[0].display_title, "X");
+        assert_eq!(db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].display_title, "X");
     }
 
     #[test]

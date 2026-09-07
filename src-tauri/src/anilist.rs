@@ -318,7 +318,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         let p = ParsedName { title: "Show".into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
         db.upsert_episode(&p, &RawFile { path: "/a/1.mkv".into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] }).unwrap();
-        let id = db.list_shows("").unwrap()[0].id;
+        let id = db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].id;
         let client = reqwest::Client::new();
         let hit = |n: &str| MetadataHit { id: 1, source: "anilist".into(), title_romaji: "Show".into(),
             title_english: None, cover_url: Some(format!("{}/{n}", server.uri())), episodes: None };

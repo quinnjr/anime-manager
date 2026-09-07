@@ -107,8 +107,8 @@ pub fn match_library(app: AppHandle, state: State<'_, AppState>) -> Result<usize
 pub fn match_progress(state: State<'_, AppState>) -> Result<bool> { Ok(state.matching.is_running()) }
 
 #[tauri::command]
-pub fn list_shows(state: State<'_, AppState>, filter: Option<String>) -> Result<Vec<ShowCard>> {
-    state.db.list_shows(filter.as_deref().unwrap_or(""))
+pub fn list_shows(state: State<'_, AppState>, filter: Option<String>, sort: Option<ShowSort>) -> Result<Vec<ShowCard>> {
+    state.db.list_shows(filter.as_deref().unwrap_or(""), sort.unwrap_or_default())
 }
 
 #[tauri::command]

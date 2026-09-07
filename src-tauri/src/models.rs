@@ -103,6 +103,42 @@ pub struct ShowCard {
     pub unwatched_count: i64,
 }
 
+/// How the library grid is ordered. Every option answers a question someone actually asks of a
+/// shelf this size, rather than exposing every column the table happens to have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShowSort {
+    /// Alphabetical — the way you look something up when you already know what you want.
+    #[default]
+    Title,
+    /// Most unwatched episodes first: what is waiting for you.
+    Unwatched,
+    /// Most recently played first: what you are part-way through.
+    LastPlayed,
+    /// Most recently added to the library first.
+    RecentlyAdded,
+    /// Newest file on disk first: what the downloader brought in.
+    RecentlyUpdated,
+}
+
+impl ShowSort {
+    /// The ORDER BY body for this option. Every option falls back to title so the grid never
+    /// reshuffles arbitrarily between two shows that tie.
+    pub(crate) fn order_by(self, dt: &str) -> String {
+        let episodes_of = "FROM episodes e JOIN seasons se ON e.season_id = se.id WHERE se.show_id = s.id";
+        match self {
+            Self::Title => format!("{dt} COLLATE NOCASE ASC"),
+            Self::Unwatched => format!(
+                "(SELECT COUNT(*) {episodes_of} AND e.status IN ('unplayed','playing')) DESC, {dt} COLLATE NOCASE ASC"),
+            // NULL sorts lowest in SQLite, so never-played shows land at the end under DESC.
+            Self::LastPlayed => format!(
+                "(SELECT MAX(e.last_played_at) {episodes_of}) DESC, {dt} COLLATE NOCASE ASC"),
+            Self::RecentlyAdded => format!("s.created_at DESC, {dt} COLLATE NOCASE ASC"),
+            Self::RecentlyUpdated => format!("(SELECT MAX(e.mtime) {episodes_of}) DESC, {dt} COLLATE NOCASE ASC"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ScanSummary {
     pub files_seen: usize,

@@ -6,7 +6,7 @@ pkgrel=1
 pkgdesc='Scan an anime collection, play episodes in mpv and track what you have watched'
 arch=('x86_64')
 url='https://github.com/quinnjr/anime-manager'
-license=('MIT')
+license=('MIT' 'CC-BY-3.0')
 # Runtime libraries the binary actually links (readelf -d), plus mpv, which the player shells out to.
 # SQLite is statically linked (rusqlite "bundled") and TLS is rustls, so neither is a dependency.
 depends=('webkit2gtk-4.1' 'gtk3' 'glib2' 'cairo' 'gdk-pixbuf2' 'libsoup3' 'dbus' 'gcc-libs' 'glibc' 'mpv')
@@ -50,4 +50,6 @@ package() {
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   # MIT has no shared copy under /usr/share/licenses/common, so ship the text.
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  # The icon is CC BY 3.0, which requires the attribution to travel with it.
+  install -Dm644 NOTICE "$pkgdir/usr/share/licenses/$pkgname/NOTICE"
 }
