@@ -74,7 +74,6 @@ jobs:
         run: pnpm tauri build --bundles deb,rpm,appimage
 
       - name: Collect artifacts
-        id: collect
         run: |
           mkdir -p dist
           find src-tauri/target/release/bundle \
@@ -96,4 +95,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
-        run: gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+        run: |
+          # `git flow release finish` pushes a tag but creates no release object, so make one
+          # if it is missing rather than failing the upload.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes
+          fi
+          gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
