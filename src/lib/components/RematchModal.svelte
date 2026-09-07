@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
+  import { untrack } from 'svelte';
   import { api, type AniListHit } from '$lib/api';
   import { toasts } from '$lib/stores/toasts.svelte';
 
@@ -8,21 +10,39 @@
   let hits = $state<AniListHit[]>([]);
   let busy = $state(false);
 
-  $effect(() => { if (open) { query = initialQuery; search(); } });
+  // search() reads `query` synchronously, so calling it inside the effect made `query` a
+  // dependency of the effect that resets it: every keystroke snapped the box back to the
+  // parsed title and fired another AniList request. untrack keeps the reset one-way.
+  $effect(() => {
+    if (!open) return;
+    untrack(() => { query = initialQuery; search(); });
+  });
 
+  let searchGen = 0;
   async function search() {
+    const mine = ++searchGen;
     busy = true;
-    try { hits = await api.searchAnilist(query); } catch (e) { toasts.error(e); } finally { busy = false; }
+    try {
+      const rows = await api.searchAnilist(query);
+      if (mine === searchGen) hits = rows;
+    } catch (e) { if (mine === searchGen) toasts.error(e); }
+    finally { if (mine === searchGen) busy = false; }
   }
   async function pick(id: number | null) {
     try { await api.rematch(showId, id); open = false; onDone(); } catch (e) { toasts.error(e); }
   }
+
+  onMount(() => {
+    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape' && open) { e.preventDefault(); open = false; } };
+    window.addEventListener('keydown', esc);
+    return () => window.removeEventListener('keydown', esc);
+  });
 </script>
 
 {#if open}
   <div class="fixed inset-0 z-40 flex items-center justify-center bg-black/60" onclick={() => (open = false)} role="presentation">
-    <div class="w-[520px] rounded-lg bg-zinc-900 p-5 ring-1 ring-zinc-700" onclick={(e) => e.stopPropagation()} role="dialog">
-      <h2 class="mb-3 text-lg font-semibold">Match on AniList</h2>
+    <div class="w-[520px] rounded-lg bg-zinc-900 p-5 ring-1 ring-zinc-700" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-labelledby="rematch-title" tabindex="-1">
+      <h2 id="rematch-title" class="mb-3 text-lg font-semibold">Match on AniList</h2>
       <form class="mb-3 flex gap-2" onsubmit={(e) => { e.preventDefault(); search(); }}>
         <input bind:value={query} class="flex-1 rounded bg-zinc-800 px-3 py-1 text-sm" />
         <button class="rounded bg-zinc-700 px-3 py-1 text-sm" disabled={busy}>Search</button>

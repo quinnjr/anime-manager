@@ -21,7 +21,7 @@ pub fn is_video(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-pub fn scan_dir(root: &Path, on_file: &mut dyn FnMut(&Path)) -> (Vec<RawFile>, Vec<String>) {
+pub fn scan_dir(root: &Path) -> (Vec<RawFile>, Vec<String>) {
     let mut files = Vec::new();
     let mut errors = Vec::new();
     let is_hidden = |e: &walkdir::DirEntry| {
@@ -58,7 +58,6 @@ pub fn scan_dir(root: &Path, on_file: &mut dyn FnMut(&Path)) -> (Vec<RawFile>, V
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let path = entry.path().to_path_buf();
-        on_file(&path);
         files.push(RawFile {
             stem: path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string(),
             dirs: path.ancestors().skip(1)
@@ -88,11 +87,9 @@ mod tests {
         fs::write(s2.join("notes.txt"), b"x").unwrap();
         fs::write(dir.path().join("Show/cover.jpg"), b"x").unwrap();
 
-        let mut seen = 0;
-        let (files, errors) = scan_dir(dir.path(), &mut |_| seen += 1);
+        let (files, errors) = scan_dir(dir.path());
         assert!(errors.is_empty());
         assert_eq!(files.len(), 2);
-        assert_eq!(seen, 2);
         let f = files.iter().find(|f| f.stem == "Show - 01").unwrap();
         assert_eq!(f.size, 3);
         assert_eq!(f.dirs[0], "Season 2");
@@ -101,7 +98,7 @@ mod tests {
 
     #[test]
     fn missing_root_is_an_error_not_a_panic() {
-        let (files, errors) = scan_dir(Path::new("/definitely/not/here"), &mut |_| {});
+        let (files, errors) = scan_dir(Path::new("/definitely/not/here"));
         assert!(files.is_empty());
         assert_eq!(errors.len(), 1);
     }
@@ -113,7 +110,7 @@ mod tests {
         fs::write(dir.path().join("Show/.unwanted/Show - 03.mkv"), b"x").unwrap();
         fs::write(dir.path().join("Show/.hidden.mkv"), b"x").unwrap();
         fs::write(dir.path().join("Show/Show - 01.mkv"), b"x").unwrap();
-        let (files, errors) = scan_dir(dir.path(), &mut |_| {});
+        let (files, errors) = scan_dir(dir.path());
         assert!(errors.is_empty(), "{errors:?}");
         let names: Vec<_> = files.iter().map(|f| f.stem.clone()).collect();
         assert_eq!(names, vec!["Show - 01"]);
@@ -130,7 +127,7 @@ mod tests {
         fs::write(dir.path().join("K-On!/K-On!/K-On! - 01.mkv"), b"x").unwrap();
         fs::write(dir.path().join("K-On!/K-On!/K-On!/K-On! - 01.mkv"), b"x").unwrap();
         fs::write(deep.join("K-On! - 01.mkv"), b"x").unwrap();
-        let (files, _) = scan_dir(dir.path(), &mut |_| {});
+        let (files, _) = scan_dir(dir.path());
         assert_eq!(files.len(), 1);
         assert!(files[0].path.ends_with("K-On!/K-On!/K-On! - 01.mkv"));
     }

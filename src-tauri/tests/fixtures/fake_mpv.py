@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Fake mpv: serves the JSON IPC socket, reports a scripted time-pos, exits.
 Env: FAKE_MPV_DURATION (secs, default 100), FAKE_MPV_STOP_AT (secs, default 95),
-     FAKE_MPV_RUNTIME (wall secs to stay alive, default 1.5)."""
+     FAKE_MPV_RUNTIME (wall secs to stay alive, default 1.5),
+     FAKE_MPV_NO_IPC (if set, never create the socket, simulating a wrapper that ignores
+     --input-ipc-server or a share too slow to bind in time)."""
 import json, os, socket, sys, threading, time
 
 sock_path = next(a.split("=", 1)[1] for a in sys.argv if a.startswith("--input-ipc-server="))
@@ -25,6 +27,10 @@ def serve(conn):
                 frac = min(1.0, (time.time() - start) / runtime)
                 val = duration if prop == "duration" else stop_at * frac
                 conn.sendall((json.dumps({"request_id": req.get("request_id", 0), "error": "success", "data": val}) + "\n").encode())
+
+if os.environ.get("FAKE_MPV_NO_IPC"):
+    time.sleep(runtime)
+    sys.exit(0)
 
 if os.path.exists(sock_path):
     os.unlink(sock_path)

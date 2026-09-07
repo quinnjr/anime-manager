@@ -6,7 +6,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,13 +31,25 @@ pub struct FileGuess {
     pub guess: String,
 }
 
+/// Accept whatever shape the model emits for a number: an integer, a float (11.5 is a standard
+/// recap/special convention), a numeric string, or null. Anything else yields None for that
+/// field rather than failing the whole folder's decisions.
+fn lenient_u32<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<u32>, D::Error> {
+    let v = Option::<Value>::deserialize(d)?;
+    Ok(match v {
+        Some(Value::Number(n)) => n.as_f64().filter(|f| f.is_finite() && *f >= 0.0).map(|f| f.trunc() as u32),
+        Some(Value::String(s)) => s.trim().parse::<f64>().ok().filter(|f| f.is_finite() && *f >= 0.0).map(|f| f.trunc() as u32),
+        _ => None,
+    })
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct FileDecision {
     pub name: String,
     pub kind: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_u32")]
     pub season: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_u32")]
     pub episode: Option<u32>,
     #[serde(default)]
     pub title: Option<String>,
@@ -47,7 +58,7 @@ pub struct FileDecision {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct FolderInspection {
     pub title: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_u32")]
     pub season: Option<u32>,
     #[serde(default)]
     pub files: Vec<FileDecision>,
@@ -170,25 +181,32 @@ pub fn parse_inspection(reply: &str) -> Result<FolderInspection> {
     Ok(v)
 }
 
-fn rel_to_roots(db: &Db, folder: &str) -> String {
-    let roots = db.list_roots().unwrap_or_default();
-    let best = roots.iter().map(|r| r.path.trim_end_matches('/').to_string()).filter(|r| folder.starts_with(r.as_str())).max_by_key(|r| r.len());
+/// Shorten a folder to its path relative to the library root that contains it. Matching is on a
+/// path boundary, so root `/lib` does not claim `/library/Anime/X`.
+fn rel_to_roots(roots: &[String], folder: &str) -> String {
+    let best = roots.iter()
+        .map(|r| r.trim_end_matches('/'))
+        .filter(|r| folder == *r || folder.strip_prefix(*r).is_some_and(|rest| rest.starts_with('/')))
+        .max_by_key(|r| r.len());
     match best {
-        Some(r) => folder[r.len()..].trim_start_matches('/').to_string(),
+        Some(r) => {
+            let rest = folder[r.len()..].trim_start_matches('/');
+            if rest.is_empty() { folder.to_string() } else { rest.to_string() }
+        }
         None => folder.to_string(),
     }
 }
 
 /// Inspect one folder and apply the model's decisions as parse overrides.
 /// Returns Ok(false) when the folder held no known episodes.
-async fn inspect_one(db: &Db, llm: &Llm, folder: &str, source: &str, report: &mut InspectReport) -> Result<bool> {
+async fn inspect_one(db: &Db, llm: &Llm, roots: &[String], folder: &str, source: &str, report: &mut InspectReport) -> Result<bool> {
     let rows = db.episodes_in_folder(folder)?;
     if rows.is_empty() { return Ok(false); }
     let files: Vec<FileGuess> = rows.iter().map(|(path, title, season, number)| FileGuess {
         name: Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or(path).to_string(),
         guess: format!("{title} S{season}E{number}"),
     }).collect();
-    let rel = rel_to_roots(db, folder);
+    let rel = rel_to_roots(roots, folder);
     let inspection = match llm.inspect_folder(&rel, &files).await {
         Ok(i) => i,
         Err(e) => { report.notes.push(format!("{rel}: {e}")); return Ok(true); }
@@ -226,11 +244,12 @@ pub async fn inspect_folders(db: Arc<Db>, llm: Arc<Llm>, folders: Vec<String>, s
         return Err(AppError::Network("LLM not configured: set an OpenCode Zen API key in Settings".into()));
     }
     let mut report = InspectReport::default();
+    let roots: Vec<String> = db.list_roots().unwrap_or_default().into_iter().map(|r| r.path).collect();
     let mut first = true;
     for folder in folders {
         if !first { tokio::time::sleep(llm.delay_between_folders).await; }
         first = false;
-        inspect_one(&db, &llm, &folder, source, &mut report).await?;
+        inspect_one(&db, &llm, &roots, &folder, source, &mut report).await?;
     }
     Ok(report)
 }
@@ -238,61 +257,106 @@ pub async fn inspect_folders(db: Arc<Db>, llm: Arc<Llm>, folders: Vec<String>, s
 /// Background work list of folders awaiting an LLM opinion. Scans enqueue; one worker drains.
 /// Enqueuing while a worker runs simply extends that run, so no folder is ever dropped.
 #[derive(Default)]
+struct QueueState {
+    pending: VecDeque<String>,
+    done: usize,
+    total: usize,
+    running: bool,
+}
+
+#[derive(Default)]
 pub struct AssistQueue {
-    pending: Mutex<VecDeque<String>>,
-    running: AtomicBool,
-    done: AtomicUsize,
-    total: AtomicUsize,
+    state: Mutex<QueueState>,
+}
+
+/// Clears the running flag even if the worker panics or its task is dropped, so a single
+/// failure cannot wedge the queue for the rest of the session.
+pub struct RunGuard<'a>(&'a AssistQueue);
+
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        let mut s = self.0.lock();
+        s.running = false;
+        if s.pending.is_empty() { s.done = 0; s.total = 0; }
+    }
 }
 
 impl AssistQueue {
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Add folders not already queued. Returns how many were new.
     pub fn enqueue(&self, folders: impl IntoIterator<Item = String>) -> usize {
-        let mut q = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut s = self.lock();
         let mut added = 0;
         for f in folders {
-            if !q.contains(&f) { q.push_back(f); added += 1; }
+            if !s.pending.contains(&f) { s.pending.push_back(f); added += 1; }
         }
-        self.total.fetch_add(added, Ordering::SeqCst);
+        s.total += added;
         added
     }
 
-    pub fn is_running(&self) -> bool { self.running.load(Ordering::SeqCst) }
+    pub fn is_running(&self) -> bool { self.lock().running }
+
+    pub fn has_pending(&self) -> bool { !self.lock().pending.is_empty() }
 
     pub fn progress(&self) -> AssistProgress {
-        AssistProgress { done: self.done.load(Ordering::SeqCst), total: self.total.load(Ordering::SeqCst), folder: String::new(), running: self.is_running() }
+        let s = self.lock();
+        AssistProgress { done: s.done, total: s.total, folder: String::new(), running: s.running }
     }
 
-    fn pop(&self) -> Option<String> { self.pending.lock().unwrap_or_else(|e| e.into_inner()).pop_front() }
-
-    /// Try to become the worker. Returns false if one is already draining the queue.
-    pub fn try_start(&self) -> bool {
-        self.running.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+    /// Try to become the worker. `None` if one is already draining the queue. Hold the returned
+    /// guard for the whole run.
+    pub fn try_start(&self) -> Option<RunGuard<'_>> {
+        let mut s = self.lock();
+        if s.running { return None; }
+        s.running = true;
+        drop(s);
+        Some(RunGuard(self))
     }
 
-    /// Drain the queue one folder at a time, reporting progress after each. Must follow a
-    /// successful `try_start`. Clears the counters and the running flag when the queue is empty.
+    /// Take the next folder, or finish. Popping and clearing `running` happen under one lock, so
+    /// a folder enqueued concurrently is either picked up by this worker or seen by a `try_start`
+    /// that now succeeds — it can never be stranded with no worker.
+    fn next_or_finish(&self) -> Option<String> {
+        let mut s = self.lock();
+        if let Some(f) = s.pending.pop_front() { return Some(f); }
+        s.done = 0;
+        s.total = 0;
+        s.running = false;
+        None
+    }
+
+    /// Drain the queue one folder at a time, reporting progress after each.
     pub async fn run(&self, db: Arc<Db>, llm: Arc<Llm>, source: &str, on_progress: &(dyn Fn(AssistProgress) + Send + Sync)) -> InspectReport {
         let mut report = InspectReport::default();
+        let roots: Vec<String> = db.list_roots().unwrap_or_default().into_iter().map(|r| r.path).collect();
         let mut first = true;
-        while let Some(folder) = self.pop() {
+        while let Some(folder) = self.next_or_finish() {
             if !first { tokio::time::sleep(llm.delay_between_folders).await; }
             first = false;
-            if let Err(e) = inspect_one(&db, &llm, &folder, source, &mut report).await {
+            if let Err(e) = inspect_one(&db, &llm, &roots, &folder, source, &mut report).await {
                 report.notes.push(format!("{folder}: {e}"));
             }
-            let done = self.done.fetch_add(1, Ordering::SeqCst) + 1;
-            on_progress(AssistProgress { done, total: self.total.load(Ordering::SeqCst), folder, running: true });
+            let (done, total) = {
+                let mut s = self.lock();
+                s.done += 1;
+                (s.done, s.total)
+            };
+            on_progress(AssistProgress { done, total, folder, running: true });
         }
-        self.done.store(0, Ordering::SeqCst);
-        self.total.store(0, Ordering::SeqCst);
-        self.running.store(false, Ordering::SeqCst);
         report
     }
 }
 
 /// On-demand inspection of every folder that holds an episode of `show_id`.
-pub async fn inspect_show(db: Arc<Db>, llm: Arc<Llm>, show_id: i64) -> Result<InspectReport> {
+pub async fn inspect_show(db: Arc<Db>, llm: Arc<Llm>, queue: Arc<AssistQueue>, show_id: i64) -> Result<InspectReport> {
+    // Two loops re-homing the same rows would race, and report.show_id would be resolved against
+    // a database the other loop is still changing.
+    let Some(_guard) = queue.try_start() else {
+        return Err(AppError::Network("AI assist is already running; try again when it finishes".into()));
+    };
     let paths = db.episode_paths_for_show(show_id)?;
     if paths.is_empty() { return Err(AppError::Db(format!("show {show_id} has no episodes"))); }
     let mut folders: Vec<String> = paths.iter().filter_map(|p| Path::new(p).parent().map(|d| d.to_string_lossy().to_string())).collect();
@@ -374,7 +438,7 @@ mod tests {
         db.upsert_episode(&pn("Season1", 1, 3), &rf("/lib/Sekirei Complete/Season1/sample.mkv")).unwrap();
         let wrong_id = db.list_shows("").unwrap()[0].id;
         let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()));
-        let r = inspect_show(db.clone(), llm, wrong_id).await.unwrap();
+        let r = inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), wrong_id).await.unwrap();
         assert_eq!(r.folders, 1);
         assert_eq!(r.ignored, 1);
         assert_eq!(r.changes.len(), 3);
@@ -428,12 +492,13 @@ mod tests {
         assert_eq!(q.enqueue(folders.clone()), n);
         assert_eq!(q.enqueue(folders.clone()), 0, "duplicates are not re-queued");
         assert_eq!(q.enqueue(vec!["/lib/nothing-here".to_string()]), 1);
-        assert!(q.try_start());
-        assert!(!q.try_start(), "second worker refused while running");
+        let guard = q.try_start().expect("first worker starts");
+        assert!(q.try_start().is_none(), "second worker refused while running");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let s2 = seen.clone();
         let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()).with_timing(Duration::from_millis(1), Duration::ZERO));
         let report = q.run(db.clone(), llm, "llm", &move |p| s2.lock().unwrap().push(p)).await;
+        drop(guard);
         assert_eq!(report.folders, n, "every folder inspected, none capped");
         assert_eq!(report.changes.len(), n);
         let seen = seen.lock().unwrap();
@@ -458,5 +523,63 @@ mod tests {
         assert_eq!(r.notes.len(), 1);
         assert!(r.notes[0].contains("parse"));
         assert_eq!(db.list_shows("").unwrap()[0].display_title, "X");
+    }
+
+    #[test]
+    fn fractional_and_stringy_numbers_do_not_lose_the_folder() {
+        // 11.5 is a standard recap/special numbering; a strict u32 used to fail the whole reply.
+        let body = r#"{"title":"Show","season":1,"files":[
+            {"name":"a.mkv","kind":"episode","season":1,"episode":11,"title":null},
+            {"name":"b.mkv","kind":"special","season":"0","episode":11.5,"title":null},
+            {"name":"c.mkv","kind":"episode","season":1,"episode":-1,"title":null}
+        ],"notes":""}"#;
+        let i = parse_inspection(body).expect("a fractional episode must not discard the folder");
+        assert_eq!(i.files.len(), 3);
+        assert_eq!(i.files[0].episode, Some(11));
+        assert_eq!((i.files[1].season, i.files[1].episode), (Some(0), Some(11)));
+        assert_eq!(i.files[2].episode, None, "a negative number is dropped, not fatal");
+    }
+
+    #[test]
+    fn rel_to_roots_matches_on_a_path_boundary() {
+        let roots = vec!["/lib".to_string()];
+        assert_eq!(rel_to_roots(&roots, "/lib/Anime/X"), "Anime/X");
+        assert_eq!(rel_to_roots(&roots, "/library/Anime/X"), "/library/Anime/X", "a sibling root must not be truncated");
+        assert_eq!(rel_to_roots(&roots, "/lib"), "/lib");
+        let roots = vec!["/lib".to_string(), "/lib/Anime".to_string()];
+        assert_eq!(rel_to_roots(&roots, "/lib/Anime/X"), "X", "the longest matching root wins");
+    }
+
+    #[tokio::test]
+    async fn folders_enqueued_as_the_worker_exits_are_never_stranded() {
+        let server = MockServer::start().await;
+        let content = r#"{"title":"T","season":1,"files":[],"notes":""}"#;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(reply(content))).mount(&server).await;
+        let db = Arc::new(Db::open_memory().unwrap());
+        let q = Arc::new(AssistQueue::default());
+        q.enqueue(vec!["/lib/A".to_string()]);
+        let guard = q.try_start().expect("worker starts");
+        let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()).with_timing(Duration::from_millis(1), Duration::ZERO));
+        q.run(db.clone(), llm, "llm", &|_| {}).await;
+        // run() cleared `running` under the same lock that enqueue takes, so a scan landing now
+        // must be able to start a fresh worker rather than adding folders no one will drain.
+        assert!(!q.is_running());
+        q.enqueue(vec!["/lib/B".to_string()]);
+        assert!(q.has_pending());
+        assert!(q.try_start().is_some(), "a later scan must be able to drain the leftovers");
+        drop(guard);
+    }
+
+    #[test]
+    fn a_panicking_worker_does_not_wedge_the_queue() {
+        let q = AssistQueue::default();
+        q.enqueue(vec!["/lib/A".to_string()]);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = q.try_start().expect("starts");
+            panic!("worker blew up");
+        }));
+        assert!(r.is_err());
+        assert!(!q.is_running(), "the guard must clear `running` on unwind");
+        assert!(q.try_start().is_some());
     }
 }

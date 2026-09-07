@@ -114,6 +114,10 @@ pub async fn play_episode(
     notify(PlaybackChanged { episode_id, status: EpisodeStatus::Playing, position_secs: ep.position_secs, duration_secs: ep.duration_secs });
 
     let mut ipc = Ipc::connect(&sock, Duration::from_secs(5)).await;
+    // Without the IPC socket there is no position or duration, so the watched judgement below
+    // would be made from stale values: a fully watched episode would be written back as unplayed
+    // and rewound, and a resumed one could be marked played after ten seconds.
+    let tracked = ipc.is_some();
     let mut last_pos = ep.position_secs;
     let mut duration = ep.duration_secs;
 
@@ -131,6 +135,17 @@ pub async fn play_episode(
     }
     let _ = std::fs::remove_file(&sock);
     player.release();
+
+    if !tracked {
+        // Restore the pre-playback state untouched and tell the user why nothing was recorded.
+        let before = db.get_episode(episode_id)?;
+        db.set_status(episode_id, if before.status == EpisodeStatus::Playing { EpisodeStatus::Unplayed } else { before.status })?;
+        let after = db.get_episode(episode_id)?;
+        notify(PlaybackChanged { episode_id, status: after.status, position_secs: after.position_secs, duration_secs: after.duration_secs });
+        return Err(AppError::Player(
+            "could not reach mpv's IPC socket, so playback position was not tracked; this episode's progress is unchanged".into(),
+        ));
+    }
 
     let threshold = db.played_threshold()?;
     let finished = matches!(duration, Some(d) if d > 0.0 && last_pos / d >= threshold);
@@ -150,6 +165,17 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
 
+    /// Set every knob the fake mpv reads, so a test can never inherit a stale value from
+    /// whichever test ran before it. These are process-global, which is why the suite is
+    /// documented to run with --test-threads=1; under edition 2024 `set_var` alongside a
+    /// process spawn is unsafe, hence the block.
+    fn fake_mpv(stop_at: &str, runtime: &str) {
+        unsafe {
+            std::env::set_var("FAKE_MPV_STOP_AT", stop_at);
+            std::env::set_var("FAKE_MPV_RUNTIME", runtime);
+        }
+    }
+
     fn fixture() -> String {
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake_mpv.py").to_string()
     }
@@ -166,7 +192,7 @@ mod tests {
 
     #[tokio::test]
     async fn finishing_marks_played() {
-        unsafe { std::env::set_var("FAKE_MPV_STOP_AT", "99"); std::env::set_var("FAKE_MPV_RUNTIME", "2.0"); }
+        fake_mpv("99", "2.0");
         let (db, id) = seeded();
         let events = Arc::new(StdMutex::new(Vec::new()));
         let ev = events.clone();
@@ -181,7 +207,7 @@ mod tests {
 
     #[tokio::test]
     async fn interruption_reverts_to_unplayed_keeping_position() {
-        unsafe { std::env::set_var("FAKE_MPV_STOP_AT", "40"); std::env::set_var("FAKE_MPV_RUNTIME", "1.2"); }
+        fake_mpv("40", "1.2");
         let (db, id) = seeded();
         play_episode(db.clone(), Arc::new(Player::new()), id, |_| {}, Duration::from_millis(200)).await.unwrap();
         let ep = db.get_episode(id).unwrap();
@@ -192,6 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_binary_is_player_error_and_no_state_change() {
+        fake_mpv("99", "1.0");
         let (db, id) = seeded();
         db.set_setting("mpv_path", "/nonexistent/mpv").unwrap();
         let err = play_episode(db.clone(), Arc::new(Player::new()), id, |_| {}, Duration::from_millis(200)).await.unwrap_err();
@@ -201,7 +228,7 @@ mod tests {
 
     #[tokio::test]
     async fn second_play_while_playing_is_rejected() {
-        unsafe { std::env::set_var("FAKE_MPV_RUNTIME", "1.0"); }
+        fake_mpv("99", "1.0");
         let (db, id) = seeded();
         let player = Arc::new(Player::new());
         let first = tokio::spawn(play_episode(db.clone(), player.clone(), id, |_| {}, Duration::from_millis(200)));
@@ -209,5 +236,22 @@ mod tests {
         let err = play_episode(db.clone(), player.clone(), id, |_| {}, Duration::from_millis(200)).await.unwrap_err();
         assert!(matches!(err, AppError::Player(_)));
         first.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn playback_without_ipc_leaves_progress_untouched_and_reports_why() {
+        // The socket never appears (a wrapper that ignores --input-ipc-server, a slow share).
+        // Position and duration are unknown, so nothing may be written back.
+        fake_mpv("99", "1.0");
+        let (db, id) = seeded();
+        unsafe { std::env::set_var("FAKE_MPV_NO_IPC", "1") };
+        db.set_position(id, 1300.0, Some(1400.0)).unwrap();
+        db.set_status(id, EpisodeStatus::Unplayed).unwrap();
+        let err = play_episode(db.clone(), Arc::new(Player::new()), id, |_| {}, Duration::from_millis(50)).await.unwrap_err();
+        unsafe { std::env::remove_var("FAKE_MPV_NO_IPC") };
+        assert!(matches!(err, AppError::Player(ref m) if m.contains("IPC")), "{err:?}");
+        let ep = db.get_episode(id).unwrap();
+        assert_eq!(ep.status, EpisodeStatus::Unplayed, "must not be flipped to played from a stale 1300/1400");
+        assert_eq!(ep.position_secs, 1300.0, "the resume point must not be rewound");
     }
 }

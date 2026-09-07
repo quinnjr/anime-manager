@@ -18,7 +18,7 @@ const SPECIAL_WORDS: &str = r"NCOP|NCED|NCI|Creditless\s?(?:Opening|Ending)|Clea
 static SPECIAL: Lazy<Regex> =
     Lazy::new(|| Regex::new(&format!(r"(?i)(?:\b|\d)({SPECIAL_WORDS})(?:\s|\d|v\d|$)")).unwrap());
 static SPECIAL_NUM: Lazy<Regex> =
-    Lazy::new(|| Regex::new(&format!(r"(?i)(?:\b|\d)(?:{SPECIAL_WORDS})\s?(\d{{1,3}})\b")).unwrap());
+    Lazy::new(|| Regex::new(&format!(r"(?i)(?:\b|\d)(?:{SPECIAL_WORDS})\s?(\d{{1,3}})(?:v\d)?\b")).unwrap());
 static SXXEXX: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bS(\d{1,2})[ ._]?E(\d{1,4})(?:v\d)?\b").unwrap());
 static NXNN: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\b(\d{1,2})x(\d{1,4})(?:v\d)?\b").unwrap());
 static DASH_EP: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\s-\s(\d{1,4})(?:v\d)?\b").unwrap());
@@ -152,53 +152,94 @@ pub fn parse_with_confidence(stem: &str, dirs: &[String]) -> Option<Parsed> {
     // Strip a trailing "1080p WEB x264"-style tail: everything from the resolution token onward.
     if let Some(m) = RES.find(&work.clone()) { work.truncate(m.start()); }
 
-    let is_special = bracket_special.is_some() || SPECIAL.is_match(&work);
-
-    // Pass 2: season/episode markers
+    // Pass 2: season/episode markers. `marker` records the matched span so a special keyword
+    // can be recognised only where a marker may legitimately sit — anywhere else it belongs to
+    // the episode's own subtitle ("Grand Blue - 03 - The Extra Class" is season 1, not a special).
     let mut season: Option<u32> = None;
     let mut episode: Option<u32> = None;
     let mut title_end = work.len();
+    let mut marker: Option<(usize, usize)> = None;
+    // A 4-digit number in the 1900-2099 range is a release year in every branch, not an episode.
+    let ep_ok = |c: &regex::Captures, i: usize| c[i].parse::<u32>().ok().and_then(not_year).is_some();
 
-    if let Some(c) = SXXEXX.captures(&work) {
+    if let Some(c) = SXXEXX.captures(&work).filter(|c| ep_ok(c, 2)) {
         season = Some(c[1].parse().ok()?);
         episode = Some(c[2].parse().ok()?);
-        title_end = c.get(0).unwrap().start();
-    } else if let Some(c) = NXNN.captures(&work) {
+        let m = c.get(0).unwrap();
+        title_end = m.start();
+        marker = Some((m.start(), m.end()));
+    } else if let Some(c) = NXNN.captures(&work).filter(|c| ep_ok(c, 2)) {
         season = Some(c[1].parse().ok()?);
         episode = Some(c[2].parse().ok()?);
-        title_end = c.get(0).unwrap().start();
-    } else if let Some(c) = JP_EP.captures(&work) {
+        let m = c.get(0).unwrap();
+        title_end = m.start();
+        marker = Some((m.start(), m.end()));
+    } else if let Some(c) = JP_EP.captures(&work).filter(|c| ep_ok(c, 1)) {
         episode = Some(c[1].parse().ok()?);
-        title_end = c.get(0).unwrap().start();
-    } else if let Some(c) = DASH_EP.captures(&work) {
+        let m = c.get(0).unwrap();
+        title_end = m.start();
+        marker = Some((m.start(), m.end()));
+    } else if let Some(c) = DASH_EP.captures(&work).filter(|c| ep_ok(c, 1)) {
         episode = Some(c[1].parse().ok()?);
-        title_end = c.get(0).unwrap().start();
-    } else if let Some(c) = EP_PREFIX.captures(&work) {
+        let m = c.get(0).unwrap();
+        title_end = m.start();
+        marker = Some((m.start(), m.end()));
+    } else if let Some(c) = EP_PREFIX.captures(&work).filter(|c| ep_ok(c, 1)) {
         episode = Some(c[1].parse().ok()?);
-        title_end = c.get(0).unwrap().start();
+        let m = c.get(0).unwrap();
+        title_end = m.start();
+        marker = Some((m.start(), m.end()));
     } else if let Some(c) = SPECIAL_NUM.captures(&work) {
         episode = Some(c[1].parse().ok()?);
-        title_end = c.get(0).unwrap().start();
-    } else if let Some(c) = TRAILING_NUM.captures(&work).filter(|c| c[1].parse().ok().and_then(not_year).is_some()) {
+        let m = c.get(0).unwrap();
+        title_end = m.start();
+        marker = Some((m.start(), m.end()));
+    } else if let Some(c) = TRAILING_NUM.captures(&work).filter(|c| ep_ok(c, 1)) {
         episode = Some(c[1].parse().ok()?);
-        title_end = c.get(0).unwrap().start();
-    } else if let Some(c) = LEADING_NUM.captures(&work).filter(|c| c[1].parse().ok().and_then(not_year).is_some()) {
+        let m = c.get(0).unwrap();
+        title_end = m.start();
+        marker = Some((m.start(), m.end()));
+    } else if let Some(c) = LEADING_NUM.captures(&work).filter(|c| ep_ok(c, 1)) {
         episode = Some(c[1].parse().ok()?);
+        let m = c.get(0).unwrap();
         title_end = 0;
+        marker = Some((m.start(), m.end()));
         low_confidence = true;
-    } else if let Some(c) = MID_NUM.captures(&work).filter(|c| c[1].parse().ok().and_then(not_year).is_some()) {
+    } else if let Some(c) = MID_NUM.captures(&work).filter(|c| ep_ok(c, 1)) {
         episode = Some(c[1].parse().ok()?);
-        title_end = c.get(0).unwrap().start();
+        let m = c.get(0).unwrap();
+        title_end = m.start();
+        marker = Some((m.start(), m.end()));
         low_confidence = true;
     }
+
+    // Where a special keyword is allowed to count: the marker itself plus anything glued to it
+    // up to the next " - " (which introduces an episode subtitle). With no marker, the whole stem.
+    let special_region: &str = match marker {
+        Some((_, mend)) => {
+            let tail = &work[title_end..];
+            let rel = mend - title_end;
+            let cut = tail[rel..].find(" - ").map(|i| rel + i).unwrap_or(tail.len());
+            &tail[..cut]
+        }
+        None => &work,
+    };
+    // A title that is nothing but a marker ("NCED - 03") is a special; one that merely starts
+    // with the word ("Special A - 01", "Extra Olympia Kyklos") is a real show title.
+    let title_text = &work[..title_end];
+    let bare_marker = SPECIAL.find(title_text).is_some_and(|m| {
+        let rest = format!("{}{}", &title_text[..m.start()], &title_text[m.end()..]);
+        clean_title(&rest).is_empty()
+    });
+    let is_special = bracket_special.is_some() || SPECIAL.is_match(special_region) || bare_marker;
 
     // Specials: episode number is whatever digits trail the special marker, else 1
     if is_special && episode.is_none() {
         episode = bracket_special.flatten().or(Some(1));
     }
 
-    let mut title = work[..title_end].to_string();
-    if is_special && let Some(m) = SPECIAL.find(&title) {
+    let mut title = title_text.to_string();
+    if is_special && (marker.is_none() || bare_marker) && let Some(m) = SPECIAL.find(&title) {
         title.truncate(m.start());
     }
 
@@ -500,10 +541,45 @@ mod tests {
     }
 
     #[test]
-    fn special_word_after_episode_title_still_season_zero() {
+    fn special_word_in_an_episode_subtitle_is_not_a_special() {
+        // The keyword sits in the episode's own subtitle, after the marker, so it must not
+        // drag a real season-1 episode into the Specials tab.
         let r = p("Azumanga Daioh - Episode 08 - New Years Dream Special");
-        assert_eq!(r.title, "Azumanga Daioh");
-        assert_eq!((r.season, r.episode), (0, 8));
+        assert_eq!((r.title.as_str(), r.season, r.episode), ("Azumanga Daioh", 1, 8));
+        let r = p("Grand Blue Dreaming - 03 - The Extra Class");
+        assert_eq!((r.title.as_str(), r.season, r.episode), ("Grand Blue Dreaming", 1, 3));
+        let r = p("Bocchi the Rock - 07 - Live Special");
+        assert_eq!((r.title.as_str(), r.season, r.episode), ("Bocchi the Rock", 1, 7));
+        let r = p("Show - 12 - The Recap Job");
+        assert_eq!((r.title.as_str(), r.season, r.episode), ("Show", 1, 12));
+    }
+
+    #[test]
+    fn titles_that_begin_with_a_special_keyword_survive() {
+        // Truncating at the keyword used to empty these titles and drop the files entirely.
+        let r = p("Special A - 01");
+        assert_eq!((r.title.as_str(), r.season, r.episode), ("Special A", 1, 1));
+        let r = p("Extra Olympia Kyklos - 03");
+        assert_eq!((r.title.as_str(), r.season, r.episode), ("Extra Olympia Kyklos", 1, 3));
+        let r = p("Preview Girls - 05");
+        assert_eq!((r.title.as_str(), r.season, r.episode), ("Preview Girls", 1, 5));
+        let r = p("OP-ED Collection - 02");
+        assert_eq!((r.title.as_str(), r.season, r.episode), ("OP-ED Collection", 1, 2));
+        // ...but a title that is nothing except the keyword really is a special.
+        let dirs = vec!["NC".to_string(), "Show Name".to_string()];
+        let r = parse("NCED - 03", &dirs).unwrap();
+        assert_eq!((r.title.as_str(), r.season, r.episode), ("Show Name", 0, 3));
+    }
+
+    #[test]
+    fn years_are_never_episodes_in_any_branch() {
+        for stem in ["Kimi no Na wa - 2016 - 1080p", "Akira - 1988", "Ghost in the Shell - 1995", "Show Ep 2016"] {
+            let r = parse_with_confidence(stem, &[]).expect(stem);
+            assert!(r.name.episode < 1900, "{stem} parsed episode {}", r.name.episode);
+            assert!(r.low_confidence, "{stem} must be flagged so the LLM safety net revisits it");
+        }
+        // A genuine 4-digit episode number is still accepted.
+        assert_eq!(p("Long Show - 1234").episode, 1234);
     }
 
     #[test]
@@ -550,6 +626,16 @@ mod tests {
         assert_eq!((r.title.as_str(), r.season, r.episode), ("Mayo Chiki!", 0, 1));
         let r = p("[Scum] Girlish Number - NCI [BD][4BE57A27]");
         assert_eq!((r.title.as_str(), r.season), ("Girlish Number", 0));
+    }
+
+    #[test]
+    fn a_version_suffix_does_not_split_a_special_from_its_siblings() {
+        // "Special 01v2" and "Special 02" sit in one folder and must land in the same season.
+        let a = p("[Commie] Yuyushiki - Special 01v2 [BD 720p AAC] [0BA75EEF]");
+        let b = p("[Commie] Yuyushiki - Special 02 [BD 720p AAC] [1AD2AC62]");
+        assert_eq!((a.title.as_str(), a.season, a.episode), ("Yuyushiki", 0, 1));
+        assert_eq!((b.title.as_str(), b.season, b.episode), ("Yuyushiki", 0, 2));
+        assert_eq!(a.title, b.title);
     }
 
     #[test]

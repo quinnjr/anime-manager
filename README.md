@@ -7,7 +7,7 @@ Settings → AI folder assist takes an [OpenCode Zen](https://opencode.ai/auth) 
 
 ## Requirements
 - Linux, mpv on `$PATH` (or set the path in Settings)
-- Rust 1.85+, Node 22+, pnpm
+- Rust 1.88+ (let-chains), Node 22+, pnpm
 
 ## Develop
     pnpm install
@@ -16,6 +16,9 @@ Settings → AI folder assist takes an [OpenCode Zen](https://opencode.ai/auth) 
 ## Test
     cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1
     pnpm test
+
+The Rust suite must run single-threaded: the player tests drive a fake mpv through
+process-global environment variables.
 
 ## Build
     pnpm tauri build

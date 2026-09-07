@@ -41,7 +41,9 @@ src/                       SvelteKit (adapter-static), Svelte 5 runes, Tailwind 
   lib/stores/              library, playback, toasts
 ```
 
-Data flow: scan → parse → group by (title, season) → DB upsert → emit → UI refresh.
+Data flow: scan → override lookup → parse → group by (title, season) → DB upsert → emit → UI
+refresh. The SQLite schema is versioned through `PRAGMA user_version`; `migrate` creates the
+current shape and `upgrade` alters older databases in place.
 AniList resolution runs asynchronously per show after the scan and updates rows as
 results arrive.
 
@@ -50,22 +52,27 @@ results arrive.
 ```sql
 roots       (id, path UNIQUE, added_at)
 shows       (id, parsed_title UNIQUE, anilist_id, canonical_title, cover_url,
-             total_episodes, user_title_override, created_at)
+             total_episodes, user_title_override, created_at, anilist_cleared)
 seasons     (id, show_id → shows, number, UNIQUE(show_id, number))
 episodes    (id, season_id → seasons, number, path UNIQUE, size, mtime,
              release_group, resolution, crc,
              status TEXT CHECK(status IN ('unplayed','playing','played','missing')),
+             prev_status,          -- status to restore when a missing file comes back
              position_secs REAL, duration_secs REAL, last_played_at)
-rename_log  (id, batch_id, episode_id → episodes, old_path, new_path,
+rename_log  (id, batch_id, episode_id → episodes ON DELETE SET NULL, old_path, new_path,
              applied_at, reverted_at)
-settings    (key PRIMARY KEY, value)   -- mpv_path, played_threshold (default 0.9)
+parse_overrides (path PRIMARY KEY, title, season, number, kind, source, created_at)
+settings    (key PRIMARY KEY, value)   -- mpv_path, played_threshold (default 0.9),
+                                       -- llm_api_key, llm_model, llm_base_url,
+                                       -- llm_assist_on_scan, llm_delay_ms
 ```
 
-Rescan matching order: exact `path` → (`size`, `mtime`) pair. Files no longer found
-are set to `missing`, never deleted automatically. A "Remove missing" action in
-settings purges them.
+Rescan matching order: exact `path` → (`size`, `mtime`) pair **whose recorded path no longer
+exists on disk**. Files no longer found are set to `missing`, never deleted automatically, and
+only within roots that were readable. A "Remove missing" action in settings purges them.
 
-Display title = `user_title_override` ?? `canonical_title` ?? `parsed_title`.
+Display title = `user_title_override` ?? `canonical_title` ?? `parsed_title`. The override is
+editable from the show page heading (`set_show_title`); blank clears it.
 
 ## Parser
 
@@ -80,10 +87,10 @@ Ordered passes (each a precompiled regex):
    spaces before any marker regex runs.
 2. Episode + season markers, first match wins: `S(\d+)E(\d+)`, `(\d+)x(\d+)`,
    `第(\d+)話`, ` - (\d+)`, `(Episode|Ep?)\.? ?(\d+)`, a number glued to a special
-   word (`S01OVA01`, `SP1`), a trailing standalone integer, a leading integer
-   (`01 - Title`), then the first standalone 2–3 digit integer mid-title. Strip a
-   trailing `v\d` version suffix. A bare 4-digit number in 1900–2099 is a year, never
-   an episode.
+   word (`S01OVA01`, `SP1`, `Special 01v2`), a trailing standalone integer, a leading
+   integer (`01 - Title`), then the first standalone 2–3 digit integer mid-title. Strip a
+   trailing `v\d` version suffix. A bare 4-digit number in 1900–2099 is a year, never an
+   episode — in **every** branch, and such a file is flagged low-confidence.
 3. Season from title suffixes: `2nd Season`, `Season 2`, `Part 2`, `S2`, roman
    numerals `II`–`IX` as the final token. Remove from title. A bare `S(\d)` suffix
    with no episode anywhere is a numbered special, not a season.
@@ -99,6 +106,13 @@ Special files matching `NCOP`, `NCED`, `NCI`, `OP`, `ED`, `Clean/Creditless
 Opening|Ending`, `OVA`, `OAD`, `SP`, `Special`, `Extra`, `Preview`, `Recap`, `Menu`, `CM`,
 `PV`, `Teaser`, `Trailer`, `CharSong`, `Eyecatch` are placed in season 0 with the number
 that trails the marker, else 1.
+
+A keyword only counts where a marker may legitimately sit: inside a bracket token, inside the
+matched marker and anything glued to it up to the next `" - "`, or anywhere in a stem that has
+no marker at all. A keyword in the episode's own subtitle is ordinary text, so
+`Grand Blue - 03 - The Extra Class` is season 1. A title that *begins* with a keyword is kept
+(`Special A`, `Extra Olympia Kyklos`, `OP-ED Collection`); only a title that is nothing but the
+keyword (`NCED - 03`) is treated as a marker and replaced from the parent directories.
 
 Tests: table-driven, at least 40 real-world filenames, exact struct equality.
 
@@ -118,7 +132,10 @@ mid-title-number fallback.
 Triggers:
 1. Scan: after the regex pass, files that are low-confidence and have no override
    are grouped by immediate parent folder and appended to a single in-process
-   `AssistQueue`. One background worker drains it a folder at a time (no cap), pausing
+   `AssistQueue`. Taking the next folder and clearing the "running" flag happen under one
+   lock, so a folder queued as the worker exits is either picked up or seen by a `try_start`
+   that now succeeds; a run guard clears the flag even if the worker panics.
+   One background worker drains the queue a folder at a time (no cap), pausing
    `llm_delay_ms` (default 500) between folders; a scan that lands while the worker
    runs extends the same run. 429/5xx/transport errors retry up to 6 times with
    exponential backoff honouring `Retry-After`; 4xx auth errors fail immediately.
@@ -140,11 +157,54 @@ created_at)`. `run_scan` consults it before the regex parser for every file, so 
 LLM (or later, user) decision survives rescans and is never re-requested. `kind =
 ignore` deletes the episode row and skips the file on future scans; the file on disk is
 untouched. Applying overrides re-upserts the affected episodes and prunes empty
-seasons and shows.
+seasons and shows. Renaming a file moves its override with it, and undo moves it back, so a
+decision is never orphaned on a path that a future download could inherit. Settings offers
+"Clear AI decisions" (`clear_ai_decisions`), which drops every `source = 'llm'` row.
+
+Model replies are read leniently: an episode or season may arrive as an integer, a float
+(`11.5` is standard recap numbering), a numeric string or null, and a single unusable value
+never discards the folder's other decisions.
+
+`inspect_show` and the background worker share one `AssistQueue` and cannot run concurrently;
+the on-demand command reports that assist is busy rather than racing the worker.
 
 `llm_test()` sends a one-line prompt and returns the model's reply, for the settings
 drawer's "Test connection" button. Network failures are logged and non-fatal during
 scans; on-demand failures surface as toasts.
+
+## Safety rules
+
+These are load-bearing; each exists because its absence destroys user data.
+
+- **A root that cannot be read never marks anything missing.** `run_scan` trusts a root only
+  when its directory exists and it did not return zero files alongside errors. An unmounted
+  share therefore leaves its episodes untouched instead of flagging the whole library missing
+  and letting the Settings purge delete every watched flag and AniList match.
+- **Missing is not unwatched.** `episodes.prev_status` records the status a file had when it
+  went missing and is restored when it comes back, so an unmount/remount round trip does not
+  reset the library to unplayed. `playing` never survives, since it is a runtime state.
+- **A row is only reused for a file that actually moved.** The (size, mtime) fallback in
+  `upsert_episode` reuses an existing row only when that row's recorded path is gone from disk;
+  otherwise a `cp -p` duplicate would hijack a live episode's row.
+- **Undo never overwrites.** `undo` refuses to `fs::rename` onto an existing file, because
+  POSIX rename would silently delete a v2 re-download and report success. A batch that cannot
+  progress is reported and stepped over so it cannot pin older batches out of reach forever.
+- **Rename bookkeeping is reversible.** If any database write fails after the file has moved,
+  the file is renamed back and the entry is reported as skipped, so a renamed file is never
+  left with no log row to undo it.
+- **Renaming does not split a show.** Applying a rename writes a `parse_overrides` row pinning
+  each file to the show it is already in, so the canonical filename does not re-derive into a
+  second show and orphan the cover and AniList match on the next scan.
+- **Rename history outlives its episode.** `rename_log.episode_id` is nullable with
+  `ON DELETE SET NULL`, so purging or ignoring an episode cannot strand its file under a
+  canonical name with no record of the rename.
+- **Paths must be valid UTF-8.** A non-UTF-8 filename is reported in `ScanSummary.errors` rather
+  than stored lossily, which would produce an unopenable row that also collides on `UNIQUE(path)`.
+- **Untracked playback writes nothing.** If mpv's IPC socket never connects there is no position
+  or duration, so the watched judgement is skipped entirely and the episode's progress is left
+  exactly as it was, with an error explaining why.
+- **A cleared AniList match stays cleared.** `shows.anilist_cleared` excludes the show from
+  auto-matching until the user picks a match by hand.
 
 ## Playback
 
@@ -165,14 +225,16 @@ mpv missing → `AppError::Player`, no state change.
 
 ## AniList
 
-Endpoint `https://graphql.anilist.co`, no auth. Query: `Page(perPage:5){media(search:$q,
-type:ANIME){id title{romaji english} coverImage{large} episodes}}`.
-Auto-match takes the first result. `rematch(show_id, anilist_id?)` with an id sets it
-directly; without an id it clears the match. `search_anilist(query)` returns the top 5
-for the picker. Network errors are logged and skipped; the UI shows parsed titles.
-Cover images are loaded by URL in the webview, not cached to disk.
+Auto-match runs after every scan for shows with no `anilist_id` and `anilist_cleared = 0`.
+A hit is applied only when its romaji or English title scores at least
+`MIN_AUTO_MATCH_SIMILARITY` (0.35) against the parsed title, measured as a Dice coefficient
+over character bigrams so abbreviations still match ("Frieren" vs "Sousou no Frieren"); a
+weaker best hit is left for the user, because a wrong match is written to disk by Rename.
+429 and 5xx responses retry up to 4 times with exponential backoff honouring `Retry-After`.
+Network errors are logged and skipped; the UI shows parsed titles.
 
 ## Rename
+
 
 Canonical name: `<display_title> - S<season:02>E<episode:02><original ext>`,
 same directory. `preview_rename(target)` where target is a show id or episode id

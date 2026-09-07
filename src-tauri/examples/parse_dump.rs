@@ -3,7 +3,7 @@
 use std::path::Path;
 fn main() {
     let root = std::env::args().nth(1).expect("root path");
-    let (files, errors) = anime_manager_lib::scanner::scan_dir(Path::new(&root), &mut |_| {});
+    let (files, errors) = anime_manager_lib::scanner::scan_dir(Path::new(&root));
     for e in &errors { eprintln!("ERR\t{e}"); }
     for f in &files {
         match anime_manager_lib::parser::parse(&f.stem, &f.dirs) {

@@ -2,6 +2,7 @@
   import { api, type Root } from '$lib/api';
   import { toasts } from '$lib/stores/toasts.svelte';
   import { emit } from '@tauri-apps/api/event';
+  import { onMount } from 'svelte';
 
   let { open = $bindable(false) } = $props();
   let roots = $state<Root[]>([]);
@@ -15,6 +16,12 @@
   let testing = $state(false);
 
   $effect(() => { if (open) load(); });
+
+  onMount(() => {
+    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape' && open) { e.preventDefault(); open = false; } };
+    window.addEventListener('keydown', esc);
+    return () => window.removeEventListener('keydown', esc);
+  });
 
   async function load() {
     try {
@@ -58,6 +65,12 @@
       toasts.push('success', await api.llmTest());
     } catch (e) { toasts.error(e); } finally { testing = false; }
   }
+  async function clearAi() {
+    try {
+      const n = await api.clearAiDecisions();
+      toasts.push('success', `Cleared ${n} AI decision(s); rescan to re-derive them`);
+    } catch (e) { toasts.error(e); }
+  }
   async function undo() {
     try { const r = await api.undoRename(); toasts.push('success', `Reverted ${r.renamed} file(s)`); } catch (e) { toasts.error(e); }
   }
@@ -65,8 +78,9 @@
 
 {#if open}
   <div class="fixed inset-0 z-30 bg-black/50" onclick={() => (open = false)} role="presentation"></div>
-  <aside class="fixed top-0 right-0 z-40 flex h-full w-96 flex-col gap-6 overflow-y-auto bg-zinc-900 p-6 ring-1 ring-zinc-800">
-    <h2 class="text-lg font-semibold">Settings</h2>
+  <div class="fixed top-0 right-0 z-40 flex h-full w-96 flex-col gap-6 overflow-y-auto bg-zinc-900 p-6 ring-1 ring-zinc-800"
+    role="dialog" aria-modal="true" aria-labelledby="settings-title" tabindex="-1">
+    <h2 id="settings-title" class="text-lg font-semibold">Settings</h2>
 
     <section>
       <h3 class="mb-2 text-sm font-medium text-zinc-300">Library folders</h3>
@@ -115,7 +129,8 @@
 
     <section class="space-y-2">
       <button class="block rounded bg-zinc-800 px-3 py-1 text-sm hover:bg-zinc-700" onclick={undo}>Undo last rename</button>
+      <button class="block rounded bg-zinc-800 px-3 py-1 text-sm hover:bg-zinc-700" onclick={clearAi}>Clear AI decisions</button>
       <button class="block rounded bg-zinc-800 px-3 py-1 text-sm hover:bg-zinc-700" onclick={purge}>Remove missing episodes</button>
     </section>
-  </aside>
+  </div>
 {/if}

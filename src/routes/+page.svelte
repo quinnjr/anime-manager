@@ -1,16 +1,31 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, onEvent, type ShowCard as ShowCardT } from '$lib/api';
+  import { isTypingTarget } from '$lib/keys';
   import { toasts } from '$lib/stores/toasts.svelte';
   import ShowCard from '$lib/components/ShowCard.svelte';
   import ScanBar from '$lib/components/ScanBar.svelte';
 
   let shows = $state<ShowCardT[]>([]);
   let filter = $state('');
-  let search: HTMLInputElement;
+  let search: HTMLInputElement | undefined = $state();
+
+  // Each keystroke starts a request; without a generation guard the slowest (broadest) reply
+  // wins and the grid settles on results for a prefix the user has already typed past.
+  let generation = 0;
+  let debounce: ReturnType<typeof setTimeout> | undefined;
 
   async function load() {
-    try { shows = await api.listShows(filter); } catch (e) { toasts.error(e); }
+    const mine = ++generation;
+    try {
+      const rows = await api.listShows(filter);
+      if (mine === generation) shows = rows;
+    } catch (e) { if (mine === generation) toasts.error(e); }
+  }
+
+  function onSearchInput() {
+    clearTimeout(debounce);
+    debounce = setTimeout(load, 120);
   }
 
   onMount(() => {
@@ -20,15 +35,18 @@
       onEvent('library-changed', load),
       onEvent('playback-changed', load)
     ];
-    const key = (e: KeyboardEvent) => { if (e.key === '/' && document.activeElement !== search) { e.preventDefault(); search.focus(); } };
+    const key = (e: KeyboardEvent) => {
+      if (isTypingTarget(e.target) || document.activeElement === search) return;
+      if (e.key === '/') { e.preventDefault(); search?.focus(); }
+    };
     window.addEventListener('keydown', key);
-    return () => { window.removeEventListener('keydown', key); us.forEach((p) => p.then((u) => u())); };
+    return () => { clearTimeout(debounce); window.removeEventListener('keydown', key); us.forEach((p) => p.then((u) => u())); };
   });
 </script>
 
 <div class="mb-6 flex items-center justify-between gap-4">
   <ScanBar onFinished={load} />
-  <input bind:this={search} bind:value={filter} oninput={load} placeholder="Search  ( / )"
+  <input bind:this={search} bind:value={filter} oninput={onSearchInput} placeholder="Search  ( / )"
     class="w-64 rounded bg-zinc-900 px-3 py-1 text-sm ring-1 ring-zinc-800 focus:ring-indigo-500 focus:outline-none" />
 </div>
 

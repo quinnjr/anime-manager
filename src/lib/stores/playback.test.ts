@@ -15,4 +15,11 @@ describe('playback', () => {
   it('returns undefined for unknown episodes', () => {
     expect(playback.statusFor(99)).toBeUndefined();
   });
+
+  it('clearStatuses drops cached rows but keeps the playing episode', () => {
+    playback.apply({ episode_id: 7, status: 'playing', position_secs: 5, duration_secs: 1400 });
+    playback.clearStatuses();
+    expect(playback.statusFor(7)).toBeUndefined();
+    expect(playback.currentId).toBe(7);
+  });
 });

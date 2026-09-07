@@ -6,6 +6,8 @@ authors = ["you"]
 license = ""
 repository = ""
 edition = "2024"
+# let-chains are used throughout (commands.rs, db.rs, parser.rs)
+rust-version = "1.88"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

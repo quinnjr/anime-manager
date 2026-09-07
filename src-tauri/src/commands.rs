@@ -34,18 +34,21 @@ pub async fn scan(app: AppHandle, state: State<'_, AppState>) -> Result<ScanSumm
     })
     .await
     .map_err(|e| crate::error::AppError::Io(e.to_string()))??;
-    let _ = app.emit("scan-finished", &summary);
     // Optional LLM second opinion on folders the parser was unsure about: queue them all and
     // let a single background worker drain the queue (a running worker picks up new entries).
     let assist_on = state.db.get_setting("llm_assist_on_scan")?.map(|v| v != "false").unwrap_or(true);
-    if assist_on && let Ok(l) = Llm::from_db(&state.db) && l.configured() && !summary.low_confidence_folders.is_empty() {
+    if assist_on && let Ok(l) = Llm::from_db(&state.db) && l.configured()
+        && !(summary.low_confidence_folders.is_empty() && !state.assist.has_pending()) {
         state.assist.enqueue(summary.low_confidence_folders.iter().cloned());
-        let _ = app.emit("llm-assist-progress", state.assist.progress());
-        if state.assist.try_start() {
+        if state.assist.has_pending() && !state.assist.is_running() {
             let db_l = state.db.clone();
             let app_l = app.clone();
             let queue = state.assist.clone();
+            // Show the indicator immediately: the first folder can take a while, and a silent
+            // library re-homing itself is worse than a visible one.
+            let _ = app.emit("llm-assist-progress", AssistProgress { running: true, ..queue.progress() });
             tauri::async_runtime::spawn(async move {
+                let Some(_guard) = queue.try_start() else { return };
                 let app_p = app_l.clone();
                 let report = queue.run(db_l, Arc::new(l), "llm", &move |p| {
                     let _ = app_p.emit("llm-assist-progress", &p);
@@ -166,7 +169,7 @@ pub fn undo_rename(app: AppHandle, state: State<'_, AppState>) -> Result<RenameR
 #[tauri::command]
 pub async fn inspect_show(app: AppHandle, state: State<'_, AppState>, show_id: i64) -> Result<InspectReport> {
     let l = Arc::new(Llm::from_db(&state.db)?);
-    let report = llm::inspect_show(state.db.clone(), l, show_id).await?;
+    let report = llm::inspect_show(state.db.clone(), l, state.assist.clone(), show_id).await?;
     let _ = app.emit("library-changed", ());
     if let Some(id) = report.show_id { let _ = app.emit("show-updated", id); }
     Ok(report)
@@ -179,3 +182,17 @@ pub async fn llm_test(state: State<'_, AppState>) -> Result<String> {
 
 #[tauri::command]
 pub fn assist_progress(state: State<'_, AppState>) -> Result<AssistProgress> { Ok(state.assist.progress()) }
+
+#[tauri::command]
+pub fn clear_ai_decisions(app: AppHandle, state: State<'_, AppState>) -> Result<usize> {
+    let n = state.db.clear_overrides(Some("llm"))?;
+    let _ = app.emit("library-changed", ());
+    Ok(n)
+}
+
+#[tauri::command]
+pub fn set_show_title(app: AppHandle, state: State<'_, AppState>, show_id: i64, title: Option<String>) -> Result<ShowDetail> {
+    state.db.set_title_override(show_id, title.as_deref())?;
+    let _ = app.emit("show-updated", show_id);
+    state.db.get_show(show_id)
+}

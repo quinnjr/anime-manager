@@ -47,7 +47,9 @@ export const api = {
   purgeMissing: () => invoke<number>('purge_missing'),
   inspectShow: (showId: number) => invoke<InspectReport>('inspect_show', { showId }),
   llmTest: () => invoke<string>('llm_test'),
-  assistProgress: () => invoke<AssistProgress>('assist_progress')
+  assistProgress: () => invoke<AssistProgress>('assist_progress'),
+  clearAiDecisions: () => invoke<number>('clear_ai_decisions'),
+  setShowTitle: (showId: number, title: string | null) => invoke<ShowDetail>('set_show_title', { showId, title })
 };
 
 export function onEvent<T>(name: string, cb: (payload: T) => void): Promise<UnlistenFn> {

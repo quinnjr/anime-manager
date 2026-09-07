@@ -4,6 +4,8 @@
   import { goto } from '$app/navigation';
   import { api, onEvent, type ShowDetail, type RenameTarget } from '$lib/api';
   import { toasts } from '$lib/stores/toasts.svelte';
+  import { playback } from '$lib/stores/playback.svelte';
+  import { isTypingTarget } from '$lib/keys';
   import EpisodeRow from '$lib/components/EpisodeRow.svelte';
   import RematchModal from '$lib/components/RematchModal.svelte';
   import RenameModal from '$lib/components/RenameModal.svelte';
@@ -16,19 +18,47 @@
   let renameOpen = $state(false);
   let renameTarget = $state<RenameTarget | null>(null);
   let inspecting = $state(false);
+  let editingTitle = $state(false);
+  let titleDraft = $state('');
 
   const season = $derived(show?.seasons[seasonIdx] ?? null);
 
+  // A background assist run can merge this show into another and delete it while the page is
+  // open; reloading it then errors forever and the page sticks on "Loading…".
+  let generation = 0;
+
   async function load() {
+    const mine = ++generation;
     try {
-      show = await api.getShow(id);
+      const next = await api.getShow(id);
+      if (mine !== generation) return;
+      show = next;
+      // Believe the database again rather than statuses cached earlier in the session.
+      playback.clearStatuses();
       if (seasonIdx >= show.seasons.length) seasonIdx = 0;
       const len = show.seasons[seasonIdx]?.episodes.length ?? 0;
       if (highlight >= len) highlight = Math.max(0, len - 1);
-    } catch (e) { toasts.error(e); }
+    } catch (e) {
+      if (mine !== generation) return;
+      const msg = e && typeof e === 'object' && 'message' in e ? String((e as { message: unknown }).message) : String(e);
+      if (msg.includes('no rows') || msg.includes('not found')) {
+        toasts.push('info', 'That show was merged into another and no longer exists.');
+        await goto('/');
+        return;
+      }
+      toasts.error(e);
+    }
   }
 
   function openRename(t: RenameTarget) { renameTarget = t; renameOpen = true; }
+
+  async function saveTitle() {
+    if (!show) return;
+    try {
+      show = await api.setShowTitle(show.id, titleDraft.trim() || null);
+      editingTitle = false;
+    } catch (e) { toasts.error(e); }
+  }
 
   async function inspect() {
     if (!show) return;
@@ -56,7 +86,8 @@
   onMount(() => {
     const us = [onEvent('show-updated', load), onEvent('library-changed', load), onEvent('playback-changed', load)];
     const key = (e: KeyboardEvent) => {
-      if (!season || rematchOpen || renameOpen) return;
+      // Settings lives in the layout, so a local open-flag cannot see it; ask the event target.
+      if (!season || rematchOpen || renameOpen || isTypingTarget(e.target)) return;
       if (e.key === 'ArrowDown') { e.preventDefault(); highlight = Math.min(highlight + 1, season.episodes.length - 1); }
       if (e.key === 'ArrowUp') { e.preventDefault(); highlight = Math.max(highlight - 1, 0); }
       if (e.key === 'Enter') { const ep = season.episodes[highlight]; if (ep && ep.status !== 'missing') api.play(ep.id).catch((e) => toasts.error(e)); }
@@ -72,7 +103,21 @@
       {#if show.cover_url}<img src={show.cover_url} alt="" class="h-full w-full object-cover" />{/if}
     </div>
     <div class="flex-1">
-      <h1 class="text-2xl font-semibold">{show.display_title}</h1>
+      {#if editingTitle}
+        <form class="flex gap-2" onsubmit={(e) => { e.preventDefault(); saveTitle(); }}>
+          <input bind:value={titleDraft} aria-label="Display title"
+            class="flex-1 rounded bg-zinc-800 px-2 py-1 text-xl" />
+          <button class="rounded bg-indigo-600 px-3 py-1 text-sm">Save</button>
+          <button type="button" class="rounded bg-zinc-800 px-3 py-1 text-sm" onclick={() => (editingTitle = false)}>Cancel</button>
+        </form>
+      {:else}
+        <h1 class="text-2xl font-semibold">
+          {show.display_title}
+          <button class="ml-2 align-middle text-xs font-normal text-zinc-500 hover:underline"
+            title="Use your own title for this show"
+            onclick={() => { titleDraft = show!.user_title_override ?? show!.display_title; editingTitle = true; }}>rename</button>
+        </h1>
+      {/if}
       <p class="text-sm text-zinc-400">{show.parsed_title}{show.total_episodes ? ` · ${show.total_episodes} episodes` : ''}{show.anilist_id ? ` · AniList #${show.anilist_id}` : ' · unmatched'}</p>
       <div class="mt-3 flex gap-2">
         <button class="rounded bg-zinc-800 px-3 py-1 text-sm hover:bg-zinc-700" onclick={() => (rematchOpen = true)}>Re-match</button>

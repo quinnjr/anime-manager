@@ -9,6 +9,11 @@ pub struct Db {
     conn: Mutex<Connection>,
 }
 
+/// Reject paths that are not valid UTF-8 rather than storing a lossy, unopenable string.
+pub fn path_to_str(p: &Path) -> Result<String> {
+    p.to_str().map(str::to_string).ok_or_else(|| AppError::Io(format!("path is not valid UTF-8: {}", p.display())))
+}
+
 pub fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
@@ -19,7 +24,8 @@ CREATE TABLE IF NOT EXISTS roots (
 CREATE TABLE IF NOT EXISTS shows (
   id INTEGER PRIMARY KEY, parsed_title TEXT NOT NULL UNIQUE,
   anilist_id INTEGER, canonical_title TEXT, cover_url TEXT, total_episodes INTEGER,
-  user_title_override TEXT, created_at INTEGER NOT NULL);
+  user_title_override TEXT, created_at INTEGER NOT NULL,
+  anilist_cleared INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS seasons (
   id INTEGER PRIMARY KEY, show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
   number INTEGER NOT NULL, UNIQUE(show_id, number));
@@ -28,10 +34,13 @@ CREATE TABLE IF NOT EXISTS episodes (
   number INTEGER NOT NULL, path TEXT NOT NULL UNIQUE, size INTEGER NOT NULL, mtime INTEGER NOT NULL,
   release_group TEXT, resolution TEXT, crc TEXT,
   status TEXT NOT NULL DEFAULT 'unplayed' CHECK(status IN ('unplayed','playing','played','missing')),
+  prev_status TEXT,
   position_secs REAL NOT NULL DEFAULT 0, duration_secs REAL, last_played_at INTEGER);
+-- episode_id is nullable and ON DELETE SET NULL: deleting an episode must never destroy the
+-- record of a rename, or the file is stranded under its new name with no way back.
 CREATE TABLE IF NOT EXISTS rename_log (
   id INTEGER PRIMARY KEY, batch_id TEXT NOT NULL,
-  episode_id INTEGER NOT NULL REFERENCES episodes(id) ON DELETE CASCADE,
+  episode_id INTEGER REFERENCES episodes(id) ON DELETE SET NULL,
   old_path TEXT NOT NULL, new_path TEXT NOT NULL, applied_at INTEGER NOT NULL, reverted_at INTEGER);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS parse_overrides (
@@ -42,9 +51,53 @@ CREATE INDEX IF NOT EXISTS idx_episodes_season ON episodes(season_id);
 CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status);
 "#;
 
+const SCHEMA_VERSION: i64 = 2;
+
+/// Bring an existing database up to `SCHEMA_VERSION`. Fresh databases get the current shape
+/// from SCHEMA directly; older ones are altered in place so no user data is lost.
+fn upgrade(conn: &Connection) -> Result<()> {
+    let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if v >= SCHEMA_VERSION {
+        conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+        return Ok(());
+    }
+    let has = |table: &str, col: &str| -> Result<bool> {
+        let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = st.query([])?;
+        while let Some(r) = rows.next()? {
+            if r.get::<_, String>(1)? == col { return Ok(true); }
+        }
+        Ok(false)
+    };
+    if !has("episodes", "prev_status")? {
+        conn.execute_batch("ALTER TABLE episodes ADD COLUMN prev_status TEXT;")?;
+    }
+    if !has("shows", "anilist_cleared")? {
+        conn.execute_batch("ALTER TABLE shows ADD COLUMN anilist_cleared INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    // rename_log's foreign key cannot be altered in place; rebuild the table when it still
+    // carries the old NOT NULL / ON DELETE CASCADE definition.
+    let sql: String = conn.query_row("SELECT COALESCE(sql, '') FROM sqlite_master WHERE type='table' AND name='rename_log'", [], |r| r.get(0)).unwrap_or_default();
+    if sql.contains("ON DELETE CASCADE") {
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             CREATE TABLE rename_log_new (
+               id INTEGER PRIMARY KEY, batch_id TEXT NOT NULL,
+               episode_id INTEGER REFERENCES episodes(id) ON DELETE SET NULL,
+               old_path TEXT NOT NULL, new_path TEXT NOT NULL, applied_at INTEGER NOT NULL, reverted_at INTEGER);
+             INSERT INTO rename_log_new SELECT id, batch_id, episode_id, old_path, new_path, applied_at, reverted_at FROM rename_log;
+             DROP TABLE rename_log;
+             ALTER TABLE rename_log_new RENAME TO rename_log;
+             PRAGMA foreign_keys = ON;")?;
+    }
+    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+    Ok(())
+}
+
 pub fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     conn.execute_batch(SCHEMA)?;
+    upgrade(conn)?;
     Ok(())
 }
 
@@ -61,6 +114,16 @@ fn row_to_episode(r: &rusqlite::Row) -> rusqlite::Result<Episode> {
     })
 }
 const EP_COLS: &str = "id, season_id, number, path, size, mtime, release_group, resolution, crc, status, position_secs, duration_secs, last_played_at";
+
+/// Neutralise LIKE wildcards typed into the search box, so `_` filters instead of matching all.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '\\' | '%' | '_') { out.push('\\'); }
+        out.push(ch);
+    }
+    out
+}
 
 fn display_title_sql() -> &'static str { "COALESCE(user_title_override, canonical_title, parsed_title)" }
 
@@ -124,26 +187,36 @@ impl Db {
 
     // ---- episodes / shows ----
     pub fn upsert_episode(&self, p: &crate::parser::ParsedName, f: &crate::scanner::RawFile) -> Result<Upsert> {
-        let path = f.path.to_string_lossy().to_string();
+        let path = path_to_str(&f.path)?;
         self.with(|c| {
             c.execute("INSERT OR IGNORE INTO shows(parsed_title, created_at) VALUES (?1, ?2)", params![p.title, now()])?;
             let show_id: i64 = c.query_row("SELECT id FROM shows WHERE parsed_title = ?1", params![p.title], |r| r.get(0))?;
             c.execute("INSERT OR IGNORE INTO seasons(show_id, number) VALUES (?1, ?2)", params![show_id, p.season])?;
             let season_id: i64 = c.query_row("SELECT id FROM seasons WHERE show_id = ?1 AND number = ?2", params![show_id, p.season], |r| r.get(0))?;
 
-            let existing: Option<i64> = c.query_row("SELECT id FROM episodes WHERE path = ?1", params![path], |r| r.get(0)).optional()?
-                .or(c.query_row(
-                    "SELECT id FROM episodes WHERE season_id = ?1 AND number = ?2 AND size = ?3 AND mtime = ?4 AND status = 'missing'",
-                    params![season_id, p.episode, f.size as i64, f.mtime], |r| r.get(0)).optional()?)
-                .or(c.query_row(
-                    "SELECT id FROM episodes WHERE season_id = ?1 AND number = ?2 AND size = ?3 AND mtime = ?4",
-                    params![season_id, p.episode, f.size as i64, f.mtime], |r| r.get(0)).optional()?);
+            let mut existing: Option<i64> =
+                c.query_row("SELECT id FROM episodes WHERE path = ?1", params![path], |r| r.get(0)).optional()?;
+            if existing.is_none() {
+                // A file that moved keeps its size and mtime. Reuse the old row only when its
+                // recorded path is genuinely gone from disk, otherwise a `cp -p` duplicate or a
+                // hardlinked copy would hijack the live episode's row and erase the original.
+                let candidate: Option<(i64, String)> = c.query_row(
+                    "SELECT id, path FROM episodes WHERE season_id = ?1 AND number = ?2 AND size = ?3 AND mtime = ?4
+                     ORDER BY CASE WHEN status = 'missing' THEN 0 ELSE 1 END LIMIT 1",
+                    params![season_id, p.episode, f.size as i64, f.mtime],
+                    |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()?;
+                existing = candidate.filter(|(_, old)| !Path::new(old).exists()).map(|(id, _)| id);
+            }
 
             match existing {
                 Some(id) => {
+                    // A file that comes back is restored to whatever the user had judged it to be,
+                    // never blanket-reset to unplayed; 'playing' is a runtime state, so it decays.
                     c.execute(
                         "UPDATE episodes SET season_id=?2, number=?3, path=?4, size=?5, mtime=?6, release_group=?7, resolution=?8, crc=?9,
-                         status = CASE WHEN status='missing' THEN 'unplayed' ELSE status END WHERE id=?1",
+                         status = CASE WHEN status='missing' THEN COALESCE(NULLIF(prev_status,'playing'), 'unplayed') ELSE status END,
+                         prev_status = NULL WHERE id=?1",
                         params![id, season_id, p.episode, path, f.size as i64, f.mtime, p.release_group, p.resolution, p.crc])?;
                     Ok(Upsert::Updated)
                 }
@@ -154,6 +227,31 @@ impl Db {
                     Ok(Upsert::Added)
                 }
             }
+        })
+    }
+
+    /// Flag as missing only the episodes under `roots` that this scan did not see. Roots whose
+    /// scan failed are not passed in, so an unmounted share never marks a whole library missing.
+    pub fn mark_missing_within(&self, roots: &[String], seen: &[String]) -> Result<usize> {
+        if roots.is_empty() { return Ok(0); }
+        self.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS seen(path TEXT PRIMARY KEY); DELETE FROM seen;")?;
+            {
+                let mut ins = tx.prepare("INSERT OR IGNORE INTO seen(path) VALUES (?1)")?;
+                for p in seen { ins.execute(params![p])?; }
+            }
+            let mut n = 0;
+            for root in roots {
+                let prefix = format!("{}/", root.trim_end_matches('/'));
+                n += tx.execute(
+                    "UPDATE episodes SET prev_status = status, status = 'missing'
+                     WHERE status != 'missing' AND substr(path, 1, length(?1)) = ?1
+                       AND path NOT IN (SELECT path FROM seen)",
+                    params![prefix])?;
+            }
+            tx.commit()?;
+            Ok(n)
         })
     }
 
@@ -236,12 +334,18 @@ impl Db {
         })
     }
 
+    /// Mark everything not in `seen` as missing, regardless of root. Only safe when every root
+    /// scanned cleanly; `run_scan` uses `mark_missing_within` instead.
     pub fn mark_missing_except(&self, seen: &[String]) -> Result<usize> {
         self.with(|c| {
-            c.execute_batch("CREATE TEMP TABLE IF NOT EXISTS seen(path TEXT PRIMARY KEY); DELETE FROM seen;")?;
-            let mut ins = c.prepare("INSERT OR IGNORE INTO seen(path) VALUES (?1)")?;
-            for p in seen { ins.execute(params![p])?; }
-            let n = c.execute("UPDATE episodes SET status='missing' WHERE status != 'missing' AND path NOT IN (SELECT path FROM seen)", [])?;
+            let tx = c.unchecked_transaction()?;
+            tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS seen(path TEXT PRIMARY KEY); DELETE FROM seen;")?;
+            {
+                let mut ins = tx.prepare("INSERT OR IGNORE INTO seen(path) VALUES (?1)")?;
+                for p in seen { ins.execute(params![p])?; }
+            }
+            let n = tx.execute("UPDATE episodes SET prev_status = status, status='missing' WHERE status != 'missing' AND path NOT IN (SELECT path FROM seen)", [])?;
+            tx.commit()?;
             Ok(n)
         })
     }
@@ -261,9 +365,9 @@ impl Db {
                 "SELECT s.id, {dt}, s.cover_url,
                         (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id=se.id WHERE se.show_id=s.id AND e.status!='missing'),
                         (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id=se.id WHERE se.show_id=s.id AND e.status IN ('unplayed','playing'))
-                 FROM shows s WHERE {dt} LIKE ?1 COLLATE NOCASE ORDER BY {dt} COLLATE NOCASE", dt = display_title_sql());
+                 FROM shows s WHERE {dt} LIKE ?1 ESCAPE '\\' ORDER BY {dt} COLLATE NOCASE", dt = display_title_sql());
             let mut st = c.prepare(&sql)?;
-            let rows = st.query_map(params![format!("%{filter}%")], |r| Ok(ShowCard {
+            let rows = st.query_map(params![format!("%{}%", escape_like(filter))], |r| Ok(ShowCard {
                 id: r.get(0)?, display_title: r.get(1)?, cover_url: r.get(2)?, episode_count: r.get(3)?, unwatched_count: r.get(4)?,
             }))?;
             Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -324,23 +428,37 @@ impl Db {
 
     pub fn set_anilist(&self, show_id: i64, hit: &AniListHit) -> Result<()> {
         self.with(|c| {
+            c.execute("UPDATE shows SET anilist_cleared = 0 WHERE id = ?1", params![show_id])?;
             c.execute("UPDATE shows SET anilist_id=?2, canonical_title=?3, cover_url=?4, total_episodes=?5 WHERE id=?1",
                 params![show_id, hit.id, hit.title_romaji, hit.cover_url, hit.episodes])?;
             Ok(())
         })
     }
 
+    /// True once the user has explicitly cleared a match, so auto-match must not re-apply it.
     pub fn clear_anilist(&self, show_id: i64) -> Result<()> {
         self.with(|c| {
-            c.execute("UPDATE shows SET anilist_id=NULL, canonical_title=NULL, cover_url=NULL, total_episodes=NULL WHERE id=?1", params![show_id])?;
+            c.execute("UPDATE shows SET anilist_id=NULL, canonical_title=NULL, cover_url=NULL, total_episodes=NULL, anilist_cleared=1 WHERE id=?1", params![show_id])?;
             Ok(())
         })
     }
 
+    /// Shows still awaiting an AniList match. A match the user explicitly cleared is never
+    /// offered again, otherwise the next scan would silently re-apply the same wrong guess.
     pub fn shows_needing_match(&self) -> Result<Vec<(i64, String)>> {
         self.with(|c| {
-            let mut st = c.prepare("SELECT id, parsed_title FROM shows WHERE anilist_id IS NULL ORDER BY id")?;
+            let mut st = c.prepare("SELECT id, parsed_title FROM shows WHERE anilist_id IS NULL AND anilist_cleared = 0 ORDER BY id")?;
             Ok(st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?)
+        })
+    }
+
+    /// Set (or clear, with None/blank) the user's own display title for a show. This is the
+    /// first term of the display-title COALESCE, so it wins over the AniList and parsed titles.
+    pub fn set_title_override(&self, show_id: i64, title: Option<&str>) -> Result<()> {
+        let t = title.map(str::trim).filter(|t| !t.is_empty());
+        self.with(|c| {
+            c.execute("UPDATE shows SET user_title_override = ?2 WHERE id = ?1", params![show_id, t])?;
+            Ok(())
         })
     }
 
@@ -352,6 +470,16 @@ impl Db {
         self.with(|c| { c.execute("UPDATE episodes SET path=?2 WHERE id=?1", params![id, path])?; Ok(()) })
     }
 
+    /// Move a parse override to follow a renamed file, so an LLM or user decision is not lost
+    /// (and does not linger on the old path, where it would capture an unrelated future file).
+    pub fn move_override(&self, old_path: &str, new_path: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM parse_overrides WHERE path = ?1", params![new_path])?;
+            c.execute("UPDATE parse_overrides SET path = ?2 WHERE path = ?1", params![old_path, new_path])?;
+            Ok(())
+        })
+    }
+
     pub fn log_rename(&self, batch_id: &str, episode_id: i64, old_path: &str, new_path: &str) -> Result<()> {
         self.with(|c| {
             c.execute("INSERT INTO rename_log(batch_id, episode_id, old_path, new_path, applied_at) VALUES (?1,?2,?3,?4,?5)",
@@ -360,15 +488,30 @@ impl Db {
         })
     }
 
-    pub fn latest_unreverted_batch(&self) -> Result<Option<(String, Vec<(i64, i64, String, String)>)>> {
+    /// Every batch that still has unreverted entries, newest first, as
+    /// (log id, episode id, old, new). `episode_id` is None when the episode row was deleted
+    /// after the rename was logged. Undo walks this list so a batch whose file is permanently
+    /// gone cannot pin every older batch out of reach.
+    #[allow(clippy::type_complexity)]
+    pub fn unreverted_batches(&self) -> Result<Vec<(String, Vec<(i64, Option<i64>, String, String)>)>> {
         self.with(|c| {
-            let batch: Option<String> = c.query_row(
-                "SELECT batch_id FROM rename_log WHERE reverted_at IS NULL ORDER BY applied_at DESC, id DESC LIMIT 1", [], |r| r.get(0)).optional()?;
-            let Some(batch) = batch else { return Ok(None) };
+            let mut bst = c.prepare(
+                "SELECT batch_id FROM rename_log WHERE reverted_at IS NULL GROUP BY batch_id ORDER BY MAX(applied_at) DESC, MAX(id) DESC")?;
+            let batches: Vec<String> = bst.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+            let mut out = Vec::with_capacity(batches.len());
             let mut st = c.prepare("SELECT id, episode_id, old_path, new_path FROM rename_log WHERE batch_id=?1 AND reverted_at IS NULL ORDER BY id")?;
-            let rows = st.query_map(params![batch], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<std::result::Result<_, _>>()?;
-            Ok(Some((batch, rows)))
+            for b in batches {
+                let rows = st.query_map(params![b], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<std::result::Result<_, _>>()?;
+                out.push((b, rows));
+            }
+            Ok(out)
         })
+    }
+
+    /// The newest batch with unreverted entries, or None.
+    #[allow(clippy::type_complexity)]
+    pub fn latest_unreverted_batch(&self) -> Result<Option<(String, Vec<(i64, Option<i64>, String, String)>)>> {
+        Ok(self.unreverted_batches()?.into_iter().next())
     }
 
     pub fn mark_log_entry_reverted(&self, log_id: i64) -> Result<()> {
@@ -383,9 +526,20 @@ pub fn run_scan(db: &Db, on_progress: &mut dyn FnMut(ScanProgress)) -> Result<Sc
     let mut summary = ScanSummary::default();
     let mut low_conf_folders = BTreeSet::new();
     let mut all_files = Vec::new();
+    // Only roots that were actually readable may drive missing-detection. An unmounted share
+    // returns zero files plus an error, and marking its whole library missing would let the
+    // Settings purge delete every watched flag, resume position and AniList match.
+    let mut trusted_roots: Vec<String> = Vec::new();
     for root in db.list_roots()? {
-        let (files, errors) = scanner::scan_dir(Path::new(&root.path), &mut |_| {});
+        let dir = Path::new(&root.path);
+        let (files, errors) = scanner::scan_dir(dir);
+        let unreadable = !dir.is_dir() || (files.is_empty() && !errors.is_empty());
         summary.errors.extend(errors);
+        if unreadable {
+            summary.errors.push(format!("root is unreadable, its episodes were left untouched: {}", root.path));
+        } else {
+            trusted_roots.push(root.path.clone());
+        }
         all_files.extend(files);
     }
     let total = all_files.len();
@@ -393,7 +547,12 @@ pub fn run_scan(db: &Db, on_progress: &mut dyn FnMut(ScanProgress)) -> Result<Sc
     for (i, f) in all_files.iter().enumerate() {
         summary.files_seen += 1;
         on_progress(ScanProgress { done: i + 1, total, current_path: f.path.to_string_lossy().to_string() });
-        let path_str = f.path.to_string_lossy().to_string();
+        // A lossy path would be stored with U+FFFD and could never be opened, renamed or
+        // de-duplicated, so such files are reported rather than silently corrupted.
+        let path_str = match path_to_str(&f.path) {
+            Ok(p) => p,
+            Err(e) => { summary.errors.push(e.to_string()); continue; }
+        };
         let parsed = match db.get_override(&path_str)? {
             Some(o) if o.kind == "ignore" => { seen_paths.push(path_str); continue; }
             Some(o) => {
@@ -425,7 +584,8 @@ pub fn run_scan(db: &Db, on_progress: &mut dyn FnMut(ScanProgress)) -> Result<Sc
             Err(e) => summary.errors.push(format!("{}: {e}", f.path.display())),
         }
     }
-    summary.episodes_missing = db.mark_missing_except(&seen_paths)?;
+    summary.episodes_missing = db.mark_missing_within(&trusted_roots, &seen_paths)?;
+    db.prune_empty()?;
     summary.low_confidence_folders = low_conf_folders.into_iter().collect();
     Ok(summary)
 }
@@ -650,5 +810,138 @@ mod tests {
         assert!(db.delete_episode_by_path("/a/1.mkv").unwrap());
         db.prune_empty().unwrap();
         assert!(db.list_shows("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn unreadable_root_never_marks_the_library_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("live");
+        let gone = dir.path().join("gone");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::create_dir_all(&gone).unwrap();
+        std::fs::write(live.join("Live Show - 01.mkv"), b"x").unwrap();
+        std::fs::write(gone.join("Gone Show - 01.mkv"), b"x").unwrap();
+        let db = Db::open_memory().unwrap();
+        db.add_root(live.to_str().unwrap()).unwrap();
+        db.add_root(gone.to_str().unwrap()).unwrap();
+        run_scan(&db, &mut |_| {}).unwrap();
+        let gone_show = db.list_shows("Gone").unwrap()[0].id;
+        let ep = db.get_show(gone_show).unwrap().seasons[0].episodes[0].id;
+        db.set_status(ep, EpisodeStatus::Played).unwrap();
+
+        // The share disappears (unmounted NAS): its episodes must keep their watched state.
+        std::fs::remove_dir_all(&gone).unwrap();
+        let s = run_scan(&db, &mut |_| {}).unwrap();
+        assert_eq!(s.episodes_missing, 0, "an unreadable root must not mark anything missing");
+        assert!(s.errors.iter().any(|e| e.contains("unreadable")), "{:?}", s.errors);
+        assert_eq!(db.get_episode(ep).unwrap().status, EpisodeStatus::Played);
+        assert_eq!(db.purge_missing().unwrap(), 0, "nothing to purge, so nothing is lost");
+
+        // A file that really vanishes from a healthy root is still detected.
+        std::fs::remove_file(live.join("Live Show - 01.mkv")).unwrap();
+        let s = run_scan(&db, &mut |_| {}).unwrap();
+        assert_eq!(s.episodes_missing, 1);
+    }
+
+    #[test]
+    fn watched_state_survives_a_missing_round_trip() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Show", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
+        let ep = db.get_show(db.list_shows("").unwrap()[0].id).unwrap().seasons[0].episodes[0].id;
+        db.set_status(ep, EpisodeStatus::Played).unwrap();
+        db.mark_missing_except(&[]).unwrap();
+        assert_eq!(db.get_episode(ep).unwrap().status, EpisodeStatus::Missing);
+        db.upsert_episode(&pn("Show", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
+        assert_eq!(db.get_episode(ep).unwrap().status, EpisodeStatus::Played, "a file that returns keeps its watched flag");
+    }
+
+    #[test]
+    fn duplicate_file_with_identical_metadata_does_not_hijack_the_live_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let orig = dir.path().join("Show - 01.mkv");
+        let copy = dir.path().join("Show - 01 copy.mkv");
+        std::fs::write(&orig, b"x").unwrap();
+        std::fs::write(&copy, b"x").unwrap();
+        let db = Db::open_memory().unwrap();
+        let p = pn("Show", 1, 1);
+        assert_eq!(db.upsert_episode(&p, &rf(orig.to_str().unwrap(), 500, 999)).unwrap(), Upsert::Added);
+        assert_eq!(db.upsert_episode(&p, &rf(copy.to_str().unwrap(), 500, 999)).unwrap(), Upsert::Added,
+            "a second file that still exists on disk gets its own row");
+        assert_eq!(db.get_show(db.list_shows("").unwrap()[0].id).unwrap().seasons[0].episodes.len(), 2);
+
+        // A genuine rename (old path gone) still reuses the row and keeps the watched flag.
+        let db2 = Db::open_memory().unwrap();
+        db2.upsert_episode(&p, &rf("/nonexistent/old.mkv", 500, 999)).unwrap();
+        let ep = db2.get_show(db2.list_shows("").unwrap()[0].id).unwrap().seasons[0].episodes[0].id;
+        db2.set_status(ep, EpisodeStatus::Played).unwrap();
+        assert_eq!(db2.upsert_episode(&p, &rf(orig.to_str().unwrap(), 500, 999)).unwrap(), Upsert::Updated);
+        assert_eq!(db2.get_episode(ep).unwrap().path, orig.to_str().unwrap());
+        assert_eq!(db2.get_episode(ep).unwrap().status, EpisodeStatus::Played);
+    }
+
+    #[test]
+    fn title_override_wins_over_anilist_and_parsed_titles() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Yagate Kimi ni Naru", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
+        let id = db.list_shows("").unwrap()[0].id;
+        db.set_anilist(id, &AniListHit { id: 1, title_romaji: "Yagate Kimi ni Naru".into(), title_english: None, cover_url: None, episodes: None }).unwrap();
+        db.set_title_override(id, Some("Bloom Into You")).unwrap();
+        assert_eq!(db.display_title(id).unwrap(), "Bloom Into You");
+        assert_eq!(db.list_shows("Bloom").unwrap().len(), 1);
+        assert_eq!(db.get_show(id).unwrap().user_title_override.as_deref(), Some("Bloom Into You"));
+        db.set_title_override(id, Some("   ")).unwrap();
+        assert_eq!(db.display_title(id).unwrap(), "Yagate Kimi ni Naru", "blank clears the override");
+    }
+
+    #[test]
+    fn search_wildcards_are_escaped() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Steins_Gate", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
+        db.upsert_episode(&pn("Frieren", 1, 1), &rf("/a/2.mkv", 1, 1)).unwrap();
+        assert_eq!(db.list_shows("_").unwrap().len(), 1, "a literal underscore must not match everything");
+        assert_eq!(db.list_shows("_").unwrap()[0].display_title, "Steins_Gate");
+        assert_eq!(db.list_shows("%").unwrap().len(), 0);
+        assert_eq!(db.list_shows("steins").unwrap().len(), 1, "ASCII case folding still works");
+    }
+
+    #[test]
+    fn cleared_anilist_match_is_not_re_applied() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Show", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
+        let id = db.list_shows("").unwrap()[0].id;
+        let hit = AniListHit { id: 42, title_romaji: "Wrong".into(), title_english: None, cover_url: None, episodes: None };
+        db.set_anilist(id, &hit).unwrap();
+        db.clear_anilist(id).unwrap();
+        assert!(db.shows_needing_match().unwrap().is_empty(), "the user's decision to clear must stick");
+        // An explicit re-match re-arms auto-matching for that show.
+        db.set_anilist(id, &hit).unwrap();
+        db.clear_anilist(id).unwrap();
+        assert!(db.shows_needing_match().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_an_episode_keeps_its_rename_history() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Show", 1, 1), &rf("/a/new.mkv", 1, 1)).unwrap();
+        let ep = db.get_show(db.list_shows("").unwrap()[0].id).unwrap().seasons[0].episodes[0].id;
+        db.log_rename("batch", ep, "/a/old.mkv", "/a/new.mkv").unwrap();
+        db.delete_episode_by_path("/a/new.mkv").unwrap();
+        let (_, rows) = db.latest_unreverted_batch().unwrap().expect("history survives the delete");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].3, "/a/new.mkv");
+    }
+
+    #[test]
+    fn non_utf8_paths_are_reported_not_stored_lossily() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join(std::ffi::OsStr::from_bytes(b"Pok\xe9mon - 01.mkv"));
+        std::fs::write(&bad, b"x").unwrap();
+        std::fs::write(dir.path().join("Good Show - 01.mkv"), b"x").unwrap();
+        let db = Db::open_memory().unwrap();
+        db.add_root(dir.path().to_str().unwrap()).unwrap();
+        let s = run_scan(&db, &mut |_| {}).unwrap();
+        assert_eq!(s.episodes_added, 1, "only the valid file is stored");
+        assert!(s.errors.iter().any(|e| e.contains("not valid UTF-8")), "{:?}", s.errors);
     }
 }

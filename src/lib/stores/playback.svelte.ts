@@ -13,5 +13,9 @@ export const playback = {
     else if (current === ev.episode_id) current = null;
   },
   statusFor(id: number): EpState | undefined { return byId[id]; },
+  /** Drop cached per-episode statuses so freshly loaded database rows are believed again.
+   * Without this a status recorded once masks later truth (a played episode whose file has
+   * since gone missing would still render playable) and the map grows for the whole session. */
+  clearStatuses() { byId = {}; },
   reset() { current = null; byId = {}; }
 };

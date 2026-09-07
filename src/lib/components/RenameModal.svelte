@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { api, type RenamePlan, type RenameTarget } from '$lib/api';
   import { toasts } from '$lib/stores/toasts.svelte';
 
@@ -20,12 +21,18 @@
       open = false; onDone();
     } catch (e) { toasts.error(e); }
   }
+
+  onMount(() => {
+    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape' && open) { e.preventDefault(); open = false; } };
+    window.addEventListener('keydown', esc);
+    return () => window.removeEventListener('keydown', esc);
+  });
 </script>
 
 {#if open}
   <div class="fixed inset-0 z-40 flex items-center justify-center bg-black/60" onclick={() => (open = false)} role="presentation">
-    <div class="w-[720px] rounded-lg bg-zinc-900 p-5 ring-1 ring-zinc-700" onclick={(e) => e.stopPropagation()} role="dialog">
-      <h2 class="mb-3 text-lg font-semibold">Rename on disk</h2>
+    <div class="w-[720px] rounded-lg bg-zinc-900 p-5 ring-1 ring-zinc-700" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-labelledby="rename-title" tabindex="-1">
+      <h2 id="rename-title" class="mb-3 text-lg font-semibold">Rename on disk</h2>
       {#if !plan}
         <p class="text-zinc-400">Loading…</p>
       {:else if plan.entries.length === 0}
