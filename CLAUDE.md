@@ -20,6 +20,22 @@ Single test: `cargo test --manifest-path src-tauri/Cargo.toml parser::tests::epi
 
 Requires Rust 1.88+ (let-chains are used in `commands.rs`, `db.rs`, `parser.rs`) and mpv on `$PATH`.
 
+## Branching (git-flow)
+
+This repo uses git-flow (AVH), already configured: `main` is production, `develop` is integration, tags are `v`-prefixed, prefixes are `feature/ bugfix/ release/ hotfix/ support/`.
+
+**Never commit to `main`.** It only receives merges from a release or hotfix branch. Day-to-day work branches off `develop`:
+
+```bash
+git flow feature start <name>     # branches off develop
+git flow release start 0.2.0      # branches off develop, bump versions here
+git flow hotfix start 0.1.1       # branches off main
+```
+
+Bump the version in three places together, or the package and the binary disagree: `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`, `package.json`. `packaging/arch/PKGBUILD` carries `pkgver` as well.
+
+`git flow * finish` merges, tags and deletes branches in one step. The user's standing rule is that merges are never automatic, so stop and hand the finish over rather than running it.
+
 ## The spec is binding
 
 `docs/superpowers/specs/2026-09-05-anime-manager-design.md` is the authority, not a historical note. Read it before changing parser passes, the data model, or playback. Its **Safety rules** section records why each data-loss guard exists; a change that removes one needs a spec change first.

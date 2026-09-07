@@ -25,6 +25,12 @@ process-global environment variables.
 
 Data lives in `~/.local/share/anime-manager/db.sqlite`. Files on disk are only changed by the explicit Rename feature, which is undoable.
 
+## Contributing
+
+This repo follows [git-flow](https://github.com/petervanderdoes/gitflow-avh): `main` is
+production, `develop` is integration, releases are tagged `vX.Y.Z`. Branch off `develop`
+with `git flow feature start <name>`; `main` only receives release and hotfix merges.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
