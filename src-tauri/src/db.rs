@@ -418,13 +418,15 @@ impl Db {
         })
     }
 
-    pub fn list_shows(&self, filter: &str) -> Result<Vec<ShowCard>> {
+    pub fn list_shows(&self, filter: &str, sort: ShowSort) -> Result<Vec<ShowCard>> {
         self.with(|c| {
+            let dt = display_title_sql();
             let sql = format!(
                 "SELECT s.id, {dt}, s.cover_url, s.cover_path,
                         (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id=se.id WHERE se.show_id=s.id AND e.status!='missing'),
                         (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id=se.id WHERE se.show_id=s.id AND e.status IN ('unplayed','playing'))
-                 FROM shows s WHERE {dt} LIKE ?1 ESCAPE '\\' ORDER BY {dt} COLLATE NOCASE", dt = display_title_sql());
+                 FROM shows s WHERE {dt} LIKE ?1 ESCAPE '\\' ORDER BY {order}",
+                order = sort.order_by(dt));
             let mut st = c.prepare(&sql)?;
             let rows = st.query_map(params![format!("%{}%", escape_like(filter))], |r| Ok(ShowCard {
                 id: r.get(0)?, display_title: r.get(1)?, cover_url: r.get(2)?, cover_path: r.get(3)?,
@@ -768,7 +770,7 @@ mod tests {
         assert_eq!(db.upsert_episode(&pn("Frieren", 2, 1), &rf("/a/s2e1.mkv", 10, 100)).unwrap(), Upsert::Added);
         // same path again → updated, not duplicated
         assert_eq!(db.upsert_episode(&pn("Frieren", 1, 1), &rf("/a/f1.mkv", 11, 101)).unwrap(), Upsert::Updated);
-        let shows = db.list_shows("").unwrap();
+        let shows = db.list_shows("", ShowSort::Title).unwrap();
         assert_eq!(shows.len(), 1);
         assert_eq!(shows[0].episode_count, 3);
         assert_eq!(shows[0].unwatched_count, 3);
@@ -782,7 +784,7 @@ mod tests {
     fn upsert_matches_renamed_file_by_size_and_mtime() {
         let db = Db::open_memory().unwrap();
         db.upsert_episode(&pn("Show", 1, 1), &rf("/a/old.mkv", 500, 999)).unwrap();
-        let id = db.list_shows("").unwrap()[0].id;
+        let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
         let ep_id = db.get_show(id).unwrap().seasons[0].episodes[0].id;
         db.set_status(ep_id, EpisodeStatus::Played).unwrap();
         assert_eq!(db.upsert_episode(&pn("Show", 1, 1), &rf("/a/new.mkv", 500, 999)).unwrap(), Upsert::Updated);
@@ -797,7 +799,7 @@ mod tests {
         db.upsert_episode(&pn("Show", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
         db.upsert_episode(&pn("Show", 1, 2), &rf("/a/2.mkv", 1, 1)).unwrap();
         assert_eq!(db.mark_missing_except(&["/a/1.mkv".to_string()]).unwrap(), 1);
-        let detail = db.get_show(db.list_shows("").unwrap()[0].id).unwrap();
+        let detail = db.get_show(db.list_shows("", ShowSort::Title).unwrap()[0].id).unwrap();
         assert_eq!(detail.seasons[0].episodes[1].status, EpisodeStatus::Missing);
         // a missing file that reappears is restored to unplayed
         db.upsert_episode(&pn("Show", 1, 2), &rf("/a/2.mkv", 1, 1)).unwrap();
@@ -811,18 +813,18 @@ mod tests {
         let db = Db::open_memory().unwrap();
         db.upsert_episode(&pn("Alpha", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
         db.upsert_episode(&pn("Beta", 1, 1), &rf("/b/1.mkv", 1, 1)).unwrap();
-        let alpha = db.list_shows("alp").unwrap();
+        let alpha = db.list_shows("alp", ShowSort::Title).unwrap();
         assert_eq!(alpha.len(), 1);
         let ep_id = db.get_show(alpha[0].id).unwrap().seasons[0].episodes[0].id;
         db.set_status(ep_id, EpisodeStatus::Played).unwrap();
-        assert_eq!(db.list_shows("alp").unwrap()[0].unwatched_count, 0);
+        assert_eq!(db.list_shows("alp", ShowSort::Title).unwrap()[0].unwatched_count, 0);
     }
 
     #[test]
     fn position_status_and_reset_playing() {
         let db = Db::open_memory().unwrap();
         db.upsert_episode(&pn("Show", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
-        let id = db.get_show(db.list_shows("").unwrap()[0].id).unwrap().seasons[0].episodes[0].id;
+        let id = db.get_show(db.list_shows("", ShowSort::Title).unwrap()[0].id).unwrap().seasons[0].episodes[0].id;
         db.set_status(id, EpisodeStatus::Playing).unwrap();
         db.set_position(id, 120.5, Some(1400.0)).unwrap();
         let ep = db.get_episode(id).unwrap();
@@ -875,7 +877,7 @@ mod tests {
     fn episode_show_and_season_lookup() {
         let db = Db::open_memory().unwrap();
         db.upsert_episode(&pn("Show", 3, 7), &rf("/a/1.mkv", 1, 1)).unwrap();
-        let id = db.get_show(db.list_shows("").unwrap()[0].id).unwrap().seasons[0].episodes[0].id;
+        let id = db.get_show(db.list_shows("", ShowSort::Title).unwrap()[0].id).unwrap().seasons[0].episodes[0].id;
         let (show, season) = db.episode_show_and_season(id).unwrap();
         assert_eq!(show.parsed_title, "Show");
         assert_eq!(season, 3);
@@ -898,7 +900,7 @@ mod tests {
         let s = run_scan(&db, &mut |_| {}).unwrap();
         assert_eq!(s.episodes_added, 2);
         assert!(s.errors.is_empty(), "{:?}", s.errors);
-        let shows = db.list_shows("").unwrap();
+        let shows = db.list_shows("", ShowSort::Title).unwrap();
         let titles: Vec<_> = shows.iter().map(|s| s.display_title.clone()).collect();
         assert_eq!(titles, vec!["Other", "Show"]);
         let other = db.get_show(shows[0].id).unwrap();
@@ -925,18 +927,18 @@ mod tests {
     fn reassign_moves_episode_and_prune_drops_empty_show() {
         let db = Db::open_memory().unwrap();
         db.upsert_episode(&pn("Wrong Title", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
-        let old_id = db.list_shows("").unwrap()[0].id;
+        let old_id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
         assert!(db.reassign_episode("/a/1.mkv", "Right Title", 0, 3).unwrap());
         assert!(!db.reassign_episode("/nope.mkv", "X", 1, 1).unwrap());
         db.prune_empty().unwrap();
-        let shows = db.list_shows("").unwrap();
+        let shows = db.list_shows("", ShowSort::Title).unwrap();
         assert_eq!(shows.len(), 1);
         assert_ne!(shows[0].id, old_id);
         assert_eq!(shows[0].display_title, "Right Title");
         assert_eq!(db.episode_paths_for_show(shows[0].id).unwrap(), vec!["/a/1.mkv"]);
         assert!(db.delete_episode_by_path("/a/1.mkv").unwrap());
         db.prune_empty().unwrap();
-        assert!(db.list_shows("").unwrap().is_empty());
+        assert!(db.list_shows("", ShowSort::Title).unwrap().is_empty());
     }
 
     #[test]
@@ -952,7 +954,7 @@ mod tests {
         db.add_root(live.to_str().unwrap()).unwrap();
         db.add_root(gone.to_str().unwrap()).unwrap();
         run_scan(&db, &mut |_| {}).unwrap();
-        let gone_show = db.list_shows("Gone").unwrap()[0].id;
+        let gone_show = db.list_shows("Gone", ShowSort::Title).unwrap()[0].id;
         let ep = db.get_show(gone_show).unwrap().seasons[0].episodes[0].id;
         db.set_status(ep, EpisodeStatus::Played).unwrap();
 
@@ -974,7 +976,7 @@ mod tests {
     fn watched_state_survives_a_missing_round_trip() {
         let db = Db::open_memory().unwrap();
         db.upsert_episode(&pn("Show", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
-        let ep = db.get_show(db.list_shows("").unwrap()[0].id).unwrap().seasons[0].episodes[0].id;
+        let ep = db.get_show(db.list_shows("", ShowSort::Title).unwrap()[0].id).unwrap().seasons[0].episodes[0].id;
         db.set_status(ep, EpisodeStatus::Played).unwrap();
         db.mark_missing_except(&[]).unwrap();
         assert_eq!(db.get_episode(ep).unwrap().status, EpisodeStatus::Missing);
@@ -994,12 +996,12 @@ mod tests {
         assert_eq!(db.upsert_episode(&p, &rf(orig.to_str().unwrap(), 500, 999)).unwrap(), Upsert::Added);
         assert_eq!(db.upsert_episode(&p, &rf(copy.to_str().unwrap(), 500, 999)).unwrap(), Upsert::Added,
             "a second file that still exists on disk gets its own row");
-        assert_eq!(db.get_show(db.list_shows("").unwrap()[0].id).unwrap().seasons[0].episodes.len(), 2);
+        assert_eq!(db.get_show(db.list_shows("", ShowSort::Title).unwrap()[0].id).unwrap().seasons[0].episodes.len(), 2);
 
         // A genuine rename (old path gone) still reuses the row and keeps the watched flag.
         let db2 = Db::open_memory().unwrap();
         db2.upsert_episode(&p, &rf("/nonexistent/old.mkv", 500, 999)).unwrap();
-        let ep = db2.get_show(db2.list_shows("").unwrap()[0].id).unwrap().seasons[0].episodes[0].id;
+        let ep = db2.get_show(db2.list_shows("", ShowSort::Title).unwrap()[0].id).unwrap().seasons[0].episodes[0].id;
         db2.set_status(ep, EpisodeStatus::Played).unwrap();
         assert_eq!(db2.upsert_episode(&p, &rf(orig.to_str().unwrap(), 500, 999)).unwrap(), Upsert::Updated);
         assert_eq!(db2.get_episode(ep).unwrap().path, orig.to_str().unwrap());
@@ -1010,14 +1012,66 @@ mod tests {
     fn title_override_wins_over_anilist_and_parsed_titles() {
         let db = Db::open_memory().unwrap();
         db.upsert_episode(&pn("Yagate Kimi ni Naru", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
-        let id = db.list_shows("").unwrap()[0].id;
+        let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
         db.set_anilist(id, &MetadataHit { id: 1, source: "anilist".into(), title_romaji: "Yagate Kimi ni Naru".into(), title_english: None, cover_url: None, episodes: None }).unwrap();
         db.set_title_override(id, Some("Bloom Into You")).unwrap();
         assert_eq!(db.display_title(id).unwrap(), "Bloom Into You");
-        assert_eq!(db.list_shows("Bloom").unwrap().len(), 1);
+        assert_eq!(db.list_shows("Bloom", ShowSort::Title).unwrap().len(), 1);
         assert_eq!(db.get_show(id).unwrap().user_title_override.as_deref(), Some("Bloom Into You"));
         db.set_title_override(id, Some("   ")).unwrap();
         assert_eq!(db.display_title(id).unwrap(), "Yagate Kimi ni Naru", "blank clears the override");
+    }
+
+    #[test]
+    fn every_sort_orders_by_what_it_claims() {
+        let db = Db::open_memory().unwrap();
+        // Three shows that disagree on every axis, so a wrong ORDER BY cannot pass by luck.
+        //  Zulu  : newest files, added last, one unwatched, never played
+        //  Alpha : oldest files, added first, three unwatched, played most recently
+        //  Mid   : middling files, no unwatched at all, played long ago
+        db.upsert_episode(&pn("Zulu", 1, 1), &rf("/z/1.mkv", 1, 9000)).unwrap();
+        for e in 1..=3 { db.upsert_episode(&pn("Alpha", 1, e), &rf(&format!("/a/{e}.mkv"), 1, 100)).unwrap(); }
+        db.upsert_episode(&pn("Mid", 1, 1), &rf("/m/1.mkv", 1, 5000)).unwrap();
+
+        let id = |t: &str| db.list_shows(t, ShowSort::Title).unwrap()[0].id;
+        let (alpha, mid) = (id("Alpha"), id("Mid"));
+        // Alpha was created first; make its ordering by created_at unambiguous.
+        db.with(|c| { c.execute("UPDATE shows SET created_at = CASE parsed_title WHEN 'Alpha' THEN 10 WHEN 'Mid' THEN 20 ELSE 30 END", [])?; Ok(()) }).unwrap();
+
+        let ep_of = |show: i64| db.get_show(show).unwrap().seasons[0].episodes[0].id;
+        db.set_status(ep_of(mid), EpisodeStatus::Played).unwrap();
+        db.with(|c| { c.execute("UPDATE episodes SET last_played_at = 500 WHERE id = ?1", params![ep_of(mid)])?; Ok(()) }).unwrap();
+        db.with(|c| { c.execute("UPDATE episodes SET last_played_at = 900 WHERE id = ?1", params![ep_of(alpha)])?; Ok(()) }).unwrap();
+
+        let titles = |s: ShowSort| db.list_shows("", s).unwrap().into_iter().map(|c| c.display_title).collect::<Vec<_>>();
+        assert_eq!(titles(ShowSort::Title), ["Alpha", "Mid", "Zulu"]);
+        assert_eq!(titles(ShowSort::Unwatched), ["Alpha", "Zulu", "Mid"], "most waiting first, none last");
+        assert_eq!(titles(ShowSort::LastPlayed), ["Alpha", "Mid", "Zulu"], "never-played sorts last, not first");
+        assert_eq!(titles(ShowSort::RecentlyAdded), ["Zulu", "Mid", "Alpha"]);
+        assert_eq!(titles(ShowSort::RecentlyUpdated), ["Zulu", "Mid", "Alpha"], "newest file on disk first");
+    }
+
+    #[test]
+    fn sorting_ties_fall_back_to_title() {
+        let db = Db::open_memory().unwrap();
+        for t in ["Charlie", "alpha", "Bravo"] {
+            db.upsert_episode(&pn(t, 1, 1), &rf(&format!("/{t}/1.mkv"), 1, 42)).unwrap();
+        }
+        // Identical on every sortable axis, so only the title fallback can order them.
+        for s in [ShowSort::Unwatched, ShowSort::LastPlayed, ShowSort::RecentlyUpdated] {
+            let titles: Vec<_> = db.list_shows("", s).unwrap().into_iter().map(|c| c.display_title).collect();
+            assert_eq!(titles, ["alpha", "Bravo", "Charlie"], "{s:?} must not reshuffle equal rows");
+        }
+    }
+
+    #[test]
+    fn sorting_still_respects_the_filter() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
+        db.upsert_episode(&pn("Beta", 1, 1), &rf("/b/1.mkv", 1, 1)).unwrap();
+        let rows = db.list_shows("alp", ShowSort::Unwatched).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].display_title, "Alpha");
     }
 
     #[test]
@@ -1025,17 +1079,17 @@ mod tests {
         let db = Db::open_memory().unwrap();
         db.upsert_episode(&pn("Steins_Gate", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
         db.upsert_episode(&pn("Frieren", 1, 1), &rf("/a/2.mkv", 1, 1)).unwrap();
-        assert_eq!(db.list_shows("_").unwrap().len(), 1, "a literal underscore must not match everything");
-        assert_eq!(db.list_shows("_").unwrap()[0].display_title, "Steins_Gate");
-        assert_eq!(db.list_shows("%").unwrap().len(), 0);
-        assert_eq!(db.list_shows("steins").unwrap().len(), 1, "ASCII case folding still works");
+        assert_eq!(db.list_shows("_", ShowSort::Title).unwrap().len(), 1, "a literal underscore must not match everything");
+        assert_eq!(db.list_shows("_", ShowSort::Title).unwrap()[0].display_title, "Steins_Gate");
+        assert_eq!(db.list_shows("%", ShowSort::Title).unwrap().len(), 0);
+        assert_eq!(db.list_shows("steins", ShowSort::Title).unwrap().len(), 1, "ASCII case folding still works");
     }
 
     #[test]
     fn cleared_anilist_match_is_not_re_applied() {
         let db = Db::open_memory().unwrap();
         db.upsert_episode(&pn("Show", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
-        let id = db.list_shows("").unwrap()[0].id;
+        let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
         let hit = MetadataHit { id: 42, source: "anilist".into(), title_romaji: "Wrong".into(), title_english: None, cover_url: None, episodes: None };
         db.set_anilist(id, &hit).unwrap();
         db.clear_anilist(id).unwrap();
@@ -1050,7 +1104,7 @@ mod tests {
     fn deleting_an_episode_keeps_its_rename_history() {
         let db = Db::open_memory().unwrap();
         db.upsert_episode(&pn("Show", 1, 1), &rf("/a/new.mkv", 1, 1)).unwrap();
-        let ep = db.get_show(db.list_shows("").unwrap()[0].id).unwrap().seasons[0].episodes[0].id;
+        let ep = db.get_show(db.list_shows("", ShowSort::Title).unwrap()[0].id).unwrap().seasons[0].episodes[0].id;
         db.log_rename("batch", ep, "/a/old.mkv", "/a/new.mkv").unwrap();
         db.delete_episode_by_path("/a/new.mkv").unwrap();
         let (_, rows) = db.latest_unreverted_batch().unwrap().expect("history survives the delete");

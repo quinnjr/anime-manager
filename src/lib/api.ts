@@ -17,6 +17,17 @@ export interface ShowDetail {
   cover_url: string | null; cover_path: string | null; total_episodes: number | null;
   user_title_override: string | null; seasons: SeasonDetail[];
 }
+export type ShowSort = 'title' | 'unwatched' | 'last-played' | 'recently-added' | 'recently-updated';
+
+/** Label for each ordering, phrased as what the reader gets rather than which column it uses. */
+export const SHOW_SORTS: { value: ShowSort; label: string }[] = [
+  { value: 'title', label: 'Title' },
+  { value: 'unwatched', label: 'Most unwatched' },
+  { value: 'last-played', label: 'Recently played' },
+  { value: 'recently-added', label: 'Recently added' },
+  { value: 'recently-updated', label: 'Newest files' }
+];
+
 export interface ShowCard { id: number; display_title: string; cover_url: string | null; cover_path: string | null; episode_count: number; unwatched_count: number }
 export interface ScanSummary { files_seen: number; episodes_added: number; episodes_updated: number; episodes_missing: number; errors: string[]; low_confidence_folders: string[] }
 export interface InspectChange { path: string; from: string; to: string }
@@ -41,7 +52,7 @@ export const api = {
   removeRoot: (id: number) => invoke<void>('remove_root', { id }),
   listRoots: () => invoke<Root[]>('list_roots'),
   scan: () => invoke<ScanSummary>('scan'),
-  listShows: (filter = '') => invoke<ShowCard[]>('list_shows', { filter }),
+  listShows: (filter = '', sort: ShowSort = 'title') => invoke<ShowCard[]>('list_shows', { filter, sort }),
   getShow: (id: number) => invoke<ShowDetail>('get_show', { id }),
   play: (episodeId: number) => invoke<void>('play', { episodeId }),
   setStatus: (episodeId: number, status: EpisodeStatus) => invoke<void>('set_status', { episodeId, status }),

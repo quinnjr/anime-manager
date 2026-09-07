@@ -186,7 +186,7 @@ mod tests {
         let p = ParsedName { title: "S".into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
         let f = RawFile { path: PathBuf::from("/tmp/fake.mkv"), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
         db.upsert_episode(&p, &f).unwrap();
-        let id = db.get_show(db.list_shows("").unwrap()[0].id).unwrap().seasons[0].episodes[0].id;
+        let id = db.get_show(db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].id).unwrap().seasons[0].episodes[0].id;
         (db, id)
     }
 
