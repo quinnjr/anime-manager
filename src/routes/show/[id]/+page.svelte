@@ -9,6 +9,7 @@
   import EpisodeRow from '$lib/components/EpisodeRow.svelte';
   import RematchModal from '$lib/components/RematchModal.svelte';
   import RenameModal from '$lib/components/RenameModal.svelte';
+  import Cover from '$lib/components/Cover.svelte';
 
   const id = $derived(Number(page.params.id));
   let show = $state<ShowDetail | null>(null);
@@ -100,7 +101,7 @@
 {#if show}
   <div class="mb-6 flex gap-6">
     <div class="h-56 w-40 shrink-0 overflow-hidden rounded bg-zinc-800">
-      {#if show.cover_url}<img src={show.cover_url} alt="" class="h-full w-full object-cover" />{/if}
+      <Cover {show} class="h-full w-full object-cover" />
     </div>
     <div class="flex-1">
       {#if editingTitle}
@@ -118,7 +119,7 @@
             onclick={() => { titleDraft = show!.user_title_override ?? show!.display_title; editingTitle = true; }}>rename</button>
         </h1>
       {/if}
-      <p class="text-sm text-zinc-400">{show.parsed_title}{show.total_episodes ? ` · ${show.total_episodes} episodes` : ''}{show.anilist_id ? ` · AniList #${show.anilist_id}` : ' · unmatched'}</p>
+      <p class="text-sm text-zinc-400">{show.parsed_title}{show.total_episodes ? ` · ${show.total_episodes} episodes` : ''}{show.match_source ? ` · ${show.match_source === 'kitsu' ? 'Kitsu' : 'AniList'} #${show.anilist_id}` : ' · unmatched'}</p>
       <div class="mt-3 flex gap-2">
         <button class="rounded bg-zinc-800 px-3 py-1 text-sm hover:bg-zinc-700" onclick={() => (rematchOpen = true)}>Re-match</button>
         <button class="rounded bg-zinc-800 px-3 py-1 text-sm hover:bg-zinc-700" onclick={() => openRename({ type: 'show', id: show!.id })}>Rename files</button>

@@ -20,12 +20,20 @@ pub fn now() -> i64 {
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS roots (
-  id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, added_at INTEGER NOT NULL);
+  id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, added_at INTEGER NOT NULL,
+  -- result of the most recent scan of this root; NULL until it has been scanned once
+  last_scan_at INTEGER, last_files_seen INTEGER, last_added INTEGER, last_updated INTEGER,
+  last_missing INTEGER, last_errors INTEGER, last_readable INTEGER);
 CREATE TABLE IF NOT EXISTS shows (
   id INTEGER PRIMARY KEY, parsed_title TEXT NOT NULL UNIQUE,
   anilist_id INTEGER, canonical_title TEXT, cover_url TEXT, total_episodes INTEGER,
   user_title_override TEXT, created_at INTEGER NOT NULL,
-  anilist_cleared INTEGER NOT NULL DEFAULT 0);
+  anilist_cleared INTEGER NOT NULL DEFAULT 0,
+  -- local copy of cover_url once downloaded, so art survives going offline
+  cover_path TEXT,
+  -- which provider supplied the match: 'anilist' or 'kitsu'. anilist_id holds that
+  -- provider's id, so it is only an AniList id when match_source = 'anilist'.
+  match_source TEXT);
 CREATE TABLE IF NOT EXISTS seasons (
   id INTEGER PRIMARY KEY, show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
   number INTEGER NOT NULL, UNIQUE(show_id, number));
@@ -51,7 +59,7 @@ CREATE INDEX IF NOT EXISTS idx_episodes_season ON episodes(season_id);
 CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status);
 "#;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Bring an existing database up to `SCHEMA_VERSION`. Fresh databases get the current shape
 /// from SCHEMA directly; older ones are altered in place so no user data is lost.
@@ -74,6 +82,19 @@ fn upgrade(conn: &Connection) -> Result<()> {
     }
     if !has("shows", "anilist_cleared")? {
         conn.execute_batch("ALTER TABLE shows ADD COLUMN anilist_cleared INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    if !has("shows", "match_source")? {
+        conn.execute_batch(
+            "ALTER TABLE shows ADD COLUMN match_source TEXT;
+             UPDATE shows SET match_source = 'anilist' WHERE anilist_id IS NOT NULL;")?;
+    }
+    if !has("shows", "cover_path")? {
+        conn.execute_batch("ALTER TABLE shows ADD COLUMN cover_path TEXT;")?;
+    }
+    for col in ["last_scan_at", "last_files_seen", "last_added", "last_updated", "last_missing", "last_errors", "last_readable"] {
+        if !has("roots", col)? {
+            conn.execute_batch(&format!("ALTER TABLE roots ADD COLUMN {col} INTEGER;"))?;
+        }
     }
     // rename_log's foreign key cannot be altered in place; rebuild the table when it still
     // carries the old NOT NULL / ON DELETE CASCADE definition.
@@ -125,6 +146,27 @@ fn escape_like(s: &str) -> String {
     out
 }
 
+const ROOT_COLS: &str = "id, path, added_at, last_scan_at, last_files_seen, last_added, last_updated, last_missing, last_errors, last_readable";
+
+fn row_to_root(r: &rusqlite::Row) -> rusqlite::Result<Root> {
+    // last_scan_at is NULL until the root has been scanned once; the rest travel with it.
+    let at: Option<i64> = r.get(3)?;
+    Ok(Root {
+        id: r.get(0)?,
+        path: r.get(1)?,
+        added_at: r.get(2)?,
+        last_scan: at.map(|at| RootScan {
+            at,
+            files_seen: r.get(4).unwrap_or(0),
+            added: r.get(5).unwrap_or(0),
+            updated: r.get(6).unwrap_or(0),
+            missing: r.get(7).unwrap_or(0),
+            errors: r.get(8).unwrap_or(0),
+            readable: r.get::<_, Option<i64>>(9).unwrap_or(Some(1)).unwrap_or(1) != 0,
+        }),
+    })
+}
+
 fn display_title_sql() -> &'static str { "COALESCE(user_title_override, canonical_title, parsed_title)" }
 
 impl Db {
@@ -151,8 +193,7 @@ impl Db {
     pub fn add_root(&self, path: &str) -> Result<Root> {
         self.with(|c| {
             c.execute("INSERT OR IGNORE INTO roots(path, added_at) VALUES (?1, ?2)", params![path, now()])?;
-            Ok(c.query_row("SELECT id, path, added_at FROM roots WHERE path = ?1", params![path],
-                |r| Ok(Root { id: r.get(0)?, path: r.get(1)?, added_at: r.get(2)? }))?)
+            Ok(c.query_row(&format!("SELECT {ROOT_COLS} FROM roots WHERE path = ?1"), params![path], row_to_root)?)
         })
     }
 
@@ -162,13 +203,24 @@ impl Db {
 
     pub fn list_roots(&self) -> Result<Vec<Root>> {
         self.with(|c| {
-            let mut st = c.prepare("SELECT id, path, added_at FROM roots ORDER BY id")?;
-            let rows = st.query_map([], |r| Ok(Root { id: r.get(0)?, path: r.get(1)?, added_at: r.get(2)? }))?;
+            let mut st = c.prepare(&format!("SELECT {ROOT_COLS} FROM roots ORDER BY id"))?;
+            let rows = st.query_map([], row_to_root)?;
             Ok(rows.collect::<std::result::Result<_, _>>()?)
         })
     }
 
     // ---- settings ----
+    /// Record what the latest scan of one root did, so Settings can report it later.
+    pub fn record_root_scan(&self, root_id: i64, s: &RootScan) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE roots SET last_scan_at=?2, last_files_seen=?3, last_added=?4, last_updated=?5,
+                 last_missing=?6, last_errors=?7, last_readable=?8 WHERE id=?1",
+                params![root_id, s.at, s.files_seen, s.added, s.updated, s.missing, s.errors, s.readable as i64])?;
+            Ok(())
+        })
+    }
+
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         self.with(|c| Ok(c.query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| r.get(0)).optional()?))
     }
@@ -232,8 +284,11 @@ impl Db {
 
     /// Flag as missing only the episodes under `roots` that this scan did not see. Roots whose
     /// scan failed are not passed in, so an unmounted share never marks a whole library missing.
-    pub fn mark_missing_within(&self, roots: &[String], seen: &[String]) -> Result<usize> {
-        if roots.is_empty() { return Ok(0); }
+    /// Returns one count per entry of `roots`, in the same order. Nested roots are allowed, so
+    /// the longest matching root claims a file: without that the outer root would absorb the
+    /// inner one's files and report their count as its own.
+    pub fn mark_missing_within(&self, roots: &[String], seen: &[String]) -> Result<Vec<usize>> {
+        if roots.is_empty() { return Ok(Vec::new()); }
         self.with(|c| {
             let tx = c.unchecked_transaction()?;
             tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS seen(path TEXT PRIMARY KEY); DELETE FROM seen;")?;
@@ -241,17 +296,21 @@ impl Db {
                 let mut ins = tx.prepare("INSERT OR IGNORE INTO seen(path) VALUES (?1)")?;
                 for p in seen { ins.execute(params![p])?; }
             }
-            let mut n = 0;
-            for root in roots {
-                let prefix = format!("{}/", root.trim_end_matches('/'));
-                n += tx.execute(
+            // Longest first, so a file under /lib/Anime/Movies is counted against that root
+            // rather than against /lib/Anime.
+            let mut order: Vec<usize> = (0..roots.len()).collect();
+            order.sort_by_key(|&i| std::cmp::Reverse(roots[i].trim_end_matches('/').len()));
+            let mut counts = vec![0usize; roots.len()];
+            for i in order {
+                let prefix = format!("{}/", roots[i].trim_end_matches('/'));
+                counts[i] = tx.execute(
                     "UPDATE episodes SET prev_status = status, status = 'missing'
                      WHERE status != 'missing' AND substr(path, 1, length(?1)) = ?1
                        AND path NOT IN (SELECT path FROM seen)",
                     params![prefix])?;
             }
             tx.commit()?;
-            Ok(n)
+            Ok(counts)
         })
     }
 
@@ -362,23 +421,25 @@ impl Db {
     pub fn list_shows(&self, filter: &str) -> Result<Vec<ShowCard>> {
         self.with(|c| {
             let sql = format!(
-                "SELECT s.id, {dt}, s.cover_url,
+                "SELECT s.id, {dt}, s.cover_url, s.cover_path,
                         (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id=se.id WHERE se.show_id=s.id AND e.status!='missing'),
                         (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id=se.id WHERE se.show_id=s.id AND e.status IN ('unplayed','playing'))
                  FROM shows s WHERE {dt} LIKE ?1 ESCAPE '\\' ORDER BY {dt} COLLATE NOCASE", dt = display_title_sql());
             let mut st = c.prepare(&sql)?;
             let rows = st.query_map(params![format!("%{}%", escape_like(filter))], |r| Ok(ShowCard {
-                id: r.get(0)?, display_title: r.get(1)?, cover_url: r.get(2)?, episode_count: r.get(3)?, unwatched_count: r.get(4)?,
+                id: r.get(0)?, display_title: r.get(1)?, cover_url: r.get(2)?, cover_path: r.get(3)?,
+                episode_count: r.get(4)?, unwatched_count: r.get(5)?,
             }))?;
             Ok(rows.collect::<std::result::Result<_, _>>()?)
         })
     }
 
     fn show_row(c: &Connection, id: i64) -> Result<ShowDetail> {
-        let sql = format!("SELECT id, parsed_title, {}, canonical_title, anilist_id, cover_url, total_episodes, user_title_override FROM shows WHERE id=?1", display_title_sql());
+        let sql = format!("SELECT id, parsed_title, {}, canonical_title, anilist_id, cover_url, total_episodes, user_title_override, cover_path, match_source FROM shows WHERE id=?1", display_title_sql());
         let mut show = c.query_row(&sql, params![id], |r| Ok(ShowDetail {
             id: r.get(0)?, parsed_title: r.get(1)?, display_title: r.get(2)?, canonical_title: r.get(3)?, anilist_id: r.get(4)?,
-            cover_url: r.get(5)?, total_episodes: r.get(6)?, user_title_override: r.get(7)?, seasons: vec![],
+            cover_url: r.get(5)?, total_episodes: r.get(6)?, user_title_override: r.get(7)?, cover_path: r.get(8)?,
+            match_source: r.get(9)?, seasons: vec![],
         }))?;
         let mut st = c.prepare("SELECT id, number FROM seasons WHERE show_id=?1 ORDER BY number")?;
         let seasons: Vec<(i64, u32)> = st.query_map(params![id], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u32)))?.collect::<std::result::Result<_, _>>()?;
@@ -426,11 +487,16 @@ impl Db {
         })
     }
 
-    pub fn set_anilist(&self, show_id: i64, hit: &AniListHit) -> Result<()> {
+    /// Apply a provider's match. One statement, because auto-match is gated on `match_source`:
+    /// a half-applied match (source set, id NULL) would otherwise be excluded from future scans
+    /// forever. `cover_path` is cleared because the new match's art is a different image, and
+    /// the file on disk is named after the show, not the URL.
+    pub fn set_anilist(&self, show_id: i64, hit: &MetadataHit) -> Result<()> {
         self.with(|c| {
-            c.execute("UPDATE shows SET anilist_cleared = 0 WHERE id = ?1", params![show_id])?;
-            c.execute("UPDATE shows SET anilist_id=?2, canonical_title=?3, cover_url=?4, total_episodes=?5 WHERE id=?1",
-                params![show_id, hit.id, hit.title_romaji, hit.cover_url, hit.episodes])?;
+            c.execute(
+                "UPDATE shows SET anilist_id=?2, match_source=?3, canonical_title=?4, cover_url=?5,
+                 total_episodes=?6, cover_path=NULL, anilist_cleared=0 WHERE id=?1",
+                params![show_id, hit.id, hit.source, hit.title_romaji, hit.cover_url, hit.episodes])?;
             Ok(())
         })
     }
@@ -438,7 +504,7 @@ impl Db {
     /// True once the user has explicitly cleared a match, so auto-match must not re-apply it.
     pub fn clear_anilist(&self, show_id: i64) -> Result<()> {
         self.with(|c| {
-            c.execute("UPDATE shows SET anilist_id=NULL, canonical_title=NULL, cover_url=NULL, total_episodes=NULL, anilist_cleared=1 WHERE id=?1", params![show_id])?;
+            c.execute("UPDATE shows SET anilist_id=NULL, canonical_title=NULL, cover_url=NULL, cover_path=NULL, total_episodes=NULL, anilist_cleared=1, match_source=NULL WHERE id=?1", params![show_id])?;
             Ok(())
         })
     }
@@ -447,7 +513,7 @@ impl Db {
     /// offered again, otherwise the next scan would silently re-apply the same wrong guess.
     pub fn shows_needing_match(&self) -> Result<Vec<(i64, String)>> {
         self.with(|c| {
-            let mut st = c.prepare("SELECT id, parsed_title FROM shows WHERE anilist_id IS NULL AND anilist_cleared = 0 ORDER BY id")?;
+            let mut st = c.prepare("SELECT id, parsed_title FROM shows WHERE match_source IS NULL AND anilist_cleared = 0 ORDER BY id")?;
             Ok(st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?)
         })
     }
@@ -459,6 +525,23 @@ impl Db {
         self.with(|c| {
             c.execute("UPDATE shows SET user_title_override = ?2 WHERE id = ?1", params![show_id, t])?;
             Ok(())
+        })
+    }
+
+    /// Record where a show's cover art was saved locally.
+    pub fn set_cover_path(&self, show_id: i64, path: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE shows SET cover_path = ?2 WHERE id = ?1", params![show_id, path])?;
+            Ok(())
+        })
+    }
+
+    /// Shows with cover art on AniList that has not been copied locally yet.
+    pub fn shows_needing_cover(&self) -> Result<Vec<(i64, String)>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT id, cover_url FROM shows WHERE cover_url IS NOT NULL AND cover_path IS NULL ORDER BY id")?;
+            Ok(st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?)
         })
     }
 
@@ -523,69 +606,113 @@ pub fn run_scan(db: &Db, on_progress: &mut dyn FnMut(ScanProgress)) -> Result<Sc
     use crate::parser::{self, ParsedName};
     use crate::scanner;
     use std::collections::BTreeSet;
+
+    /// One root's files plus what walking it cost, kept separate so each root's result can be
+    /// recorded against it rather than only rolled into the library-wide summary.
+    struct RootWork {
+        root: Root,
+        files: Vec<scanner::RawFile>,
+        readable: bool,
+        errors: i64,
+    }
+
     let mut summary = ScanSummary::default();
     let mut low_conf_folders = BTreeSet::new();
-    let mut all_files = Vec::new();
+    let mut work: Vec<RootWork> = Vec::new();
+
     // Only roots that were actually readable may drive missing-detection. An unmounted share
     // returns zero files plus an error, and marking its whole library missing would let the
     // Settings purge delete every watched flag, resume position and AniList match.
-    let mut trusted_roots: Vec<String> = Vec::new();
     for root in db.list_roots()? {
         let dir = Path::new(&root.path);
         let (files, errors) = scanner::scan_dir(dir);
         let unreadable = !dir.is_dir() || (files.is_empty() && !errors.is_empty());
+        let mut error_count = errors.len() as i64;
         summary.errors.extend(errors);
         if unreadable {
             summary.errors.push(format!("root is unreadable, its episodes were left untouched: {}", root.path));
-        } else {
-            trusted_roots.push(root.path.clone());
+            error_count += 1;
         }
-        all_files.extend(files);
+        work.push(RootWork { root, files, readable: !unreadable, errors: error_count });
     }
-    let total = all_files.len();
+
+    let total: usize = work.iter().map(|w| w.files.len()).sum();
     let mut seen_paths = Vec::with_capacity(total);
-    for (i, f) in all_files.iter().enumerate() {
-        summary.files_seen += 1;
-        on_progress(ScanProgress { done: i + 1, total, current_path: f.path.to_string_lossy().to_string() });
-        // A lossy path would be stored with U+FFFD and could never be opened, renamed or
-        // de-duplicated, so such files are reported rather than silently corrupted.
-        let path_str = match path_to_str(&f.path) {
-            Ok(p) => p,
-            Err(e) => { summary.errors.push(e.to_string()); continue; }
+    let mut done = 0usize;
+    let mut per_root: Vec<(i64, RootScan)> = Vec::new();
+
+    for w in &work {
+        let mut scan = RootScan {
+            at: now(),
+            files_seen: 0,
+            added: 0,
+            updated: 0,
+            missing: 0,
+            errors: w.errors,
+            readable: w.readable,
         };
-        let parsed = match db.get_override(&path_str)? {
-            Some(o) if o.kind == "ignore" => { seen_paths.push(path_str); continue; }
-            Some(o) => {
-                let base = parser::parse(&f.stem, &f.dirs);
-                ParsedName {
-                    title: o.title, season: o.season, episode: o.number,
-                    release_group: base.as_ref().and_then(|b| b.release_group.clone()),
-                    resolution: base.as_ref().and_then(|b| b.resolution.clone()),
-                    crc: base.and_then(|b| b.crc),
+        for f in &w.files {
+            done += 1;
+            summary.files_seen += 1;
+            scan.files_seen += 1;
+            on_progress(ScanProgress { done, total, current_path: f.path.to_string_lossy().to_string() });
+            // A lossy path would be stored with U+FFFD and could never be opened, renamed or
+            // de-duplicated, so such files are reported rather than silently corrupted.
+            let path_str = match path_to_str(&f.path) {
+                Ok(p) => p,
+                Err(e) => { summary.errors.push(e.to_string()); scan.errors += 1; continue; }
+            };
+            let parsed = match db.get_override(&path_str)? {
+                Some(o) if o.kind == "ignore" => { seen_paths.push(path_str); continue; }
+                Some(o) => {
+                    let base = parser::parse(&f.stem, &f.dirs);
+                    ParsedName {
+                        title: o.title, season: o.season, episode: o.number,
+                        release_group: base.as_ref().and_then(|b| b.release_group.clone()),
+                        resolution: base.as_ref().and_then(|b| b.resolution.clone()),
+                        crc: base.and_then(|b| b.crc),
+                    }
+                }
+                None => match parser::parse_with_confidence(&f.stem, &f.dirs) {
+                    Some(p) => {
+                        if p.low_confidence && let Some(parent) = f.path.parent() {
+                            low_conf_folders.insert(parent.to_string_lossy().to_string());
+                        }
+                        p.name
+                    }
+                    None => {
+                        summary.errors.push(format!("could not parse: {}", f.path.display()));
+                        scan.errors += 1;
+                        continue;
+                    }
+                },
+            };
+            seen_paths.push(path_str);
+            match db.upsert_episode(&parsed, f) {
+                Ok(Upsert::Added) => { summary.episodes_added += 1; scan.added += 1; }
+                Ok(Upsert::Updated) => { summary.episodes_updated += 1; scan.updated += 1; }
+                Err(e) => {
+                    summary.errors.push(format!("{}: {e}", f.path.display()));
+                    scan.errors += 1;
                 }
             }
-            None => match parser::parse_with_confidence(&f.stem, &f.dirs) {
-                Some(p) => {
-                    if p.low_confidence && let Some(parent) = f.path.parent() {
-                        low_conf_folders.insert(parent.to_string_lossy().to_string());
-                    }
-                    p.name
-                }
-                None => {
-                    summary.errors.push(format!("could not parse: {}", f.path.display()));
-                    continue;
-                }
-            },
-        };
-        seen_paths.push(path_str);
-        match db.upsert_episode(&parsed, f) {
-            Ok(Upsert::Added) => summary.episodes_added += 1,
-            Ok(Upsert::Updated) => summary.episodes_updated += 1,
-            Err(e) => summary.errors.push(format!("{}: {e}", f.path.display())),
         }
+        per_root.push((w.root.id, scan));
     }
-    summary.episodes_missing = db.mark_missing_within(&trusted_roots, &seen_paths)?;
+
+    // One pass for every readable root: a single transaction over a single `seen` table, with
+    // each root's own count returned. An unreadable root is simply not asked.
+    let trusted: Vec<usize> = work.iter().enumerate().filter(|(_, w)| w.readable).map(|(i, _)| i).collect();
+    let paths: Vec<String> = trusted.iter().map(|&i| work[i].root.path.clone()).collect();
+    let counts = db.mark_missing_within(&paths, &seen_paths)?;
+    for (slot, n) in trusted.iter().zip(counts) {
+        per_root[*slot].1.missing = n as i64;
+        summary.episodes_missing += n;
+    }
     db.prune_empty()?;
+    for (root_id, scan) in &per_root {
+        db.record_root_scan(*root_id, scan)?;
+    }
     summary.low_confidence_folders = low_conf_folders.into_iter().collect();
     Ok(summary)
 }
@@ -712,7 +839,7 @@ mod tests {
         db.upsert_episode(&pn("sousou no frieren", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
         let (id, title) = db.shows_needing_match().unwrap().remove(0);
         assert_eq!(title, "sousou no frieren");
-        let hit = AniListHit { id: 154587, title_romaji: "Sousou no Frieren".into(), title_english: Some("Frieren".into()), cover_url: Some("http://c".into()), episodes: Some(28) };
+        let hit = MetadataHit { id: 154587, source: "anilist".into(), title_romaji: "Sousou no Frieren".into(), title_english: Some("Frieren".into()), cover_url: Some("http://c".into()), episodes: Some(28) };
         db.set_anilist(id, &hit).unwrap();
         assert!(db.shows_needing_match().unwrap().is_empty());
         assert_eq!(db.display_title(id).unwrap(), "Sousou no Frieren");
@@ -884,7 +1011,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         db.upsert_episode(&pn("Yagate Kimi ni Naru", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
         let id = db.list_shows("").unwrap()[0].id;
-        db.set_anilist(id, &AniListHit { id: 1, title_romaji: "Yagate Kimi ni Naru".into(), title_english: None, cover_url: None, episodes: None }).unwrap();
+        db.set_anilist(id, &MetadataHit { id: 1, source: "anilist".into(), title_romaji: "Yagate Kimi ni Naru".into(), title_english: None, cover_url: None, episodes: None }).unwrap();
         db.set_title_override(id, Some("Bloom Into You")).unwrap();
         assert_eq!(db.display_title(id).unwrap(), "Bloom Into You");
         assert_eq!(db.list_shows("Bloom").unwrap().len(), 1);
@@ -909,7 +1036,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         db.upsert_episode(&pn("Show", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
         let id = db.list_shows("").unwrap()[0].id;
-        let hit = AniListHit { id: 42, title_romaji: "Wrong".into(), title_english: None, cover_url: None, episodes: None };
+        let hit = MetadataHit { id: 42, source: "anilist".into(), title_romaji: "Wrong".into(), title_english: None, cover_url: None, episodes: None };
         db.set_anilist(id, &hit).unwrap();
         db.clear_anilist(id).unwrap();
         assert!(db.shows_needing_match().unwrap().is_empty(), "the user's decision to clear must stick");
@@ -943,5 +1070,79 @@ mod tests {
         let s = run_scan(&db, &mut |_| {}).unwrap();
         assert_eq!(s.episodes_added, 1, "only the valid file is stored");
         assert!(s.errors.iter().any(|e| e.contains("not valid UTF-8")), "{:?}", s.errors);
+    }
+
+    #[test]
+    fn each_root_records_its_own_scan_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("Alpha - 01.mkv"), b"x").unwrap();
+        std::fs::write(a.join("Alpha - 02.mkv"), b"x").unwrap();
+        std::fs::write(b.join("Beta - 01.mkv"), b"x").unwrap();
+        let db = Db::open_memory().unwrap();
+        db.add_root(a.to_str().unwrap()).unwrap();
+        db.add_root(b.to_str().unwrap()).unwrap();
+        assert!(db.list_roots().unwrap().iter().all(|r| r.last_scan.is_none()), "never scanned yet");
+
+        run_scan(&db, &mut |_| {}).unwrap();
+        let roots = db.list_roots().unwrap();
+        let sa = roots[0].last_scan.clone().expect("root a scanned");
+        let sb = roots[1].last_scan.clone().expect("root b scanned");
+        assert_eq!((sa.files_seen, sa.added, sa.errors, sa.readable), (2, 2, 0, true));
+        assert_eq!((sb.files_seen, sb.added, sb.errors, sb.readable), (1, 1, 0, true));
+        assert!(sa.at > 0);
+
+        // A file removed from one root counts as missing against that root only.
+        std::fs::remove_file(a.join("Alpha - 02.mkv")).unwrap();
+        run_scan(&db, &mut |_| {}).unwrap();
+        let roots = db.list_roots().unwrap();
+        assert_eq!(roots[0].last_scan.as_ref().unwrap().missing, 1);
+        assert_eq!(roots[1].last_scan.as_ref().unwrap().missing, 0);
+        assert_eq!(roots[0].last_scan.as_ref().unwrap().files_seen, 1);
+    }
+
+    #[test]
+    fn a_nested_root_keeps_its_own_missing_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("Anime");
+        let inner = outer.join("Movies");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(outer.join("Show - 01.mkv"), b"x").unwrap();
+        std::fs::write(inner.join("Film - 01.mkv"), b"x").unwrap();
+        let db = Db::open_memory().unwrap();
+        db.add_root(outer.to_str().unwrap()).unwrap();
+        db.add_root(inner.to_str().unwrap()).unwrap();
+        run_scan(&db, &mut |_| {}).unwrap();
+
+        // Delete one file from each root; each root must report exactly its own.
+        std::fs::remove_file(outer.join("Show - 01.mkv")).unwrap();
+        std::fs::remove_file(inner.join("Film - 01.mkv")).unwrap();
+        let s = run_scan(&db, &mut |_| {}).unwrap();
+        let roots = db.list_roots().unwrap();
+        assert_eq!(roots[0].last_scan.as_ref().unwrap().missing, 1, "outer root counts only its own file");
+        assert_eq!(roots[1].last_scan.as_ref().unwrap().missing, 1, "nested root is not absorbed by its parent");
+        assert_eq!(s.episodes_missing, 2);
+    }
+
+    #[test]
+    fn an_unreadable_root_is_recorded_as_such() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("gone");
+        std::fs::create_dir_all(&gone).unwrap();
+        std::fs::write(gone.join("Show - 01.mkv"), b"x").unwrap();
+        let db = Db::open_memory().unwrap();
+        db.add_root(gone.to_str().unwrap()).unwrap();
+        run_scan(&db, &mut |_| {}).unwrap();
+        assert!(db.list_roots().unwrap()[0].last_scan.as_ref().unwrap().readable);
+
+        std::fs::remove_dir_all(&gone).unwrap();
+        run_scan(&db, &mut |_| {}).unwrap();
+        let s = db.list_roots().unwrap()[0].last_scan.clone().unwrap();
+        assert!(!s.readable, "an unmounted share must be recorded as unreadable");
+        assert_eq!(s.missing, 0, "and must not have marked anything missing");
+        assert!(s.errors > 0);
     }
 }

@@ -34,6 +34,22 @@ pub struct Root {
     pub id: i64,
     pub path: String,
     pub added_at: i64,
+    /// Result of the most recent scan of this root, or None if it has never been scanned.
+    pub last_scan: Option<RootScan>,
+}
+
+/// What the last scan of one root did, so Settings can show when a folder was last read and
+/// whether it was reachable, without rescanning it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RootScan {
+    pub at: i64,
+    pub files_seen: i64,
+    pub added: i64,
+    pub updated: i64,
+    pub missing: i64,
+    pub errors: i64,
+    /// False when the folder could not be read, in which case its episodes were left untouched.
+    pub readable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -67,7 +83,11 @@ pub struct ShowDetail {
     pub display_title: String,
     pub canonical_title: Option<String>,
     pub anilist_id: Option<i64>,
+    /// Which provider supplied the match, if any: "anilist" or "kitsu".
+    pub match_source: Option<String>,
     pub cover_url: Option<String>,
+    /// Local copy of the cover art, once downloaded. Preferred over `cover_url` for display.
+    pub cover_path: Option<String>,
     pub total_episodes: Option<i64>,
     pub user_title_override: Option<String>,
     pub seasons: Vec<SeasonDetail>,
@@ -78,6 +98,7 @@ pub struct ShowCard {
     pub id: i64,
     pub display_title: String,
     pub cover_url: Option<String>,
+    pub cover_path: Option<String>,
     pub episode_count: i64,
     pub unwatched_count: i64,
 }
@@ -122,12 +143,22 @@ pub struct PlaybackChanged {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AniListHit {
+pub struct MetadataHit {
     pub id: i64,
+    /// Which provider this came from: "anilist" or "kitsu".
+    pub source: String,
     pub title_romaji: String,
     pub title_english: Option<String>,
     pub cover_url: Option<String>,
     pub episodes: Option<i64>,
+}
+
+/// Cross-search result. `warnings` names providers that failed, so "nothing matched" and
+/// "a provider was down" can be told apart instead of both surfacing as an error.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SearchResult {
+    pub hits: Vec<MetadataHit>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

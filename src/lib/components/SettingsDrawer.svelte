@@ -1,10 +1,23 @@
 <script lang="ts">
-  import { api, type Root } from '$lib/api';
+  import { api, onEvent, type Root } from '$lib/api';
   import { toasts } from '$lib/stores/toasts.svelte';
   import { emit } from '@tauri-apps/api/event';
   import { onMount } from 'svelte';
 
   let { open = $bindable(false) } = $props();
+
+  /** "3 minutes ago" style, so a scan time reads at a glance. */
+  function ago(secs: number): string {
+    const d = Math.max(0, Math.floor(Date.now() / 1000) - secs);
+    if (d < 60) return 'just now';
+    for (const [n, unit, next] of [[60, 'minute', 3600], [3600, 'hour', 86400], [86400, 'day', Infinity]] as const) {
+      if (d < next) {
+        const v = Math.floor(d / n);
+        return `${v} ${unit}${v === 1 ? '' : 's'} ago`;
+      }
+    }
+    return 'a long time ago';
+  }
   let roots = $state<Root[]>([]);
   let mpvPath = $state('mpv');
   let threshold = $state('0.9');
@@ -17,11 +30,23 @@
 
   $effect(() => { if (open) load(); });
 
+  // A scan finishing while the drawer is open should refresh the per-root results.
+  onMount(() => {
+    const u = onEvent('library-changed', () => { if (open) loadRoots(); });
+    return () => { u.then((f) => f()); };
+  });
+
   onMount(() => {
     const esc = (e: KeyboardEvent) => { if (e.key === 'Escape' && open) { e.preventDefault(); open = false; } };
     window.addEventListener('keydown', esc);
     return () => window.removeEventListener('keydown', esc);
   });
+
+  /** Roots only. The library-changed listener uses this so a background scan can refresh the
+   * per-root results without overwriting settings the user is part-way through editing. */
+  async function loadRoots() {
+    try { roots = await api.listRoots(); } catch (e) { toasts.error(e); }
+  }
 
   async function load() {
     try {
@@ -86,9 +111,20 @@
       <h3 class="mb-2 text-sm font-medium text-zinc-300">Library folders</h3>
       <ul class="space-y-1 text-sm">
         {#each roots as r (r.id)}
-          <li class="flex items-center justify-between gap-2 rounded bg-zinc-950 px-2 py-1">
-            <span class="truncate">{r.path}</span>
-            <button class="text-xs text-red-400 hover:underline" onclick={() => removeRoot(r.id)}>remove</button>
+          <li class="rounded bg-zinc-950 px-2 py-1">
+            <div class="flex items-center justify-between gap-2">
+              <span class="truncate">{r.path}</span>
+              <button class="shrink-0 text-xs text-red-400 hover:underline" onclick={() => removeRoot(r.id)}>remove</button>
+            </div>
+            <div class="mt-0.5 text-[11px] text-zinc-500">
+              {#if !r.last_scan}
+                never scanned
+              {:else if !r.last_scan.readable}
+                <span class="text-amber-400">unreachable</span> when last checked {ago(r.last_scan.at)} — episodes left untouched
+              {:else}
+                {r.last_scan.files_seen} file{r.last_scan.files_seen === 1 ? '' : 's'} · +{r.last_scan.added} new · {r.last_scan.updated} updated{r.last_scan.missing ? ` · ${r.last_scan.missing} missing` : ''}{r.last_scan.errors ? ` · ${r.last_scan.errors} error${r.last_scan.errors === 1 ? '' : 's'}` : ''} · {ago(r.last_scan.at)}
+              {/if}
+            </div>
           </li>
         {/each}
       </ul>
