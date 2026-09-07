@@ -44,16 +44,33 @@
   });
 </script>
 
-<div class="mb-6 flex items-center justify-between gap-4">
+<div class="mb-7 flex flex-wrap items-center gap-x-4 gap-y-3">
+  <div>
+    <div class="eyebrow">shelf</div>
+    <h1 class="spine-wide mt-0.5 text-[1.6rem] leading-none text-paper">
+      {shows.length}<span class="ml-1.5 text-faint">{shows.length === 1 ? 'show' : 'shows'}</span>
+    </h1>
+  </div>
+  <span class="hidden h-8 w-px bg-edge sm:block"></span>
   <ScanBar onFinished={load} />
-  <input bind:this={search} bind:value={filter} oninput={onSearchInput} placeholder="Search  ( / )"
-    class="w-64 rounded bg-zinc-900 px-3 py-1 text-sm ring-1 ring-zinc-800 focus:ring-indigo-500 focus:outline-none" />
+  <span class="flex-1"></span>
+  <input
+    bind:this={search}
+    bind:value={filter}
+    oninput={onSearchInput}
+    placeholder="Filter titles   /"
+    aria-label="Filter titles"
+    class="field w-56"
+  />
 </div>
 
 {#if shows.length === 0}
-  <p class="text-zinc-500">No shows yet. Add a folder to begin.</p>
+  <div class="border border-dashed border-edge px-6 py-14 text-center">
+    <p class="spine text-lg text-paper">Nothing on the shelf yet</p>
+    <p class="mt-1.5 text-sm text-muted">Add the folder your anime lives in and it will be read and catalogued.</p>
+  </div>
 {:else}
-  <div class="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-4">
+  <div class="grid grid-cols-[repeat(auto-fill,minmax(142px,1fr))] gap-x-4 gap-y-6">
     {#each shows as show (show.id)}<ShowCard {show} />{/each}
   </div>
 {/if}

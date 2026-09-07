@@ -27,17 +27,21 @@
 </script>
 
 <div class="flex min-h-screen flex-col">
-  <header class="flex items-center justify-between border-b border-zinc-800 px-6 py-3">
-    <a href="/" class="text-lg font-semibold tracking-tight">Anime Manager</a>
+  <header class="sticky top-0 z-20 flex items-center gap-6 border-b border-edge bg-ink/95 px-6 py-3 backdrop-blur">
+    <a href="/" class="spine text-[1.3rem] tracking-tight text-paper">
+      Anime<span class="text-sub">·</span>Manager
+    </a>
+    <span class="eyebrow hidden sm:inline">local archive</span>
+    <span class="flex-1"></span>
     {#if assist.active}
-      <span class="flex items-center gap-2 text-xs text-zinc-400" title={assist.progress.folder}>
-        <span class="h-2 w-2 animate-pulse rounded-full bg-indigo-500"></span>
-        AI checking folders {assist.progress.done}/{assist.progress.total}
+      <span class="flex items-center gap-2" title={assist.progress.folder}>
+        <span class="h-1.5 w-1.5 animate-pulse rounded-full bg-live"></span>
+        <span class="tag">reading {assist.progress.done}/{assist.progress.total}</span>
       </span>
     {/if}
-    <button class="rounded px-3 py-1 text-sm text-zinc-300 hover:bg-zinc-800" onclick={() => (settingsOpen = true)}>Settings</button>
+    <button class="btn" onclick={() => (settingsOpen = true)}>Settings</button>
   </header>
-  <main class="flex-1 p-6">{@render children()}</main>
+  <main class="flex-1 px-6 py-7">{@render children()}</main>
 </div>
 <Toasts />
 <SettingsDrawer bind:open={settingsOpen} />

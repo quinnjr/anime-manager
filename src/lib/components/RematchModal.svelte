@@ -49,21 +49,21 @@
 </script>
 
 {#if open}
-  <div class="fixed inset-0 z-40 flex items-center justify-center bg-black/60" onclick={() => (open = false)} role="presentation">
-    <div class="w-[520px] rounded-lg bg-zinc-900 p-5 ring-1 ring-zinc-700" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-labelledby="rematch-title" tabindex="-1">
-      <h2 id="rematch-title" class="mb-3 text-lg font-semibold">Match this show</h2>
+  <div class="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm" onclick={() => (open = false)} role="presentation">
+    <div class="w-[520px] bg-board p-5 ring-1 ring-edge shadow-2xl shadow-black/60" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-labelledby="rematch-title" tabindex="-1">
+      <h2 id="rematch-title" class="spine-wide mb-3 text-lg">Match this show</h2>
       <form class="mb-3 flex gap-2" onsubmit={(e) => { e.preventDefault(); search(); }}>
-        <input bind:value={query} class="flex-1 rounded bg-zinc-800 px-3 py-1 text-sm" />
-        <button class="rounded bg-zinc-700 px-3 py-1 text-sm" disabled={busy}>Search</button>
+        <input bind:value={query} class="field flex-1" />
+        <button class="btn" disabled={busy}>Search</button>
       </form>
       <ul class="mb-3 max-h-72 space-y-1 overflow-y-auto">
         {#each hits as h (`${h.source}-${h.id}`)}
-          <li><button class="flex w-full items-center gap-3 rounded p-2 text-left hover:bg-zinc-800" onclick={() => pick(h.id, h.source)}>
+          <li><button class="flex w-full items-center gap-3 rounded p-2 text-left hover:bg-riser" onclick={() => pick(h.id, h.source)}>
             {#if h.cover_url}<img src={h.cover_url} alt="" class="h-14 w-10 rounded object-cover" />{/if}
             <span>
               <span class="block text-sm">{h.title_romaji}</span>
-              <span class="block text-xs text-zinc-400">
-                <span class="rounded bg-zinc-800 px-1 text-[10px] uppercase">{h.source}</span>
+              <span class="block text-xs text-muted">
+                <span class="rounded bg-riser px-1 text-[10px] uppercase">{h.source}</span>
                 {h.title_english ?? ''} · {h.episodes ?? '?'} eps · #{h.id}
               </span>
             </span>
@@ -71,14 +71,14 @@
         {/each}
       </ul>
       <form class="flex items-center gap-2" onsubmit={(e) => { e.preventDefault(); const n = Number(manualId); if (n > 0) pick(n, manualSource); }}>
-        <select bind:value={manualSource} aria-label="Metadata source" class="rounded bg-zinc-800 px-2 py-1 text-sm">
+        <select bind:value={manualSource} aria-label="Metadata source" class="field">
           <option value="anilist">AniList</option>
           <option value="kitsu">Kitsu</option>
         </select>
-        <input bind:value={manualId} placeholder="ID" class="w-28 rounded bg-zinc-800 px-3 py-1 text-sm" />
-        <button class="rounded bg-zinc-700 px-3 py-1 text-sm">Use ID</button>
+        <input bind:value={manualId} placeholder="ID" class="field w-24" />
+        <button class="btn">Use ID</button>
         <span class="flex-1"></span>
-        <button type="button" class="text-xs text-zinc-400 hover:underline" onclick={() => pick(null)}>Clear match</button>
+        <button type="button" class="tag hover:text-paper hover:underline" onclick={() => pick(null)}>Clear match</button>
       </form>
     </div>
   </div>

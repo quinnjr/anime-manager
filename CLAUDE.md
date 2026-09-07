@@ -89,6 +89,28 @@ build.
 `Cover.svelte` walks `coverSources()` on image error, local copy first and the remote URL second,
 so a scope or protocol mistake degrades to fetching from AniList rather than showing nothing.
 
+## Visual identity
+
+"Spine & Subtitle", in `src/app.css`. Two facts about this collection drive it: long romaji
+titles compress onto narrow spines, and the files are fansub releases whose group tags,
+resolutions and CRCs matter to whoever curated them.
+
+- **Type.** Archivo (variable, the width axis exploited for spine-condensed titles), Public Sans
+  for UI prose, IBM Plex Mono for anything the machine produced — paths, groups, resolutions,
+  counts. Self-hosted in `static/fonts` (148 KB): this app is offline-capable, so it must not
+  reach out to a font CDN.
+- **Colour carries state, never decoration.** The ground is a warm archival dark so cover art is
+  the only saturated thing on screen. Yellow (`--color-sub`) means unwatched or the action you
+  most likely want; teal (`--color-live`) means in flight; red (`--color-alarm`) means the file
+  is gone. A Play button is only yellow when its episode is unwatched — if the accent appears on
+  every row it stops meaning anything.
+- **The signature is `.subtitle-type`**: a show title set as a fansub subtitle, hard-outlined
+  over its own artwork. It appears once per screen, on the show page hero, and nowhere else.
+
+Use `.spine` for titles, `.tag`/`.tag-chip` for release metadata, `.eyebrow` for region labels,
+`.btn`/`.field` for controls. Numbered markers are deliberately absent: nothing on these screens
+is a sequence, so numbering would decorate rather than inform.
+
 ## Platform quirks
 
 `lib::apply_dmabuf_workaround` sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` when running under
