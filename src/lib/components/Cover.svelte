@@ -19,5 +19,12 @@
 </script>
 
 {#if attempt < sources.length}
-  <img src={sources[attempt]} alt="" class={klass} loading="lazy" onerror={() => (attempt += 1)} />
+  <img
+    src={sources[attempt]}
+    alt=""
+    class={klass}
+    loading="lazy"
+    referrerpolicy="no-referrer"
+    onerror={() => (attempt += 1)}
+  />
 {/if}

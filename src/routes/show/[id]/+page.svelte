@@ -99,45 +99,67 @@
 </script>
 
 {#if show}
-  <div class="mb-6 flex gap-6">
-    <div class="h-56 w-40 shrink-0 overflow-hidden rounded bg-zinc-800">
-      <Cover {show} class="h-full w-full object-cover" />
+  <!-- The signature: cover art bled wide with the title set as a fansub subtitle
+       riding its lower third, the way a line sits on a frame. One per screen. -->
+  <section class="relative -mx-6 -mt-7 mb-7 overflow-hidden border-b border-edge">
+    <div class="absolute inset-0">
+      <Cover {show} class="h-full w-full object-cover object-center opacity-45 blur-[2px]" />
+      <div class="absolute inset-0 bg-gradient-to-t from-ink via-ink/85 to-ink/45"></div>
     </div>
-    <div class="flex-1">
-      {#if editingTitle}
-        <form class="flex gap-2" onsubmit={(e) => { e.preventDefault(); saveTitle(); }}>
-          <input bind:value={titleDraft} aria-label="Display title"
-            class="flex-1 rounded bg-zinc-800 px-2 py-1 text-xl" />
-          <button class="rounded bg-indigo-600 px-3 py-1 text-sm">Save</button>
-          <button type="button" class="rounded bg-zinc-800 px-3 py-1 text-sm" onclick={() => (editingTitle = false)}>Cancel</button>
-        </form>
-      {:else}
-        <h1 class="text-2xl font-semibold">
-          {show.display_title}
-          <button class="ml-2 align-middle text-xs font-normal text-zinc-500 hover:underline"
-            title="Use your own title for this show"
-            onclick={() => { titleDraft = show!.user_title_override ?? show!.display_title; editingTitle = true; }}>rename</button>
-        </h1>
-      {/if}
-      <p class="text-sm text-zinc-400">{show.parsed_title}{show.total_episodes ? ` · ${show.total_episodes} episodes` : ''}{show.match_source ? ` · ${show.match_source === 'kitsu' ? 'Kitsu' : 'AniList'} #${show.anilist_id}` : ' · unmatched'}</p>
-      <div class="mt-3 flex gap-2">
-        <button class="rounded bg-zinc-800 px-3 py-1 text-sm hover:bg-zinc-700" onclick={() => (rematchOpen = true)}>Re-match</button>
-        <button class="rounded bg-zinc-800 px-3 py-1 text-sm hover:bg-zinc-700" onclick={() => openRename({ type: 'show', id: show!.id })}>Rename files</button>
-        <button class="rounded bg-zinc-800 px-3 py-1 text-sm hover:bg-zinc-700 disabled:opacity-50" disabled={inspecting} title="Ask the configured LLM to check this show's folders" onclick={inspect}>{inspecting ? 'Inspecting…' : 'Inspect with AI'}</button>
+
+    <div class="relative flex flex-col gap-6 px-6 pt-8 pb-6 sm:flex-row sm:items-end">
+      <div class="w-32 shrink-0 overflow-hidden bg-board shadow-2xl shadow-black/60 ring-1 ring-edge sm:w-44">
+        <div class="aspect-[2/3]"><Cover {show} class="h-full w-full object-cover" /></div>
+      </div>
+
+      <div class="min-w-0 flex-1">
+        <div class="eyebrow mb-2">
+          {show.match_source ? `${show.match_source === 'kitsu' ? 'Kitsu' : 'AniList'} #${show.anilist_id}` : 'unmatched'}
+          {show.total_episodes ? ` · ${show.total_episodes} listed` : ''}
+        </div>
+
+        {#if editingTitle}
+          <form class="flex max-w-xl gap-2" onsubmit={(e) => { e.preventDefault(); saveTitle(); }}>
+            <input bind:value={titleDraft} aria-label="Display title" class="field spine flex-1 text-xl" />
+            <button class="btn btn-key">Save</button>
+            <button type="button" class="btn" onclick={() => (editingTitle = false)}>Cancel</button>
+          </form>
+        {:else}
+          <h1 class="subtitle-type text-[clamp(1.9rem,5.2vw,3.4rem)] leading-[1.03] text-balance">
+            {show.display_title}
+          </h1>
+        {/if}
+
+        <p class="tag mt-2.5 truncate">{show.parsed_title}</p>
+
+        <div class="mt-4 flex flex-wrap gap-2">
+          <button class="btn" onclick={() => (rematchOpen = true)}>Re-match</button>
+          <button class="btn" onclick={() => openRename({ type: 'show', id: show!.id })}>Rename files</button>
+          <button class="btn" disabled={inspecting} title="Ask the configured model to check this show's folders" onclick={inspect}>
+            {inspecting ? 'Inspecting' : 'Inspect with AI'}
+          </button>
+          <button class="btn" title="Use your own title for this show"
+            onclick={() => { titleDraft = show!.user_title_override ?? show!.display_title; editingTitle = true; }}>Retitle</button>
+        </div>
       </div>
     </div>
-  </div>
+  </section>
 
-  <div class="mb-3 flex gap-1 border-b border-zinc-800">
+  <div class="mb-4 flex flex-wrap items-center gap-x-5 gap-y-1 border-b border-edge">
     {#each show.seasons as s, i (s.id)}
-      <button class="px-3 py-2 text-sm {i === seasonIdx ? 'border-b-2 border-indigo-500 text-white' : 'text-zinc-400'}" onclick={() => { seasonIdx = i; highlight = 0; }}>
+      <button
+        class="-mb-px border-b-2 pb-2 text-[0.8125rem] font-semibold transition
+               {i === seasonIdx ? 'border-sub text-paper' : 'border-transparent text-muted hover:text-paper'}"
+        onclick={() => { seasonIdx = i; highlight = 0; }}
+      >
         {s.number === 0 ? 'Specials' : `Season ${s.number}`}
+        <span class="tag ml-1.5 tabular-nums">{s.episodes.length}</span>
       </button>
     {/each}
   </div>
 
   {#if season}
-    <div class="divide-y divide-zinc-900">
+    <div class="border border-edge">
       {#each season.episodes as ep, i (ep.id)}
         <EpisodeRow episode={ep} highlighted={i === highlight} onRename={() => openRename({ type: 'episode', id: ep.id })} />
       {/each}
@@ -147,5 +169,5 @@
   <RematchModal showId={show.id} initialQuery={show.parsed_title} bind:open={rematchOpen} onDone={load} />
   <RenameModal target={renameTarget} bind:open={renameOpen} onDone={load} />
 {:else}
-  <p class="text-zinc-500">Loading…</p>
+  <p class="tag">Reading show…</p>
 {/if}
