@@ -24,3 +24,7 @@ process-global environment variables.
     pnpm tauri build
 
 Data lives in `~/.local/share/anime-manager/db.sqlite`. Files on disk are only changed by the explicit Rename feature, which is undoable.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

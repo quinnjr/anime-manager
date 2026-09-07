@@ -1,6 +1,8 @@
 {
   "name": "anime-manager",
   "version": "0.1.0",
+  "license": "MIT",
+  "author": "Joseph R. Quinn <quinn.josephr@gmail.com>",
   "private": true,
   "type": "module",
   "scripts": {
