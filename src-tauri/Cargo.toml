@@ -1,8 +1,8 @@
 [package]
 name = "anime-manager"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Scan an anime collection, play episodes in mpv and track what you have watched"
+authors = ["Joseph R. Quinn <quinn.josephr@gmail.com>"]
 license = ""
 repository = ""
 edition = "2024"

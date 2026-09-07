@@ -1,0 +1,51 @@
+# Maintainer: Joseph R. Quinn <quinn.josephr@gmail.com>
+
+pkgname=anime-manager
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Scan an anime collection, play episodes in mpv and track what you have watched'
+arch=('x86_64')
+# No upstream remote yet; built from the local clone (see _repo below).
+license=('custom:unlicensed')
+# Runtime libraries the binary actually links (readelf -d), plus mpv, which the player shells out to.
+# SQLite is statically linked (rusqlite "bundled") and TLS is rustls, so neither is a dependency.
+depends=('webkit2gtk-4.1' 'gtk3' 'glib2' 'cairo' 'gdk-pixbuf2' 'libsoup3' 'dbus' 'gcc-libs' 'glibc' 'mpv')
+makedepends=('git' 'rust' 'nodejs' 'pnpm' 'pkgconf')
+options=('!lto')
+
+# This project has no remote yet, so the package is built from the local clone.
+# Point ANIME_MANAGER_REPO at another checkout, or replace this with the upstream URL.
+_repo="${ANIME_MANAGER_REPO:-/home/joseph/Projects/anime-manager}"
+_branch="${ANIME_MANAGER_BRANCH:-worktree-design-spec}"
+
+source=("$pkgname::git+file://$_repo#branch=$_branch"
+        'anime-manager.desktop')
+sha256sums=('SKIP'
+            'SKIP')
+
+build() {
+  cd "$srcdir/$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  pnpm install --frozen-lockfile
+  # --no-bundle: this PKGBUILD installs the files itself, and the AppImage target needs
+  # linuxdeploy, which is not a dependency worth carrying for an Arch package.
+  pnpm tauri build --no-bundle
+}
+
+check() {
+  cd "$srcdir/$pkgname"
+  export RUSTUP_TOOLCHAIN=stable
+  # The player tests drive a fake mpv through process-global environment variables.
+  cargo test --manifest-path src-tauri/Cargo.toml --release -- --test-threads=1
+  pnpm test
+}
+
+package() {
+  cd "$srcdir/$pkgname"
+  install -Dm755 src-tauri/target/release/anime-manager "$pkgdir/usr/bin/anime-manager"
+  install -Dm644 "$srcdir/anime-manager.desktop" "$pkgdir/usr/share/applications/anime-manager.desktop"
+  install -Dm644 src-tauri/icons/32x32.png "$pkgdir/usr/share/icons/hicolor/32x32/apps/anime-manager.png"
+  install -Dm644 src-tauri/icons/128x128.png "$pkgdir/usr/share/icons/hicolor/128x128/apps/anime-manager.png"
+  install -Dm644 'src-tauri/icons/128x128@2x.png' "$pkgdir/usr/share/icons/hicolor/256x256/apps/anime-manager.png"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

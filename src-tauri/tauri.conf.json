@@ -35,6 +35,9 @@
     ],
     "android": {
       "debugApplicationIdSuffix": ".debug"
-    }
+    },
+    "category": "Video",
+    "shortDescription": "Anime library manager",
+    "longDescription": "Scan folders of anime, group them by show and season, play in mpv, and track what you have watched."
   }
 }
