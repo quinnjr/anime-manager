@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Anime Manager
+GenericName=Anime Library
+Comment=Scan an anime collection, play episodes in mpv and track what you have watched
+Exec=anime-manager
+Icon=anime-manager
+Terminal=false
+Categories=AudioVideo;Video;Player;
+Keywords=anime;video;library;mpv;anilist;
+StartupWMClass=anime-manager
