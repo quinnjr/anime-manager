@@ -1,0 +1,38 @@
+[package]
+name = "anime-manager"
+version = "0.1.0"
+description = "Scan an anime collection, play episodes in mpv and track what you have watched"
+authors = ["Joseph R. Quinn <quinn.josephr@gmail.com>"]
+license = "MIT"
+repository = ""
+edition = "2024"
+# let-chains are used throughout (commands.rs, db.rs, parser.rs)
+rust-version = "1.88"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "anime_manager_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+walkdir = "2"
+regex = "1"
+once_cell = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["process", "net", "io-util", "time", "sync", "macros"] }
+thiserror = "2"
+dirs = "6"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"
