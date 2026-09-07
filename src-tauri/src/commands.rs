@@ -62,31 +62,49 @@ pub async fn scan(app: AppHandle, state: State<'_, AppState>) -> Result<ScanSumm
             });
         }
     }
-    let db2 = state.db.clone();
-    let api = state.providers.clone();
-    let app3 = app.clone();
-    let matching = state.matching.clone();
-    let app3b = app.clone();
-    tauri::async_runtime::spawn(async move {
-        // One matching pass at a time: a second Rescan while this is running would otherwise
-        // duplicate the whole loop and double every provider request.
-        let Some(_guard) = matching.try_start() else { return };
-        let app4 = app3.clone();
-        metadata::auto_match_all(db2.clone(), api.clone(), move |id| {
-            let _ = app3.emit("show-updated", id);
-        })
-        .await;
-        // Cover art is otherwise refetched from AniList's CDN on every render, so the library
-        // is blank offline. Do this after matching, when the URLs are known.
-        anilist::download_missing_covers(db2, api.anilist.client().clone(), move |id| {
-            let _ = app4.emit("show-updated", id);
-        })
-        .await;
-        // Let an open Settings drawer pick up the new per-root scan results.
-        let _ = app3b.emit("library-changed", ());
-    });
+    spawn_match_pass(&app, &state);
     Ok(summary)
 }
+
+/// Resolve every unmatched show and fetch any missing cover art, in the background.
+/// Guarded so repeated calls cannot stack a second pass over the same shows.
+fn spawn_match_pass(app: &AppHandle, state: &State<'_, AppState>) {
+    let db = state.db.clone();
+    let providers = state.providers.clone();
+    let matching = state.matching.clone();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(_guard) = matching.try_start() else { return };
+        let a = app.clone();
+        metadata::auto_match_all(db.clone(), providers.clone(), move |p| {
+            if let Some(id) = p.changed { let _ = a.emit("show-updated", id); }
+            let _ = a.emit("match-progress", &p);
+        })
+        .await;
+        let a = app.clone();
+        // Cover art comes second: the URLs only exist once a match has been applied.
+        anilist::download_missing_covers(db, providers.anilist.client().clone(), move |p| {
+            if let Some(id) = p.changed { let _ = a.emit("show-updated", id); }
+            let _ = a.emit("match-progress", &p);
+        })
+        .await;
+        let _ = app.emit("match-progress", MatchProgress::default());
+        let _ = app.emit("library-changed", ());
+    });
+}
+
+/// Run matching and artwork without re-walking the library. Recovering from a provider outage
+/// otherwise meant a full rescan of every file, which is slow over a network share and has
+/// nothing to do with matching. Returns how many shows are pending.
+#[tauri::command]
+pub fn match_library(app: AppHandle, state: State<'_, AppState>) -> Result<usize> {
+    let pending = state.db.shows_needing_match()?.len() + state.db.shows_needing_cover()?.len();
+    spawn_match_pass(&app, &state);
+    Ok(pending)
+}
+
+#[tauri::command]
+pub fn match_progress(state: State<'_, AppState>) -> Result<bool> { Ok(state.matching.is_running()) }
 
 #[tauri::command]
 pub fn list_shows(state: State<'_, AppState>, filter: Option<String>) -> Result<Vec<ShowCard>> {

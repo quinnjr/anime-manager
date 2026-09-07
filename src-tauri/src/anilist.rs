@@ -200,23 +200,38 @@ pub async fn download_cover_into(
 
 /// Fetch any cover art that is known but not yet on disk. Failures are logged and skipped:
 /// the remote URL still works while online.
-pub async fn download_missing_covers(db: Arc<Db>, client: reqwest::Client, notify: impl Fn(i64) + Send + 'static) {
+pub async fn download_missing_covers(
+    db: Arc<Db>,
+    client: reqwest::Client,
+    on_progress: impl Fn(crate::models::MatchProgress) + Send + 'static,
+) -> usize {
     let pending = match db.shows_needing_cover() {
         Ok(p) => p,
-        Err(_) => return,
+        Err(_) => return 0,
     };
+    let total = pending.len();
+    let mut fetched = 0;
     let mut first = true;
-    for (show_id, url) in pending {
+    for (i, (show_id, url)) in pending.into_iter().enumerate() {
         if !first {
             // Same courtesy pacing as matching; these are someone else's CDN.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
         first = false;
-        match download_cover(&db, &client, show_id, &url).await {
-            Ok(_) => notify(show_id),
-            Err(e) => eprintln!("cover {show_id}: {e}"),
-        }
+        let changed = match download_cover(&db, &client, show_id, &url).await {
+            Ok(_) => { fetched += 1; Some(show_id) }
+            Err(e) => { eprintln!("cover {show_id}: {e}"); None }
+        };
+        on_progress(crate::models::MatchProgress {
+            done: i + 1,
+            total,
+            title: db.display_title(show_id).unwrap_or_default(),
+            phase: "artwork".into(),
+            changed,
+            running: true,
+        });
     }
+    fetched
 }
 
 #[cfg(test)]

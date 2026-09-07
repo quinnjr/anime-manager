@@ -76,6 +76,15 @@ so it is only an AniList id when `match_source = 'anilist'`. Auto-match is gated
 every scan. Ranking is the shared similarity threshold, so a strong Kitsu hit beats a weak
 AniList one rather than losing on provider order.
 
+## Matching is separate from scanning
+
+`commands::match_library` runs the match-and-artwork pass on its own (`spawn_match_pass`, shared
+with `scan`). Matching used to ride along with a scan only, so recovering from a provider outage
+meant re-walking every file — slow over a network share and unrelated to matching. Cover art has
+no URL until a match is applied, so an unmatched library has nothing to download: "covers are
+missing" almost always means "nothing is matched". Both phases report `match-progress`
+`{done, total, title, phase, changed, running}`; `changed` names the one show to refresh.
+
 ## Cover art
 
 AniList cover URLs are downloaded to `$XDG_DATA_HOME/anime-manager/covers/<show id>.<ext>`
