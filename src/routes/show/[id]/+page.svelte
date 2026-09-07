@@ -9,6 +9,7 @@
   import EpisodeRow from '$lib/components/EpisodeRow.svelte';
   import RematchModal from '$lib/components/RematchModal.svelte';
   import RenameModal from '$lib/components/RenameModal.svelte';
+  import Cover from '$lib/components/Cover.svelte';
 
   const id = $derived(Number(page.params.id));
   let show = $state<ShowDetail | null>(null);
@@ -100,7 +101,7 @@
 {#if show}
   <div class="mb-6 flex gap-6">
     <div class="h-56 w-40 shrink-0 overflow-hidden rounded bg-zinc-800">
-      {#if show.cover_url}<img src={show.cover_url} alt="" class="h-full w-full object-cover" />{/if}
+      <Cover {show} class="h-full w-full object-cover" />
     </div>
     <div class="flex-1">
       {#if editingTitle}

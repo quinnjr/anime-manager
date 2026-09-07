@@ -63,8 +63,15 @@ pub async fn scan(app: AppHandle, state: State<'_, AppState>) -> Result<ScanSumm
     let api = state.anilist.clone();
     let app3 = app.clone();
     tauri::async_runtime::spawn(async move {
-        anilist::auto_match_all(db2, api, move |id| {
+        let app4 = app3.clone();
+        anilist::auto_match_all(db2.clone(), api.clone(), move |id| {
             let _ = app3.emit("show-updated", id);
+        })
+        .await;
+        // Cover art is otherwise refetched from AniList's CDN on every render, so the library
+        // is blank offline. Do this after matching, when the URLs are known.
+        anilist::download_missing_covers(db2, api, move |id| {
+            let _ = app4.emit("show-updated", id);
         })
         .await;
     });
@@ -142,6 +149,11 @@ pub async fn rematch(app: AppHandle, state: State<'_, AppState>, show_id: i64, a
                 .await?
                 .ok_or_else(|| crate::error::AppError::Network(format!("no AniList entry {id}")))?;
             state.db.set_anilist(show_id, &hit)?;
+            if let Some(url) = &hit.cover_url
+                && let Err(e) = anilist::download_cover(&state.db, state.anilist.client(), show_id, url).await
+            {
+                eprintln!("cover {show_id}: {e}");
+            }
         }
         None => state.db.clear_anilist(show_id)?,
     }

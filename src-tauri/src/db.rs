@@ -28,7 +28,9 @@ CREATE TABLE IF NOT EXISTS shows (
   id INTEGER PRIMARY KEY, parsed_title TEXT NOT NULL UNIQUE,
   anilist_id INTEGER, canonical_title TEXT, cover_url TEXT, total_episodes INTEGER,
   user_title_override TEXT, created_at INTEGER NOT NULL,
-  anilist_cleared INTEGER NOT NULL DEFAULT 0);
+  anilist_cleared INTEGER NOT NULL DEFAULT 0,
+  -- local copy of cover_url once downloaded, so art survives going offline
+  cover_path TEXT);
 CREATE TABLE IF NOT EXISTS seasons (
   id INTEGER PRIMARY KEY, show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
   number INTEGER NOT NULL, UNIQUE(show_id, number));
@@ -54,7 +56,7 @@ CREATE INDEX IF NOT EXISTS idx_episodes_season ON episodes(season_id);
 CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status);
 "#;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Bring an existing database up to `SCHEMA_VERSION`. Fresh databases get the current shape
 /// from SCHEMA directly; older ones are altered in place so no user data is lost.
@@ -77,6 +79,9 @@ fn upgrade(conn: &Connection) -> Result<()> {
     }
     if !has("shows", "anilist_cleared")? {
         conn.execute_batch("ALTER TABLE shows ADD COLUMN anilist_cleared INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    if !has("shows", "cover_path")? {
+        conn.execute_batch("ALTER TABLE shows ADD COLUMN cover_path TEXT;")?;
     }
     for col in ["last_scan_at", "last_files_seen", "last_added", "last_updated", "last_missing", "last_errors", "last_readable"] {
         if !has("roots", col)? {
@@ -401,23 +406,24 @@ impl Db {
     pub fn list_shows(&self, filter: &str) -> Result<Vec<ShowCard>> {
         self.with(|c| {
             let sql = format!(
-                "SELECT s.id, {dt}, s.cover_url,
+                "SELECT s.id, {dt}, s.cover_url, s.cover_path,
                         (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id=se.id WHERE se.show_id=s.id AND e.status!='missing'),
                         (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id=se.id WHERE se.show_id=s.id AND e.status IN ('unplayed','playing'))
                  FROM shows s WHERE {dt} LIKE ?1 ESCAPE '\\' ORDER BY {dt} COLLATE NOCASE", dt = display_title_sql());
             let mut st = c.prepare(&sql)?;
             let rows = st.query_map(params![format!("%{}%", escape_like(filter))], |r| Ok(ShowCard {
-                id: r.get(0)?, display_title: r.get(1)?, cover_url: r.get(2)?, episode_count: r.get(3)?, unwatched_count: r.get(4)?,
+                id: r.get(0)?, display_title: r.get(1)?, cover_url: r.get(2)?, cover_path: r.get(3)?,
+                episode_count: r.get(4)?, unwatched_count: r.get(5)?,
             }))?;
             Ok(rows.collect::<std::result::Result<_, _>>()?)
         })
     }
 
     fn show_row(c: &Connection, id: i64) -> Result<ShowDetail> {
-        let sql = format!("SELECT id, parsed_title, {}, canonical_title, anilist_id, cover_url, total_episodes, user_title_override FROM shows WHERE id=?1", display_title_sql());
+        let sql = format!("SELECT id, parsed_title, {}, canonical_title, anilist_id, cover_url, total_episodes, user_title_override, cover_path FROM shows WHERE id=?1", display_title_sql());
         let mut show = c.query_row(&sql, params![id], |r| Ok(ShowDetail {
             id: r.get(0)?, parsed_title: r.get(1)?, display_title: r.get(2)?, canonical_title: r.get(3)?, anilist_id: r.get(4)?,
-            cover_url: r.get(5)?, total_episodes: r.get(6)?, user_title_override: r.get(7)?, seasons: vec![],
+            cover_url: r.get(5)?, total_episodes: r.get(6)?, user_title_override: r.get(7)?, cover_path: r.get(8)?, seasons: vec![],
         }))?;
         let mut st = c.prepare("SELECT id, number FROM seasons WHERE show_id=?1 ORDER BY number")?;
         let seasons: Vec<(i64, u32)> = st.query_map(params![id], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u32)))?.collect::<std::result::Result<_, _>>()?;
@@ -477,7 +483,7 @@ impl Db {
     /// True once the user has explicitly cleared a match, so auto-match must not re-apply it.
     pub fn clear_anilist(&self, show_id: i64) -> Result<()> {
         self.with(|c| {
-            c.execute("UPDATE shows SET anilist_id=NULL, canonical_title=NULL, cover_url=NULL, total_episodes=NULL, anilist_cleared=1 WHERE id=?1", params![show_id])?;
+            c.execute("UPDATE shows SET anilist_id=NULL, canonical_title=NULL, cover_url=NULL, cover_path=NULL, total_episodes=NULL, anilist_cleared=1 WHERE id=?1", params![show_id])?;
             Ok(())
         })
     }
@@ -498,6 +504,23 @@ impl Db {
         self.with(|c| {
             c.execute("UPDATE shows SET user_title_override = ?2 WHERE id = ?1", params![show_id, t])?;
             Ok(())
+        })
+    }
+
+    /// Record where a show's cover art was saved locally.
+    pub fn set_cover_path(&self, show_id: i64, path: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE shows SET cover_path = ?2 WHERE id = ?1", params![show_id, path])?;
+            Ok(())
+        })
+    }
+
+    /// Shows with cover art on AniList that has not been copied locally yet.
+    pub fn shows_needing_cover(&self) -> Result<Vec<(i64, String)>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT id, cover_url FROM shows WHERE cover_url IS NOT NULL AND cover_path IS NULL ORDER BY id")?;
+            Ok(st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?)
         })
     }
 

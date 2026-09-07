@@ -84,6 +84,8 @@ pub struct ShowDetail {
     pub canonical_title: Option<String>,
     pub anilist_id: Option<i64>,
     pub cover_url: Option<String>,
+    /// Local copy of the cover art, once downloaded. Preferred over `cover_url` for display.
+    pub cover_path: Option<String>,
     pub total_episodes: Option<i64>,
     pub user_title_override: Option<String>,
     pub seasons: Vec<SeasonDetail>,
@@ -94,6 +96,7 @@ pub struct ShowCard {
     pub id: i64,
     pub display_title: String,
     pub cover_url: Option<String>,
+    pub cover_path: Option<String>,
     pub episode_count: i64,
     pub unwatched_count: i64,
 }

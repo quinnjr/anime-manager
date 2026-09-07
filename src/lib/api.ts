@@ -13,10 +13,10 @@ export interface Episode {
 export interface SeasonDetail { id: number; number: number; episodes: Episode[] }
 export interface ShowDetail {
   id: number; parsed_title: string; display_title: string; canonical_title: string | null;
-  anilist_id: number | null; cover_url: string | null; total_episodes: number | null;
+  anilist_id: number | null; cover_url: string | null; cover_path: string | null; total_episodes: number | null;
   user_title_override: string | null; seasons: SeasonDetail[];
 }
-export interface ShowCard { id: number; display_title: string; cover_url: string | null; episode_count: number; unwatched_count: number }
+export interface ShowCard { id: number; display_title: string; cover_url: string | null; cover_path: string | null; episode_count: number; unwatched_count: number }
 export interface ScanSummary { files_seen: number; episodes_added: number; episodes_updated: number; episodes_missing: number; errors: string[]; low_confidence_folders: string[] }
 export interface InspectChange { path: string; from: string; to: string }
 export interface AssistProgress { done: number; total: number; folder: string; running: boolean }

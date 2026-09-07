@@ -63,6 +63,19 @@ scanner::scan_dir → per file: db.get_override() → parser::parse_with_confide
 
 **Frontend contract.** `src/lib/api.ts` is the only place that calls `invoke`; keep the TS interfaces in step with `models.rs`. Tauri maps camelCase JS args to snake_case Rust params automatically. Events (`scan-progress`, `library-changed`, `show-updated`, `playback-changed`, `llm-assist-progress`, `llm-assist`, `error`) are subscribed in `+layout.svelte` and the route components. Stores are Svelte 5 runes in `.svelte.ts` files.
 
+## Cover art
+
+AniList cover URLs are downloaded to `$XDG_DATA_HOME/anime-manager/covers/<show id>.<ext>`
+after matching (`anilist::download_missing_covers`, and directly on a manual re-match), so the
+library still renders offline. The webview reads them through Tauri's asset protocol, which
+needs three things in agreement: the `protocol-asset` cargo feature, `app.security.assetProtocol`
+in `tauri.conf.json`, and a scope covering the directory (`$DATA` is `dirs::data_dir()`, the same
+base the database uses). There is no `core:asset:*` capability permission — adding one fails the
+build.
+
+`Cover.svelte` walks `coverSources()` on image error, local copy first and the remote URL second,
+so a scope or protocol mistake degrades to fetching from AniList rather than showing nothing.
+
 ## Platform quirks
 
 `lib::apply_dmabuf_workaround` sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` when running under
