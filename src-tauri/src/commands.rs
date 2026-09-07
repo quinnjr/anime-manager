@@ -14,6 +14,8 @@ pub struct AppState {
     pub db: Arc<Db>,
     pub player: Arc<Player>,
     pub providers: Arc<Providers>,
+    /// Guards the background match-and-cover pass so repeated scans cannot stack it.
+    pub matching: Arc<AssistQueue>,
     pub assist: Arc<AssistQueue>,
 }
 
@@ -63,7 +65,12 @@ pub async fn scan(app: AppHandle, state: State<'_, AppState>) -> Result<ScanSumm
     let db2 = state.db.clone();
     let api = state.providers.clone();
     let app3 = app.clone();
+    let matching = state.matching.clone();
+    let app3b = app.clone();
     tauri::async_runtime::spawn(async move {
+        // One matching pass at a time: a second Rescan while this is running would otherwise
+        // duplicate the whole loop and double every provider request.
+        let Some(_guard) = matching.try_start() else { return };
         let app4 = app3.clone();
         metadata::auto_match_all(db2.clone(), api.clone(), move |id| {
             let _ = app3.emit("show-updated", id);
@@ -75,6 +82,8 @@ pub async fn scan(app: AppHandle, state: State<'_, AppState>) -> Result<ScanSumm
             let _ = app4.emit("show-updated", id);
         })
         .await;
+        // Let an open Settings drawer pick up the new per-root scan results.
+        let _ = app3b.emit("library-changed", ());
     });
     Ok(summary)
 }
@@ -136,13 +145,11 @@ pub async fn play(app: AppHandle, state: State<'_, AppState>, episode_id: i64) -
 }
 
 #[tauri::command]
-pub async fn search_metadata(state: State<'_, AppState>, query: String) -> Result<Vec<MetadataHit>> {
-    // Every provider that answered. Only fail if none did, so one outage still allows matching.
-    let (hits, errors) = state.providers.search(&query).await;
-    if hits.is_empty() && !errors.is_empty() {
-        return Err(crate::error::AppError::Network(errors.join("; ")));
-    }
-    Ok(hits)
+pub async fn search_metadata(state: State<'_, AppState>, query: String) -> Result<SearchResult> {
+    // A provider being down is a warning, not a failure: the other may legitimately have zero
+    // matches for this query, and reporting that as an error left stale hits on screen.
+    let (hits, warnings) = state.providers.search(&query).await;
+    Ok(SearchResult { hits, warnings })
 }
 
 #[tauri::command]
@@ -156,10 +163,18 @@ pub async fn rematch(app: AppHandle, state: State<'_, AppState>, show_id: i64, m
                 .await?
                 .ok_or_else(|| crate::error::AppError::Network(format!("no {source} entry {id}")))?;
             state.db.set_anilist(show_id, &hit)?;
-            if let Some(url) = &hit.cover_url
-                && let Err(e) = anilist::download_cover(&state.db, state.providers.anilist.client(), show_id, url).await
-            {
-                eprintln!("cover {show_id}: {e}");
+            // Fetch the art in the background: it is a network round trip on someone else's CDN
+            // and must not hold the modal open, nor let a stalled fetch block the command.
+            if let Some(url) = hit.cover_url.clone() {
+                let db = state.db.clone();
+                let client = state.providers.anilist.client().clone();
+                let app_c = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    match anilist::download_cover(&db, &client, show_id, &url).await {
+                        Ok(_) => { let _ = app_c.emit("show-updated", show_id); }
+                        Err(e) => eprintln!("cover {show_id}: {e}"),
+                    }
+                });
             }
         }
         None => state.db.clear_anilist(show_id)?,

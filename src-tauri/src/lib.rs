@@ -34,8 +34,14 @@ fn apply_dmabuf_workaround() {
     }
 }
 
+/// Everything this app stores lives under one directory, so the database and the cover cache
+/// cannot drift apart (the Tauri asset-protocol scope is written against this base).
+pub fn data_dir() -> std::path::PathBuf {
+    dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join("anime-manager")
+}
+
 fn db_path() -> std::path::PathBuf {
-    dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join("anime-manager").join("db.sqlite")
+    data_dir().join("db.sqlite")
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -46,7 +52,7 @@ pub fn run() {
     db.reset_playing().expect("reset playing rows");
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(commands::AppState { db, player: Arc::new(player::Player::new()), providers: Arc::new(metadata::Providers::new()), assist: Arc::new(llm::AssistQueue::default()) })
+        .manage(commands::AppState { db, player: Arc::new(player::Player::new()), providers: Arc::new(metadata::Providers::new()), matching: Arc::new(llm::AssistQueue::default()), assist: Arc::new(llm::AssistQueue::default()) })
         .invoke_handler(tauri::generate_handler![
             commands::add_root, commands::remove_root, commands::list_roots, commands::scan,
             commands::list_shows, commands::get_show, commands::set_status,

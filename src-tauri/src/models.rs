@@ -153,6 +153,14 @@ pub struct MetadataHit {
     pub episodes: Option<i64>,
 }
 
+/// Cross-search result. `warnings` names providers that failed, so "nothing matched" and
+/// "a provider was down" can be told apart instead of both surfacing as an error.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SearchResult {
+    pub hits: Vec<MetadataHit>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RenameEntry {
     pub episode_id: i64,

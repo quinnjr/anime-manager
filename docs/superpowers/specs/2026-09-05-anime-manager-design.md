@@ -50,9 +50,15 @@ results arrive.
 ## Data model (SQLite)
 
 ```sql
-roots       (id, path UNIQUE, added_at)
-shows       (id, parsed_title UNIQUE, anilist_id, canonical_title, cover_url,
-             total_episodes, user_title_override, created_at, anilist_cleared)
+roots       (id, path UNIQUE, added_at,
+             -- result of the most recent scan of this root, NULL until scanned once
+             last_scan_at, last_files_seen, last_added, last_updated, last_missing,
+             last_errors, last_readable)
+shows       (id, parsed_title UNIQUE, anilist_id, match_source, canonical_title, cover_url,
+             cover_path, total_episodes, user_title_override, created_at, anilist_cleared)
+             -- match_source is 'anilist' or 'kitsu'; anilist_id holds THAT provider's id,
+             -- so it is only an AniList id when match_source = 'anilist'.
+             -- cover_path is the local copy of cover_url once downloaded.
 seasons     (id, show_id → shows, number, UNIQUE(show_id, number))
 episodes    (id, season_id → seasons, number, path UNIQUE, size, mtime,
              release_group, resolution, crc,
@@ -223,15 +229,34 @@ These are load-bearing; each exists because its absence destroys user data.
 `set_status(episode_id, status)` is always available for manual override.
 mpv missing → `AppError::Player`, no state change.
 
-## AniList
+## Metadata providers
 
-Auto-match runs after every scan for shows with no `anilist_id` and `anilist_cleared = 0`.
-A hit is applied only when its romaji or English title scores at least
-`MIN_AUTO_MATCH_SIMILARITY` (0.35) against the parsed title, measured as a Dice coefficient
-over character bigrams so abbreviations still match ("Frieren" vs "Sousou no Frieren"); a
-weaker best hit is left for the user, because a wrong match is written to disk by Rename.
-429 and 5xx responses retry up to 4 times with exponential backoff honouring `Retry-After`.
-Network errors are logged and skipped; the UI shows parsed titles.
+Matching cross-searches **AniList** and **Kitsu** concurrently and merges the results; a
+provider that errors is recorded as a warning and skipped, never failing the search. Both go
+down independently — AniList disabled its API outright in September 2026, and Jikan was
+returning 504 at the same time — so neither is trusted alone. Kitsu needs no API key.
+
+Auto-match runs after every scan for shows with `match_source IS NULL` and
+`anilist_cleared = 0`. It must **not** key on `anilist_id IS NULL`, or every Kitsu-matched show
+is re-searched on every scan. A hit is applied only when its romaji or English title scores at
+least `MIN_AUTO_MATCH_SIMILARITY` (0.35) against the parsed title, measured as a Dice
+coefficient over character bigrams so abbreviations still match ("Frieren" vs "Sousou no
+Frieren"); a weaker best hit is left for the user, because a wrong match is written to disk by
+Rename. An exact tie goes to the first provider searched (AniList), so a healthy AniList is not
+silently displaced.
+
+Kitsu's `canonicalTitle` is frequently the English title, so `titles.en_jp` is read first for
+the romaji field; otherwise the romaji form is lost and a romaji-named folder scores near zero.
+
+AniList retries 429 and 5xx up to 4 times with exponential backoff honouring `Retry-After`.
+Both clients set connect and request timeouts: an untimed socket would stall the other
+provider's leg of the cross-search.
+
+Cover art is downloaded to `$DATA/anime-manager/covers/<show id>.<ext>` and recorded in
+`cover_path`, so the library renders offline. Applying a match clears `cover_path` and the file
+is always refetched — show ids are reused after `prune_empty`, so a file left by a previous
+occupant must never be adopted. The webview reads it through Tauri's asset protocol and falls
+back to the remote URL on error.
 
 ## Rename
 
@@ -249,15 +274,19 @@ under one `batch_id`, updates `episodes.path`. Entries with `conflict` set are s
 add_root(path) -> Root            remove_root(id)
 scan() -> ScanSummary             list_shows(filter) -> Vec<ShowCard>
 get_show(id) -> ShowDetail        play(episode_id)
-set_status(episode_id, status)    rematch(show_id, anilist_id?)
-search_anilist(query) -> Vec<AniListHit>
+set_status(episode_id, status)    rematch(show_id, match_id?, source?)
+search_metadata(query) -> SearchResult { hits: Vec<MetadataHit>, warnings }
+set_show_title(show_id, title?) -> ShowDetail
+inspect_show(show_id) -> InspectReport   llm_test() -> String
+assist_progress() -> AssistProgress      clear_ai_decisions() -> usize
 preview_rename(target) -> RenamePlan   apply_rename(plan) -> RenameResult
 undo_rename() -> RenameResult     get_settings() / set_setting(key, value)
 ```
 
-Events: `scan-progress {done, total, current_path}`, `scan-finished`,
+Events: `scan-progress {done, total, current_path}`, `library-changed`,
 `playback-changed {episode_id, status, position_secs, duration_secs}`,
-`show-updated {show_id}` (after AniList resolution).
+`show-updated {show_id}` (after a match or a cover download),
+`llm-assist-progress {done, total, folder, running}`, `llm-assist {InspectReport}`, `error`.
 
 ## UI
 

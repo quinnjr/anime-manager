@@ -3,7 +3,7 @@
 //! AniList and Kitsu both go down independently — AniList disabled its API outright in
 //! September 2026 — so neither is trusted alone. A search asks both and merges what comes back;
 //! auto-matching takes whichever provider offers the most convincing title.
-use crate::anilist::{self, AniList, best_match};
+use crate::anilist::{AniList, best_match};
 use crate::error::Result;
 use crate::kitsu::Kitsu;
 use crate::models::MetadataHit;
@@ -25,24 +25,32 @@ impl Providers {
     /// Hits from every provider that answered, AniList first. A provider that errors is
     /// skipped rather than failing the search, so one outage does not block matching.
     pub async fn search(&self, q: &str) -> (Vec<MetadataHit>, Vec<String>) {
+        // Concurrent, not sequential: AniList's retry ladder can run to minutes on a 429, and
+        // awaiting it first would gate the healthy provider behind the sick one — the opposite
+        // of why a second provider exists. join! (not try_join!) keeps one side's Ok on error.
+        let (a, k) = tokio::join!(self.anilist.search(q), self.kitsu.search(q));
         let mut hits = Vec::new();
         let mut errors = Vec::new();
-        match self.anilist.search(q).await {
+        // AniList first, so it wins an exact similarity tie in best_match.
+        match a {
             Ok(h) => hits.extend(h),
             Err(e) => errors.push(format!("anilist: {e}")),
         }
-        match self.kitsu.search(q).await {
+        match k {
             Ok(h) => hits.extend(h),
             Err(e) => errors.push(format!("kitsu: {e}")),
         }
         (hits, errors)
     }
 
+    /// Look one id up on a named provider. An unrecognised name is an error, never a silent
+    /// fallback: AniList and Kitsu ids overlap heavily, so guessing resolves a real but
+    /// unrelated show and Rename would then write its title onto disk.
     pub async fn by_id(&self, source: &str, id: i64) -> Result<Option<MetadataHit>> {
-        if source == crate::kitsu::SOURCE {
-            self.kitsu.by_id(id).await
-        } else {
-            self.anilist.by_id(id).await
+        match source {
+            crate::anilist::SOURCE => self.anilist.by_id(id).await,
+            crate::kitsu::SOURCE => self.kitsu.by_id(id).await,
+            other => Err(crate::error::AppError::Network(format!("unknown metadata source {other:?}"))),
         }
     }
 
@@ -57,9 +65,6 @@ impl Providers {
         best_match(title, &hits).cloned()
     }
 }
-
-/// Re-export so callers do not need to know which provider defines the threshold.
-pub use anilist::MIN_AUTO_MATCH_SIMILARITY;
 
 /// Match every unmatched show against whichever provider answers, then fetch its cover art.
 pub async fn auto_match_all(
@@ -134,6 +139,14 @@ mod tests {
         assert!(hits.is_empty());
         assert_eq!(errors.len(), 2);
         assert!(p.best("Frieren").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_source_is_rejected_rather_than_guessed() {
+        let p = Providers::new();
+        let e = p.by_id("Kitsu", 46474).await.unwrap_err();
+        assert!(format!("{e}").contains("unknown metadata source"), "{e}");
+        assert!(p.by_id("", 1).await.is_err());
     }
 
     #[tokio::test]

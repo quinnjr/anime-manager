@@ -62,7 +62,9 @@ pub fn best_match<'a>(title: &str, hits: &'a [MetadataHit]) -> Option<&'a Metada
             (h, s)
         })
         .filter(|(_, s)| *s >= MIN_AUTO_MATCH_SIMILARITY)
-        .max_by(|(_, x), (_, y)| x.total_cmp(y))
+        // `max_by` keeps the LAST of equal maxima, which would hand every exact tie to whichever
+        // provider is appended last. Keep the first instead, so provider order is the tiebreak.
+        .reduce(|best, cur| if cur.1 > best.1 { cur } else { best })
         .map(|(h, _)| h)
 }
 
@@ -73,7 +75,14 @@ impl AniList {
 
     pub fn with_endpoint(endpoint: String) -> Self {
         Self {
-            client: reqwest::Client::builder().user_agent("anime-manager/0.1").build().expect("client"),
+            // Without timeouts a blackholed socket never resolves: it would stall the other
+            // provider's leg of a cross-search and strand every remaining cover download.
+            client: reqwest::Client::builder()
+                .user_agent("anime-manager/0.1")
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("client"),
             endpoint,
             retry_base: std::time::Duration::from_secs(1),
         }
@@ -135,7 +144,7 @@ impl Default for AniList {
 
 /// Where a show's cover art is cached, alongside the database.
 pub fn covers_dir() -> std::path::PathBuf {
-    dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join("anime-manager").join("covers")
+    crate::data_dir().join("covers")
 }
 
 /// Keep the remote extension when it is a plain image one, so the file is recognisable on disk.
@@ -153,13 +162,25 @@ fn cover_extension(url: &str) -> &str {
 /// otherwise fetched from AniList's CDN on every render, so the library is blank offline.
 /// Already-downloaded art is left alone.
 pub async fn download_cover(db: &Db, client: &reqwest::Client, show_id: i64, url: &str) -> Result<std::path::PathBuf> {
-    let dir = covers_dir();
-    std::fs::create_dir_all(&dir)?;
+    download_cover_into(db, client, &covers_dir(), show_id, url).await
+}
+
+/// As `download_cover`, but into an explicit directory so tests need not touch the process
+/// environment. Always refetches: a re-match points at different art under the same file name,
+/// and show ids are reused after `prune_empty`, so a file left from a previous occupant must
+/// never be adopted.
+pub async fn download_cover_into(
+    db: &Db,
+    client: &reqwest::Client,
+    dir: &std::path::Path,
+    show_id: i64,
+    url: &str,
+) -> Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dir)?;
     let dest = dir.join(format!("{show_id}.{}", cover_extension(url)));
-    if dest.exists() {
-        db.set_cover_path(show_id, &dest.to_string_lossy())?;
-        return Ok(dest);
-    }
+    // Reject a lossy path up front rather than storing U+FFFD for a file that can never be
+    // opened again — the same invariant every other stored path in the codebase follows.
+    let dest_str = crate::db::path_to_str(&dest)?;
     let resp = client.get(url).send().await?;
     if !resp.status().is_success() {
         return Err(AppError::Network(format!("cover download returned {}", resp.status())));
@@ -168,11 +189,12 @@ pub async fn download_cover(db: &Db, client: &reqwest::Client, show_id: i64, url
     if bytes.is_empty() {
         return Err(AppError::Network("cover download was empty".into()));
     }
-    // Write then rename so a killed download never leaves a truncated image behind.
-    let tmp = dest.with_extension("part");
+    // Write then rename so a killed download never leaves a truncated image behind. The temp
+    // name carries the show id so two downloads cannot collide on one .part file.
+    let tmp = dir.join(format!("{show_id}.part"));
     std::fs::write(&tmp, &bytes)?;
     std::fs::rename(&tmp, &dest)?;
-    db.set_cover_path(show_id, &dest.to_string_lossy())?;
+    db.set_cover_path(show_id, &dest_str)?;
     Ok(dest)
 }
 
@@ -183,7 +205,13 @@ pub async fn download_missing_covers(db: Arc<Db>, client: reqwest::Client, notif
         Ok(p) => p,
         Err(_) => return,
     };
+    let mut first = true;
     for (show_id, url) in pending {
+        if !first {
+            // Same courtesy pacing as matching; these are someone else's CDN.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        first = false;
         match download_cover(&db, &client, show_id, &url).await {
             Ok(_) => notify(show_id),
             Err(e) => eprintln!("cover {show_id}: {e}"),
@@ -262,53 +290,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn covers_are_downloaded_once_and_recorded() {
+    async fn a_rematch_replaces_the_previous_cover_rather_than_keeping_it() {
         use crate::parser::ParsedName;
         use crate::scanner::RawFile;
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/cover.jpg"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"\x89PNGnotreally".to_vec()))
-            .expect(1)  // a second pass must not re-download
-            .mount(&server).await;
+        Mock::given(method("GET")).and(path("/a.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"FIRST".to_vec())).mount(&server).await;
+        Mock::given(method("GET")).and(path("/b.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SECOND".to_vec())).mount(&server).await;
 
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_DATA_HOME", tmp.path()) };
-
-        let db = Arc::new(Db::open_memory().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_memory().unwrap();
         let p = ParsedName { title: "Show".into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
         db.upsert_episode(&p, &RawFile { path: "/a/1.mkv".into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] }).unwrap();
         let id = db.list_shows("").unwrap()[0].id;
-        let url = format!("{}/cover.jpg", server.uri());
-        db.set_anilist(id, &MetadataHit { id: 7, source: "anilist".into(), title_romaji: "Show".into(), title_english: None, cover_url: Some(url), episodes: None }).unwrap();
-
-        assert_eq!(db.shows_needing_cover().unwrap().len(), 1);
         let client = reqwest::Client::new();
-        download_missing_covers(db.clone(), client.clone(), |_| {}).await;
+        let hit = |n: &str| MetadataHit { id: 1, source: "anilist".into(), title_romaji: "Show".into(),
+            title_english: None, cover_url: Some(format!("{}/{n}", server.uri())), episodes: None };
 
-        let show = db.get_show(id).unwrap();
-        let local = show.cover_path.expect("cover path recorded");
-        assert!(std::path::Path::new(&local).exists(), "the file is on disk at {local}");
-        assert!(local.ends_with(&format!("{id}.jpg")));
-        assert!(db.shows_needing_cover().unwrap().is_empty(), "no longer pending");
+        db.set_anilist(id, &hit("a.jpg")).unwrap();
+        let first = download_cover_into(&db, &client, dir.path(), id, &hit("a.jpg").cover_url.unwrap()).await.unwrap();
+        assert_eq!(std::fs::read(&first).unwrap(), b"FIRST");
+        assert_eq!(db.get_show(id).unwrap().cover_path.as_deref(), Some(first.to_str().unwrap()));
 
-        // Second pass is a no-op; the mock asserts it was hit exactly once on drop.
-        download_missing_covers(db.clone(), client, |_| {}).await;
-
-        // Clearing the match drops the local art reference too.
-        db.clear_anilist(id).unwrap();
-        assert!(db.get_show(id).unwrap().cover_path.is_none());
+        // Re-matching to a different entry must not leave the old poster in place.
+        db.set_anilist(id, &hit("b.jpg")).unwrap();
+        assert!(db.get_show(id).unwrap().cover_path.is_none(), "a new match drops the stale art");
+        let second = download_cover_into(&db, &client, dir.path(), id, &hit("b.jpg").cover_url.unwrap()).await.unwrap();
+        assert_eq!(std::fs::read(&second).unwrap(), b"SECOND", "the file is refetched, not adopted");
     }
 
     #[tokio::test]
     async fn a_failed_cover_download_is_not_recorded() {
         let server = MockServer::start().await;
         Mock::given(method("GET")).respond_with(ResponseTemplate::new(404)).mount(&server).await;
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_DATA_HOME", tmp.path()) };
+        let dir = tempfile::tempdir().unwrap();
         let db = Db::open_memory().unwrap();
         let client = reqwest::Client::new();
-        let err = download_cover(&db, &client, 1, &format!("{}/x.jpg", server.uri())).await.unwrap_err();
+        let err = download_cover_into(&db, &client, dir.path(), 1, &format!("{}/x.jpg", server.uri())).await.unwrap_err();
         assert!(matches!(err, AppError::Network(_)), "{err:?}");
-        assert!(!covers_dir().join("1.jpg").exists(), "no partial file left behind");
+        assert!(!dir.path().join("1.jpg").exists(), "no partial file left behind");
+        assert!(!dir.path().join("1.part").exists());
+    }
+
+    #[test]
+    fn an_exact_tie_goes_to_the_first_provider() {
+        // Providers::search appends AniList before Kitsu, so an identical score must keep AniList
+        // rather than silently migrating the whole library to the other provider's ids.
+        let mk = |source: &str, id: i64| MetadataHit { id, source: source.into(),
+            title_romaji: "Sousou no Frieren".into(), title_english: None, cover_url: None, episodes: None };
+        let hits = vec![mk("anilist", 154587), mk("kitsu", 46474)];
+        let best = best_match("Sousou no Frieren", &hits).unwrap();
+        assert_eq!((best.source.as_str(), best.id), ("anilist", 154587));
+        // A strictly better score still wins regardless of order.
+        let hits = vec![mk("anilist", 1), MetadataHit { id: 2, source: "kitsu".into(),
+            title_romaji: "Sousou no Frieren".into(), title_english: None, cover_url: None, episodes: None }];
+        assert_eq!(best_match("Sousou no Frieren", &hits).unwrap().id, 1);
     }
 }

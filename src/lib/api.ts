@@ -29,6 +29,7 @@ export interface MetadataHit {
   id: number; source: MetadataSource; title_romaji: string; title_english: string | null;
   cover_url: string | null; episodes: number | null;
 }
+export interface SearchResult { hits: MetadataHit[]; warnings: string[] }
 export interface RenameEntry { episode_id: number; old_path: string; new_path: string; conflict: string | null }
 export interface RenamePlan { entries: RenameEntry[] }
 export interface RenameResult { renamed: number; skipped: string[] }
@@ -45,7 +46,7 @@ export const api = {
   setStatus: (episodeId: number, status: EpisodeStatus) => invoke<void>('set_status', { episodeId, status }),
   rematch: (showId: number, matchId: number | null, source: MetadataSource | null = null) =>
     invoke<ShowDetail>('rematch', { showId, matchId, source }),
-  searchMetadata: (query: string) => invoke<MetadataHit[]>('search_metadata', { query }),
+  searchMetadata: (query: string) => invoke<SearchResult>('search_metadata', { query }),
   previewRename: (target: RenameTarget) => invoke<RenamePlan>('preview_rename', { target }),
   applyRename: (plan: RenamePlan) => invoke<RenameResult>('apply_rename', { plan }),
   undoRename: () => invoke<RenameResult>('undo_rename'),

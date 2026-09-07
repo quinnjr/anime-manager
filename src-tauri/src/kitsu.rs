@@ -29,34 +29,34 @@ impl Kitsu {
         }
     }
 
-    pub fn client(&self) -> &reqwest::Client { &self.client }
-
-    async fn get(&self, url: &str) -> Result<Value> {
+    /// `None` when the resource does not exist, mirroring `AniList::by_id`.
+    async fn get(&self, url: &str, query: &[(&str, &str)]) -> Result<Option<Value>> {
         let resp = self
             .client
             .get(url)
+            .query(query)
             .header("Accept", "application/vnd.api+json")
             .send()
             .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
         if !resp.status().is_success() {
             return Err(AppError::Network(format!("kitsu returned {}", resp.status())));
         }
-        Ok(resp.json().await?)
+        Ok(Some(resp.json().await?))
     }
 
     pub async fn search(&self, q: &str) -> Result<Vec<MetadataHit>> {
-        let url = format!(
-            "{}/anime?filter[text]={}&page[limit]=5",
-            self.endpoint,
-            urlencoding(q)
-        );
-        Ok(parse_hits(&self.get(&url).await?))
+        let url = format!("{}/anime", self.endpoint);
+        let v = self.get(&url, &[("filter[text]", q), ("page[limit]", "5")]).await?;
+        Ok(v.as_ref().map(parse_hits).unwrap_or_default())
     }
 
     pub async fn by_id(&self, id: i64) -> Result<Option<MetadataHit>> {
-        let v = self.get(&format!("{}/anime/{id}", self.endpoint)).await?;
+        let v = self.get(&format!("{}/anime/{id}", self.endpoint), &[]).await?;
         // A single fetch returns one object rather than a list.
-        Ok(v.get("data").and_then(parse_hit))
+        Ok(v.as_ref().and_then(|v| v.get("data")).and_then(parse_hit))
     }
 }
 
@@ -64,27 +64,17 @@ impl Default for Kitsu {
     fn default() -> Self { Self::new() }
 }
 
-/// Minimal percent-encoding for a search term in a query string.
-fn urlencoding(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(*b as char),
-            b' ' => out.push_str("%20"),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
 fn parse_hit(a: &Value) -> Option<MetadataHit> {
     let at = a.get("attributes")?;
     // Kitsu ids arrive as JSON:API strings.
     let id: i64 = a.get("id")?.as_str()?.parse().ok()?;
+    // Prefer the romaji title. Kitsu's canonicalTitle is often the English one (id 7442 is
+    // "Attack on Titan"), and storing that as the romaji field both sinks the similarity score
+    // for a romaji-named folder and makes Rename write the English title onto disk.
     let romaji = at
-        .get("canonicalTitle")
+        .pointer("/titles/en_jp")
         .and_then(|t| t.as_str())
-        .or_else(|| at.pointer("/titles/en_jp").and_then(|t| t.as_str()))?
+        .or_else(|| at.get("canonicalTitle").and_then(|t| t.as_str()))?
         .to_string();
     Some(MetadataHit {
         id,
@@ -112,7 +102,7 @@ mod tests {
     fn body() -> Value {
         serde_json::json!({"data": [
             {"id": "46474", "attributes": {
-                "canonicalTitle": "Sousou no Frieren",
+                "canonicalTitle": "Frieren: Beyond Journey's End",
                 "titles": {"en": "Frieren: Beyond Journey's End", "en_jp": "Sousou no Frieren"},
                 "episodeCount": 28,
                 "posterImage": {"large": "https://media.kitsu.app/x/large.jpeg"}}},
@@ -125,13 +115,6 @@ mod tests {
         ]})
     }
 
-    #[test]
-    fn urlencodes_search_terms() {
-        assert_eq!(urlencoding("Yuru Yuri"), "Yuru%20Yuri");
-        assert_eq!(urlencoding("K-On!"), "K-On%21");
-        assert_eq!(urlencoding("Fate/Zero"), "Fate%2FZero");
-    }
-
     #[tokio::test]
     async fn search_parses_hits_and_skips_unusable_rows() {
         let server = MockServer::start().await;
@@ -142,12 +125,19 @@ mod tests {
         assert_eq!(hits.len(), 2, "the non-numeric id is skipped, not fatal");
         assert_eq!(hits[0].id, 46474);
         assert_eq!(hits[0].source, "kitsu");
-        assert_eq!(hits[0].title_romaji, "Sousou no Frieren");
+        assert_eq!(hits[0].title_romaji, "Sousou no Frieren", "romaji wins over an English canonicalTitle");
         assert_eq!(hits[0].title_english.as_deref(), Some("Frieren: Beyond Journey's End"));
         assert_eq!(hits[0].episodes, Some(28));
         assert_eq!(hits[0].cover_url.as_deref(), Some("https://media.kitsu.app/x/large.jpeg"));
         assert_eq!(hits[1].title_english, None);
         assert_eq!(hits[1].cover_url, None);
+    }
+
+    #[tokio::test]
+    async fn a_missing_entry_is_none_not_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(404)).mount(&server).await;
+        assert!(Kitsu::with_endpoint(server.uri()).by_id(1).await.unwrap().is_none());
     }
 
     #[tokio::test]

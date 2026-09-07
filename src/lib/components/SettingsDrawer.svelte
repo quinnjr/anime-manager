@@ -10,14 +10,13 @@
   function ago(secs: number): string {
     const d = Math.max(0, Math.floor(Date.now() / 1000) - secs);
     if (d < 60) return 'just now';
-    for (const [n, unit] of [[60, 'minute'], [3600, 'hour'], [86400, 'day']] as const) {
-      const next = unit === 'minute' ? 3600 : unit === 'hour' ? 86400 : Infinity;
+    for (const [n, unit, next] of [[60, 'minute', 3600], [3600, 'hour', 86400], [86400, 'day', Infinity]] as const) {
       if (d < next) {
         const v = Math.floor(d / n);
         return `${v} ${unit}${v === 1 ? '' : 's'} ago`;
       }
     }
-    return `${Math.floor(d / 86400)} days ago`;
+    return 'a long time ago';
   }
   let roots = $state<Root[]>([]);
   let mpvPath = $state('mpv');
@@ -33,7 +32,7 @@
 
   // A scan finishing while the drawer is open should refresh the per-root results.
   onMount(() => {
-    const u = onEvent('library-changed', () => { if (open) load(); });
+    const u = onEvent('library-changed', () => { if (open) loadRoots(); });
     return () => { u.then((f) => f()); };
   });
 
@@ -42,6 +41,12 @@
     window.addEventListener('keydown', esc);
     return () => window.removeEventListener('keydown', esc);
   });
+
+  /** Roots only. The library-changed listener uses this so a background scan can refresh the
+   * per-root results without overwriting settings the user is part-way through editing. */
+  async function loadRoots() {
+    try { roots = await api.listRoots(); } catch (e) { toasts.error(e); }
+  }
 
   async function load() {
     try {

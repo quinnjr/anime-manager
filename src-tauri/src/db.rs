@@ -284,8 +284,11 @@ impl Db {
 
     /// Flag as missing only the episodes under `roots` that this scan did not see. Roots whose
     /// scan failed are not passed in, so an unmounted share never marks a whole library missing.
-    pub fn mark_missing_within(&self, roots: &[String], seen: &[String]) -> Result<usize> {
-        if roots.is_empty() { return Ok(0); }
+    /// Returns one count per entry of `roots`, in the same order. Nested roots are allowed, so
+    /// the longest matching root claims a file: without that the outer root would absorb the
+    /// inner one's files and report their count as its own.
+    pub fn mark_missing_within(&self, roots: &[String], seen: &[String]) -> Result<Vec<usize>> {
+        if roots.is_empty() { return Ok(Vec::new()); }
         self.with(|c| {
             let tx = c.unchecked_transaction()?;
             tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS seen(path TEXT PRIMARY KEY); DELETE FROM seen;")?;
@@ -293,17 +296,21 @@ impl Db {
                 let mut ins = tx.prepare("INSERT OR IGNORE INTO seen(path) VALUES (?1)")?;
                 for p in seen { ins.execute(params![p])?; }
             }
-            let mut n = 0;
-            for root in roots {
-                let prefix = format!("{}/", root.trim_end_matches('/'));
-                n += tx.execute(
+            // Longest first, so a file under /lib/Anime/Movies is counted against that root
+            // rather than against /lib/Anime.
+            let mut order: Vec<usize> = (0..roots.len()).collect();
+            order.sort_by_key(|&i| std::cmp::Reverse(roots[i].trim_end_matches('/').len()));
+            let mut counts = vec![0usize; roots.len()];
+            for i in order {
+                let prefix = format!("{}/", roots[i].trim_end_matches('/'));
+                counts[i] = tx.execute(
                     "UPDATE episodes SET prev_status = status, status = 'missing'
                      WHERE status != 'missing' AND substr(path, 1, length(?1)) = ?1
                        AND path NOT IN (SELECT path FROM seen)",
                     params![prefix])?;
             }
             tx.commit()?;
-            Ok(n)
+            Ok(counts)
         })
     }
 
@@ -480,12 +487,16 @@ impl Db {
         })
     }
 
+    /// Apply a provider's match. One statement, because auto-match is gated on `match_source`:
+    /// a half-applied match (source set, id NULL) would otherwise be excluded from future scans
+    /// forever. `cover_path` is cleared because the new match's art is a different image, and
+    /// the file on disk is named after the show, not the URL.
     pub fn set_anilist(&self, show_id: i64, hit: &MetadataHit) -> Result<()> {
         self.with(|c| {
-            c.execute("UPDATE shows SET anilist_cleared = 0, match_source = ?2 WHERE id = ?1",
-                params![show_id, hit.source])?;
-            c.execute("UPDATE shows SET anilist_id=?2, canonical_title=?3, cover_url=?4, total_episodes=?5 WHERE id=?1",
-                params![show_id, hit.id, hit.title_romaji, hit.cover_url, hit.episodes])?;
+            c.execute(
+                "UPDATE shows SET anilist_id=?2, match_source=?3, canonical_title=?4, cover_url=?5,
+                 total_episodes=?6, cover_path=NULL, anilist_cleared=0 WHERE id=?1",
+                params![show_id, hit.id, hit.source, hit.title_romaji, hit.cover_url, hit.episodes])?;
             Ok(())
         })
     }
@@ -689,14 +700,14 @@ pub fn run_scan(db: &Db, on_progress: &mut dyn FnMut(ScanProgress)) -> Result<Sc
         per_root.push((w.root.id, scan));
     }
 
-    // Missing-detection is per root so each root's count is its own, and an unreadable root is
-    // simply not asked.
-    for (w, (_, scan)) in work.iter().zip(per_root.iter_mut()) {
-        if w.readable {
-            let n = db.mark_missing_within(std::slice::from_ref(&w.root.path), &seen_paths)?;
-            scan.missing = n as i64;
-            summary.episodes_missing += n;
-        }
+    // One pass for every readable root: a single transaction over a single `seen` table, with
+    // each root's own count returned. An unreadable root is simply not asked.
+    let trusted: Vec<usize> = work.iter().enumerate().filter(|(_, w)| w.readable).map(|(i, _)| i).collect();
+    let paths: Vec<String> = trusted.iter().map(|&i| work[i].root.path.clone()).collect();
+    let counts = db.mark_missing_within(&paths, &seen_paths)?;
+    for (slot, n) in trusted.iter().zip(counts) {
+        per_root[*slot].1.missing = n as i64;
+        summary.episodes_missing += n;
     }
     db.prune_empty()?;
     for (root_id, scan) in &per_root {
@@ -1091,6 +1102,29 @@ mod tests {
         assert_eq!(roots[0].last_scan.as_ref().unwrap().missing, 1);
         assert_eq!(roots[1].last_scan.as_ref().unwrap().missing, 0);
         assert_eq!(roots[0].last_scan.as_ref().unwrap().files_seen, 1);
+    }
+
+    #[test]
+    fn a_nested_root_keeps_its_own_missing_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("Anime");
+        let inner = outer.join("Movies");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(outer.join("Show - 01.mkv"), b"x").unwrap();
+        std::fs::write(inner.join("Film - 01.mkv"), b"x").unwrap();
+        let db = Db::open_memory().unwrap();
+        db.add_root(outer.to_str().unwrap()).unwrap();
+        db.add_root(inner.to_str().unwrap()).unwrap();
+        run_scan(&db, &mut |_| {}).unwrap();
+
+        // Delete one file from each root; each root must report exactly its own.
+        std::fs::remove_file(outer.join("Show - 01.mkv")).unwrap();
+        std::fs::remove_file(inner.join("Film - 01.mkv")).unwrap();
+        let s = run_scan(&db, &mut |_| {}).unwrap();
+        let roots = db.list_roots().unwrap();
+        assert_eq!(roots[0].last_scan.as_ref().unwrap().missing, 1, "outer root counts only its own file");
+        assert_eq!(roots[1].last_scan.as_ref().unwrap().missing, 1, "nested root is not absorbed by its parent");
+        assert_eq!(s.episodes_missing, 2);
     }
 
     #[test]

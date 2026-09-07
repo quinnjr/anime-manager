@@ -4,9 +4,18 @@
   let { show, class: klass = '' }: { show: HasCover; class?: string } = $props();
 
   const sources = $derived(coverSources(show));
+  // Keyed on the contents, not the array's identity: a scan reloads the show list every few
+  // hundred milliseconds, and resetting on identity would re-request a source already known to
+  // fail and visibly flicker the tile each time.
+  const key = $derived(sources.join('|'));
   let attempt = $state(0);
-  // Reset when the show changes, otherwise a previous failure hides the next show's art.
-  $effect(() => { sources; attempt = 0; });
+  let seen = $state('');
+  $effect(() => {
+    if (key !== seen) {
+      seen = key;
+      attempt = 0;
+    }
+  });
 </script>
 
 {#if attempt < sources.length}

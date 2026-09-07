@@ -24,9 +24,17 @@
     const mine = ++searchGen;
     busy = true;
     try {
-      const rows = await api.searchMetadata(query);
-      if (mine === searchGen) hits = rows;
-    } catch (e) { if (mine === searchGen) toasts.error(e); }
+      const res = await api.searchMetadata(query);
+      if (mine !== searchGen) return;
+      // Always replace: leaving the previous query's rows on screen lets the user apply a hit
+      // that belongs to a different search.
+      hits = res.hits;
+      for (const w of res.warnings) toasts.push('info', `Search: ${w}`);
+    } catch (e) {
+      if (mine !== searchGen) return;
+      hits = [];
+      toasts.error(e);
+    }
     finally { if (mine === searchGen) busy = false; }
   }
   async function pick(id: number | null, source: MetadataSource | null = null) {
