@@ -5,7 +5,7 @@ pkgver=0.1.0
 pkgrel=1
 pkgdesc='Scan an anime collection, play episodes in mpv and track what you have watched'
 arch=('x86_64')
-# No upstream remote yet; built from the local clone (see _repo below).
+url='https://github.com/quinnjr/anime-manager'
 license=('custom:unlicensed')
 # Runtime libraries the binary actually links (readelf -d), plus mpv, which the player shells out to.
 # SQLite is statically linked (rusqlite "bundled") and TLS is rustls, so neither is a dependency.
@@ -13,12 +13,12 @@ depends=('webkit2gtk-4.1' 'gtk3' 'glib2' 'cairo' 'gdk-pixbuf2' 'libsoup3' 'dbus'
 makedepends=('git' 'rust' 'nodejs' 'pnpm' 'pkgconf')
 options=('!lto')
 
-# This project has no remote yet, so the package is built from the local clone.
-# Point ANIME_MANAGER_REPO at another checkout, or replace this with the upstream URL.
-_repo="${ANIME_MANAGER_REPO:-/home/joseph/Projects/anime-manager}"
-_branch="${ANIME_MANAGER_BRANCH:-worktree-design-spec}"
+# Override either to build from a local clone or another branch, e.g.
+#   ANIME_MANAGER_REPO=file:///path/to/checkout ANIME_MANAGER_BRANCH=some-branch makepkg
+_repo="${ANIME_MANAGER_REPO:-https://github.com/quinnjr/anime-manager.git}"
+_branch="${ANIME_MANAGER_BRANCH:-main}"
 
-source=("$pkgname::git+file://$_repo#branch=$_branch"
+source=("$pkgname::git+$_repo#branch=$_branch"
         'anime-manager.desktop')
 sha256sums=('SKIP'
             'SKIP')
