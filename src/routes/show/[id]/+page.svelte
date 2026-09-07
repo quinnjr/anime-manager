@@ -119,7 +119,7 @@
             onclick={() => { titleDraft = show!.user_title_override ?? show!.display_title; editingTitle = true; }}>rename</button>
         </h1>
       {/if}
-      <p class="text-sm text-zinc-400">{show.parsed_title}{show.total_episodes ? ` · ${show.total_episodes} episodes` : ''}{show.anilist_id ? ` · AniList #${show.anilist_id}` : ' · unmatched'}</p>
+      <p class="text-sm text-zinc-400">{show.parsed_title}{show.total_episodes ? ` · ${show.total_episodes} episodes` : ''}{show.match_source ? ` · ${show.match_source === 'kitsu' ? 'Kitsu' : 'AniList'} #${show.anilist_id}` : ' · unmatched'}</p>
       <div class="mt-3 flex gap-2">
         <button class="rounded bg-zinc-800 px-3 py-1 text-sm hover:bg-zinc-700" onclick={() => (rematchOpen = true)}>Re-match</button>
         <button class="rounded bg-zinc-800 px-3 py-1 text-sm hover:bg-zinc-700" onclick={() => openRename({ type: 'show', id: show!.id })}>Rename files</button>

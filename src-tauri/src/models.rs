@@ -83,6 +83,8 @@ pub struct ShowDetail {
     pub display_title: String,
     pub canonical_title: Option<String>,
     pub anilist_id: Option<i64>,
+    /// Which provider supplied the match, if any: "anilist" or "kitsu".
+    pub match_source: Option<String>,
     pub cover_url: Option<String>,
     /// Local copy of the cover art, once downloaded. Preferred over `cover_url` for display.
     pub cover_path: Option<String>,
@@ -141,8 +143,10 @@ pub struct PlaybackChanged {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AniListHit {
+pub struct MetadataHit {
     pub id: i64,
+    /// Which provider this came from: "anilist" or "kitsu".
+    pub source: String,
     pub title_romaji: String,
     pub title_english: Option<String>,
     pub cover_url: Option<String>,

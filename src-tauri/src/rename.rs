@@ -298,7 +298,7 @@ mod tests {
         seed(&db, dir.path(), "Frieren", 1, "[G] Frieren - 01.mkv");
         seed(&db, dir.path(), "Frieren", 2, "[G] Frieren - 02.mkv");
         let id = db.list_shows("").unwrap()[0].id;
-        let hit = AniListHit { id: 154587, title_romaji: "Sousou no Frieren".into(), title_english: None,
+        let hit = MetadataHit { id: 154587, source: "anilist".into(), title_romaji: "Sousou no Frieren".into(), title_english: None,
             cover_url: Some("https://img/x.jpg".into()), episodes: Some(28) };
         db.set_anilist(id, &hit).unwrap();
         assert_eq!(apply(&db, preview(&db, RenameTarget::Show(id)).unwrap()).unwrap().renamed, 2);

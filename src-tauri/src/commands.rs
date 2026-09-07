@@ -1,4 +1,5 @@
-use crate::anilist::{self, AniList};
+use crate::anilist;
+use crate::metadata::{self, Providers};
 use crate::db::{self, Db};
 use crate::llm::{self, AssistQueue, Llm};
 use crate::error::Result;
@@ -12,7 +13,7 @@ use tauri::{AppHandle, Emitter, State};
 pub struct AppState {
     pub db: Arc<Db>,
     pub player: Arc<Player>,
-    pub anilist: Arc<AniList>,
+    pub providers: Arc<Providers>,
     pub assist: Arc<AssistQueue>,
 }
 
@@ -60,17 +61,17 @@ pub async fn scan(app: AppHandle, state: State<'_, AppState>) -> Result<ScanSumm
         }
     }
     let db2 = state.db.clone();
-    let api = state.anilist.clone();
+    let api = state.providers.clone();
     let app3 = app.clone();
     tauri::async_runtime::spawn(async move {
         let app4 = app3.clone();
-        anilist::auto_match_all(db2.clone(), api.clone(), move |id| {
+        metadata::auto_match_all(db2.clone(), api.clone(), move |id| {
             let _ = app3.emit("show-updated", id);
         })
         .await;
         // Cover art is otherwise refetched from AniList's CDN on every render, so the library
         // is blank offline. Do this after matching, when the URLs are known.
-        anilist::download_missing_covers(db2, api, move |id| {
+        anilist::download_missing_covers(db2, api.anilist.client().clone(), move |id| {
             let _ = app4.emit("show-updated", id);
         })
         .await;
@@ -135,22 +136,28 @@ pub async fn play(app: AppHandle, state: State<'_, AppState>, episode_id: i64) -
 }
 
 #[tauri::command]
-pub async fn search_anilist(state: State<'_, AppState>, query: String) -> Result<Vec<AniListHit>> {
-    state.anilist.search(&query).await
+pub async fn search_metadata(state: State<'_, AppState>, query: String) -> Result<Vec<MetadataHit>> {
+    // Every provider that answered. Only fail if none did, so one outage still allows matching.
+    let (hits, errors) = state.providers.search(&query).await;
+    if hits.is_empty() && !errors.is_empty() {
+        return Err(crate::error::AppError::Network(errors.join("; ")));
+    }
+    Ok(hits)
 }
 
 #[tauri::command]
-pub async fn rematch(app: AppHandle, state: State<'_, AppState>, show_id: i64, anilist_id: Option<i64>) -> Result<ShowDetail> {
-    match anilist_id {
+pub async fn rematch(app: AppHandle, state: State<'_, AppState>, show_id: i64, match_id: Option<i64>, source: Option<String>) -> Result<ShowDetail> {
+    match match_id {
         Some(id) => {
+            let source = source.unwrap_or_else(|| crate::anilist::SOURCE.to_string());
             let hit = state
-                .anilist
-                .by_id(id)
+                .providers
+                .by_id(&source, id)
                 .await?
-                .ok_or_else(|| crate::error::AppError::Network(format!("no AniList entry {id}")))?;
+                .ok_or_else(|| crate::error::AppError::Network(format!("no {source} entry {id}")))?;
             state.db.set_anilist(show_id, &hit)?;
             if let Some(url) = &hit.cover_url
-                && let Err(e) = anilist::download_cover(&state.db, state.anilist.client(), show_id, url).await
+                && let Err(e) = anilist::download_cover(&state.db, state.providers.anilist.client(), show_id, url).await
             {
                 eprintln!("cover {show_id}: {e}");
             }

@@ -13,7 +13,8 @@ export interface Episode {
 export interface SeasonDetail { id: number; number: number; episodes: Episode[] }
 export interface ShowDetail {
   id: number; parsed_title: string; display_title: string; canonical_title: string | null;
-  anilist_id: number | null; cover_url: string | null; cover_path: string | null; total_episodes: number | null;
+  anilist_id: number | null; match_source: MetadataSource | null;
+  cover_url: string | null; cover_path: string | null; total_episodes: number | null;
   user_title_override: string | null; seasons: SeasonDetail[];
 }
 export interface ShowCard { id: number; display_title: string; cover_url: string | null; cover_path: string | null; episode_count: number; unwatched_count: number }
@@ -23,7 +24,11 @@ export interface AssistProgress { done: number; total: number; folder: string; r
 export interface InspectReport { folders: number; ignored: number; changes: InspectChange[]; notes: string[]; show_id: number | null }
 export interface ScanProgress { done: number; total: number; current_path: string }
 export interface PlaybackChanged { episode_id: number; status: EpisodeStatus; position_secs: number; duration_secs: number | null }
-export interface AniListHit { id: number; title_romaji: string; title_english: string | null; cover_url: string | null; episodes: number | null }
+export type MetadataSource = 'anilist' | 'kitsu';
+export interface MetadataHit {
+  id: number; source: MetadataSource; title_romaji: string; title_english: string | null;
+  cover_url: string | null; episodes: number | null;
+}
 export interface RenameEntry { episode_id: number; old_path: string; new_path: string; conflict: string | null }
 export interface RenamePlan { entries: RenameEntry[] }
 export interface RenameResult { renamed: number; skipped: string[] }
@@ -38,8 +43,9 @@ export const api = {
   getShow: (id: number) => invoke<ShowDetail>('get_show', { id }),
   play: (episodeId: number) => invoke<void>('play', { episodeId }),
   setStatus: (episodeId: number, status: EpisodeStatus) => invoke<void>('set_status', { episodeId, status }),
-  rematch: (showId: number, anilistId: number | null) => invoke<ShowDetail>('rematch', { showId, anilistId }),
-  searchAnilist: (query: string) => invoke<AniListHit[]>('search_anilist', { query }),
+  rematch: (showId: number, matchId: number | null, source: MetadataSource | null = null) =>
+    invoke<ShowDetail>('rematch', { showId, matchId, source }),
+  searchMetadata: (query: string) => invoke<MetadataHit[]>('search_metadata', { query }),
   previewRename: (target: RenameTarget) => invoke<RenamePlan>('preview_rename', { target }),
   applyRename: (plan: RenamePlan) => invoke<RenameResult>('apply_rename', { plan }),
   undoRename: () => invoke<RenameResult>('undo_rename'),

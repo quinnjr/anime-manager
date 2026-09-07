@@ -1,6 +1,6 @@
 use crate::db::Db;
 use crate::error::{AppError, Result};
-use crate::models::AniListHit;
+use crate::models::MetadataHit;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -15,6 +15,7 @@ query ($q: String, $id: Int) {
 
 /// Attempts per query; waits grow as retry_base * 2^n and honour Retry-After.
 pub const MAX_ATTEMPTS: u32 = 4;
+pub const SOURCE: &str = "anilist";
 /// Minimum title similarity for an automatic match. Below this the show is left unmatched
 /// rather than labelled — and renamed on disk — with someone else's title.
 pub const MIN_AUTO_MATCH_SIMILARITY: f64 = 0.35;
@@ -53,7 +54,7 @@ pub fn similarity(a: &str, b: &str) -> f64 {
 }
 
 /// The best hit for `title`, or None when nothing is close enough to apply unattended.
-pub fn best_match<'a>(title: &str, hits: &'a [AniListHit]) -> Option<&'a AniListHit> {
+pub fn best_match<'a>(title: &str, hits: &'a [MetadataHit]) -> Option<&'a MetadataHit> {
     hits.iter()
         .map(|h| {
             let s = similarity(title, &h.title_romaji)
@@ -78,7 +79,7 @@ impl AniList {
         }
     }
 
-    async fn run(&self, vars: Value) -> Result<Vec<AniListHit>> {
+    async fn run(&self, vars: Value) -> Result<Vec<MetadataHit>> {
         let body = json!({"query": QUERY, "variables": vars});
         let mut attempt = 0u32;
         let v: Value = loop {
@@ -100,8 +101,9 @@ impl AniList {
         Ok(media
             .iter()
             .filter_map(|m| {
-                Some(AniListHit {
+                Some(MetadataHit {
                     id: m.get("id")?.as_i64()?,
+                    source: SOURCE.to_string(),
                     title_romaji: m.pointer("/title/romaji")?.as_str()?.to_string(),
                     title_english: m.pointer("/title/english").and_then(|t| t.as_str()).map(String::from),
                     cover_url: m.pointer("/coverImage/large").and_then(|t| t.as_str()).map(String::from),
@@ -116,11 +118,11 @@ impl AniList {
     /// Shorten retry waits (tests).
     pub fn with_retry_base(mut self, d: std::time::Duration) -> Self { self.retry_base = d; self }
 
-    pub async fn search(&self, q: &str) -> Result<Vec<AniListHit>> {
+    pub async fn search(&self, q: &str) -> Result<Vec<MetadataHit>> {
         self.run(json!({"q": q})).await
     }
 
-    pub async fn by_id(&self, id: i64) -> Result<Option<AniListHit>> {
+    pub async fn by_id(&self, id: i64) -> Result<Option<MetadataHit>> {
         Ok(self.run(json!({"id": id})).await?.into_iter().next())
     }
 }
@@ -176,38 +178,16 @@ pub async fn download_cover(db: &Db, client: &reqwest::Client, show_id: i64, url
 
 /// Fetch any cover art that is known but not yet on disk. Failures are logged and skipped:
 /// the remote URL still works while online.
-pub async fn download_missing_covers(db: Arc<Db>, api: Arc<AniList>, notify: impl Fn(i64) + Send + 'static) {
+pub async fn download_missing_covers(db: Arc<Db>, client: reqwest::Client, notify: impl Fn(i64) + Send + 'static) {
     let pending = match db.shows_needing_cover() {
         Ok(p) => p,
         Err(_) => return,
     };
     for (show_id, url) in pending {
-        match download_cover(&db, api.client(), show_id, &url).await {
+        match download_cover(&db, &client, show_id, &url).await {
             Ok(_) => notify(show_id),
             Err(e) => eprintln!("cover {show_id}: {e}"),
         }
-    }
-}
-
-pub async fn auto_match_all(db: Arc<Db>, api: Arc<AniList>, notify: impl Fn(i64) + Send + 'static) {
-    let pending = match db.shows_needing_match() {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    for (show_id, title) in pending {
-        match api.search(&title).await {
-            Ok(hits) => {
-                // Applying a barely-related first hit renames files on disk under the wrong
-                // title, so an unconvincing match is left for the user to make by hand.
-                if let Some(hit) = best_match(&title, &hits)
-                    && db.set_anilist(show_id, hit).is_ok()
-                {
-                    notify(show_id);
-                }
-            }
-            Err(e) => eprintln!("anilist: {title}: {e}"),
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(700)).await; // stay under AniList's 90 req/min
     }
 }
 
@@ -246,24 +226,6 @@ mod tests {
         assert!(matches!(api.search("x").await, Err(crate::error::AppError::Network(_))));
     }
 
-    #[tokio::test]
-    async fn auto_match_all_sets_first_hit_and_skips_failures() {
-        use crate::parser::ParsedName;
-        use crate::scanner::RawFile;
-        let server = MockServer::start().await;
-        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(body())).mount(&server).await;
-        let db = Arc::new(Db::open_memory().unwrap());
-        let p = |t: &str| ParsedName { title: t.into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
-        let f = |p: &str| RawFile { path: p.into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
-        db.upsert_episode(&p("frieren"), &f("/a/1.mkv")).unwrap();
-        let matched = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let m = matched.clone();
-        auto_match_all(db.clone(), Arc::new(AniList::with_endpoint(server.uri())), move |id| m.lock().unwrap().push(id)).await;
-        assert_eq!(matched.lock().unwrap().len(), 1);
-        assert!(db.shows_needing_match().unwrap().is_empty());
-        assert_eq!(db.display_title(1).unwrap(), "Sousou no Frieren");
-    }
-
     #[test]
     fn similarity_rejects_unrelated_titles() {
         assert!(similarity("Sousou no Frieren", "Sousou no Frieren") > 0.99);
@@ -272,11 +234,11 @@ mod tests {
         assert!(similarity("Sekirei", "Sousou no Frieren") < MIN_AUTO_MATCH_SIMILARITY);
         assert!(similarity("Yuru Yuri", "Yuru Yuri San Hai!") >= MIN_AUTO_MATCH_SIMILARITY);
         let hits = vec![
-            AniListHit { id: 1, title_romaji: "Totally Unrelated Show".into(), title_english: None, cover_url: None, episodes: None },
+            MetadataHit { id: 1, source: "anilist".into(), title_romaji: "Totally Unrelated Show".into(), title_english: None, cover_url: None, episodes: None },
         ];
         assert!(best_match("Bagel Girl", &hits).is_none(), "a bad first hit must not be applied unattended");
         let hits = vec![
-            AniListHit { id: 2, title_romaji: "Sousou no Frieren".into(), title_english: Some("Frieren: Beyond Journey's End".into()), cover_url: None, episodes: None },
+            MetadataHit { id: 2, source: "anilist".into(), title_romaji: "Sousou no Frieren".into(), title_english: Some("Frieren: Beyond Journey's End".into()), cover_url: None, episodes: None },
         ];
         assert_eq!(best_match("Frieren", &hits).map(|h| h.id), Some(2), "the English title also counts");
     }
@@ -317,11 +279,11 @@ mod tests {
         db.upsert_episode(&p, &RawFile { path: "/a/1.mkv".into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] }).unwrap();
         let id = db.list_shows("").unwrap()[0].id;
         let url = format!("{}/cover.jpg", server.uri());
-        db.set_anilist(id, &AniListHit { id: 7, title_romaji: "Show".into(), title_english: None, cover_url: Some(url), episodes: None }).unwrap();
+        db.set_anilist(id, &MetadataHit { id: 7, source: "anilist".into(), title_romaji: "Show".into(), title_english: None, cover_url: Some(url), episodes: None }).unwrap();
 
         assert_eq!(db.shows_needing_cover().unwrap().len(), 1);
-        let api = Arc::new(AniList::with_endpoint(server.uri()));
-        download_missing_covers(db.clone(), api.clone(), |_| {}).await;
+        let client = reqwest::Client::new();
+        download_missing_covers(db.clone(), client.clone(), |_| {}).await;
 
         let show = db.get_show(id).unwrap();
         let local = show.cover_path.expect("cover path recorded");
@@ -330,7 +292,7 @@ mod tests {
         assert!(db.shows_needing_cover().unwrap().is_empty(), "no longer pending");
 
         // Second pass is a no-op; the mock asserts it was hit exactly once on drop.
-        download_missing_covers(db.clone(), api, |_| {}).await;
+        download_missing_covers(db.clone(), client, |_| {}).await;
 
         // Clearing the match drops the local art reference too.
         db.clear_anilist(id).unwrap();

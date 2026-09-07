@@ -63,6 +63,19 @@ scanner::scan_dir → per file: db.get_override() → parser::parse_with_confide
 
 **Frontend contract.** `src/lib/api.ts` is the only place that calls `invoke`; keep the TS interfaces in step with `models.rs`. Tauri maps camelCase JS args to snake_case Rust params automatically. Events (`scan-progress`, `library-changed`, `show-updated`, `playback-changed`, `llm-assist-progress`, `llm-assist`, `error`) are subscribed in `+layout.svelte` and the route components. Stores are Svelte 5 runes in `.svelte.ts` files.
 
+## Metadata providers
+
+`metadata::Providers` cross-searches AniList and Kitsu and merges the results; a provider that
+errors is skipped rather than failing the search. This is not hypothetical redundancy — AniList
+disabled its API outright in September 2026 (403, "temporarily disabled due to severe stability
+issues") and Jikan was returning 504 at the same time, while Kitsu stayed up. Kitsu needs no key.
+
+`shows.match_source` records which provider matched, and `anilist_id` holds *that provider's* id,
+so it is only an AniList id when `match_source = 'anilist'`. Auto-match is gated on
+`match_source IS NULL`, not `anilist_id IS NULL`, or a Kitsu-matched show would be re-searched on
+every scan. Ranking is the shared similarity threshold, so a strong Kitsu hit beats a weak
+AniList one rather than losing on provider order.
+
 ## Cover art
 
 AniList cover URLs are downloaded to `$XDG_DATA_HOME/anime-manager/covers/<show id>.<ext>`

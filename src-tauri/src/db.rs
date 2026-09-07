@@ -30,7 +30,10 @@ CREATE TABLE IF NOT EXISTS shows (
   user_title_override TEXT, created_at INTEGER NOT NULL,
   anilist_cleared INTEGER NOT NULL DEFAULT 0,
   -- local copy of cover_url once downloaded, so art survives going offline
-  cover_path TEXT);
+  cover_path TEXT,
+  -- which provider supplied the match: 'anilist' or 'kitsu'. anilist_id holds that
+  -- provider's id, so it is only an AniList id when match_source = 'anilist'.
+  match_source TEXT);
 CREATE TABLE IF NOT EXISTS seasons (
   id INTEGER PRIMARY KEY, show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
   number INTEGER NOT NULL, UNIQUE(show_id, number));
@@ -56,7 +59,7 @@ CREATE INDEX IF NOT EXISTS idx_episodes_season ON episodes(season_id);
 CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status);
 "#;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// Bring an existing database up to `SCHEMA_VERSION`. Fresh databases get the current shape
 /// from SCHEMA directly; older ones are altered in place so no user data is lost.
@@ -79,6 +82,11 @@ fn upgrade(conn: &Connection) -> Result<()> {
     }
     if !has("shows", "anilist_cleared")? {
         conn.execute_batch("ALTER TABLE shows ADD COLUMN anilist_cleared INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    if !has("shows", "match_source")? {
+        conn.execute_batch(
+            "ALTER TABLE shows ADD COLUMN match_source TEXT;
+             UPDATE shows SET match_source = 'anilist' WHERE anilist_id IS NOT NULL;")?;
     }
     if !has("shows", "cover_path")? {
         conn.execute_batch("ALTER TABLE shows ADD COLUMN cover_path TEXT;")?;
@@ -420,10 +428,11 @@ impl Db {
     }
 
     fn show_row(c: &Connection, id: i64) -> Result<ShowDetail> {
-        let sql = format!("SELECT id, parsed_title, {}, canonical_title, anilist_id, cover_url, total_episodes, user_title_override, cover_path FROM shows WHERE id=?1", display_title_sql());
+        let sql = format!("SELECT id, parsed_title, {}, canonical_title, anilist_id, cover_url, total_episodes, user_title_override, cover_path, match_source FROM shows WHERE id=?1", display_title_sql());
         let mut show = c.query_row(&sql, params![id], |r| Ok(ShowDetail {
             id: r.get(0)?, parsed_title: r.get(1)?, display_title: r.get(2)?, canonical_title: r.get(3)?, anilist_id: r.get(4)?,
-            cover_url: r.get(5)?, total_episodes: r.get(6)?, user_title_override: r.get(7)?, cover_path: r.get(8)?, seasons: vec![],
+            cover_url: r.get(5)?, total_episodes: r.get(6)?, user_title_override: r.get(7)?, cover_path: r.get(8)?,
+            match_source: r.get(9)?, seasons: vec![],
         }))?;
         let mut st = c.prepare("SELECT id, number FROM seasons WHERE show_id=?1 ORDER BY number")?;
         let seasons: Vec<(i64, u32)> = st.query_map(params![id], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u32)))?.collect::<std::result::Result<_, _>>()?;
@@ -471,9 +480,10 @@ impl Db {
         })
     }
 
-    pub fn set_anilist(&self, show_id: i64, hit: &AniListHit) -> Result<()> {
+    pub fn set_anilist(&self, show_id: i64, hit: &MetadataHit) -> Result<()> {
         self.with(|c| {
-            c.execute("UPDATE shows SET anilist_cleared = 0 WHERE id = ?1", params![show_id])?;
+            c.execute("UPDATE shows SET anilist_cleared = 0, match_source = ?2 WHERE id = ?1",
+                params![show_id, hit.source])?;
             c.execute("UPDATE shows SET anilist_id=?2, canonical_title=?3, cover_url=?4, total_episodes=?5 WHERE id=?1",
                 params![show_id, hit.id, hit.title_romaji, hit.cover_url, hit.episodes])?;
             Ok(())
@@ -483,7 +493,7 @@ impl Db {
     /// True once the user has explicitly cleared a match, so auto-match must not re-apply it.
     pub fn clear_anilist(&self, show_id: i64) -> Result<()> {
         self.with(|c| {
-            c.execute("UPDATE shows SET anilist_id=NULL, canonical_title=NULL, cover_url=NULL, cover_path=NULL, total_episodes=NULL, anilist_cleared=1 WHERE id=?1", params![show_id])?;
+            c.execute("UPDATE shows SET anilist_id=NULL, canonical_title=NULL, cover_url=NULL, cover_path=NULL, total_episodes=NULL, anilist_cleared=1, match_source=NULL WHERE id=?1", params![show_id])?;
             Ok(())
         })
     }
@@ -492,7 +502,7 @@ impl Db {
     /// offered again, otherwise the next scan would silently re-apply the same wrong guess.
     pub fn shows_needing_match(&self) -> Result<Vec<(i64, String)>> {
         self.with(|c| {
-            let mut st = c.prepare("SELECT id, parsed_title FROM shows WHERE anilist_id IS NULL AND anilist_cleared = 0 ORDER BY id")?;
+            let mut st = c.prepare("SELECT id, parsed_title FROM shows WHERE match_source IS NULL AND anilist_cleared = 0 ORDER BY id")?;
             Ok(st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?)
         })
     }
@@ -818,7 +828,7 @@ mod tests {
         db.upsert_episode(&pn("sousou no frieren", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
         let (id, title) = db.shows_needing_match().unwrap().remove(0);
         assert_eq!(title, "sousou no frieren");
-        let hit = AniListHit { id: 154587, title_romaji: "Sousou no Frieren".into(), title_english: Some("Frieren".into()), cover_url: Some("http://c".into()), episodes: Some(28) };
+        let hit = MetadataHit { id: 154587, source: "anilist".into(), title_romaji: "Sousou no Frieren".into(), title_english: Some("Frieren".into()), cover_url: Some("http://c".into()), episodes: Some(28) };
         db.set_anilist(id, &hit).unwrap();
         assert!(db.shows_needing_match().unwrap().is_empty());
         assert_eq!(db.display_title(id).unwrap(), "Sousou no Frieren");
@@ -990,7 +1000,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         db.upsert_episode(&pn("Yagate Kimi ni Naru", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
         let id = db.list_shows("").unwrap()[0].id;
-        db.set_anilist(id, &AniListHit { id: 1, title_romaji: "Yagate Kimi ni Naru".into(), title_english: None, cover_url: None, episodes: None }).unwrap();
+        db.set_anilist(id, &MetadataHit { id: 1, source: "anilist".into(), title_romaji: "Yagate Kimi ni Naru".into(), title_english: None, cover_url: None, episodes: None }).unwrap();
         db.set_title_override(id, Some("Bloom Into You")).unwrap();
         assert_eq!(db.display_title(id).unwrap(), "Bloom Into You");
         assert_eq!(db.list_shows("Bloom").unwrap().len(), 1);
@@ -1015,7 +1025,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         db.upsert_episode(&pn("Show", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
         let id = db.list_shows("").unwrap()[0].id;
-        let hit = AniListHit { id: 42, title_romaji: "Wrong".into(), title_english: None, cover_url: None, episodes: None };
+        let hit = MetadataHit { id: 42, source: "anilist".into(), title_romaji: "Wrong".into(), title_english: None, cover_url: None, episodes: None };
         db.set_anilist(id, &hit).unwrap();
         db.clear_anilist(id).unwrap();
         assert!(db.shows_needing_match().unwrap().is_empty(), "the user's decision to clear must stick");
