@@ -1,6 +1,6 @@
 [package]
 name = "anime-manager"
-version = "0.1.0"
+version = "0.2.0"
 description = "Scan an anime collection, play episodes in mpv and track what you have watched"
 authors = ["Joseph R. Quinn <quinn.josephr@gmail.com>"]
 license = "MIT"
