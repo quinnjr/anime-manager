@@ -51,6 +51,16 @@ pub fn run() {
     let db = Arc::new(db::Db::open(&db_path()).expect("open database"));
     db.reset_playing().expect("reset playing rows");
     tauri::Builder::default()
+        // Must be registered first. A second launch would otherwise open its own window over
+        // the same SQLite file, and two scan or match passes would race each other.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            use tauri::Manager;
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .manage(commands::AppState { db, player: Arc::new(player::Player::new()), providers: Arc::new(metadata::Providers::new()), matching: Arc::new(llm::AssistQueue::default()), assist: Arc::new(llm::AssistQueue::default()) })
         .invoke_handler(tauri::generate_handler![
@@ -59,8 +69,8 @@ pub fn run() {
             commands::get_settings, commands::set_setting, commands::purge_missing,
             commands::play, commands::search_metadata, commands::rematch,
             commands::preview_rename, commands::apply_rename, commands::undo_rename,
-            commands::inspect_show, commands::llm_test, commands::assist_progress, commands::clear_ai_decisions, commands::set_show_title,
-            commands::match_library, commands::match_progress,
+            commands::inspect_show, commands::llm_test, commands::llm_models, commands::assist_progress, commands::clear_ai_decisions, commands::set_show_title,
+            commands::match_library, commands::library_status, commands::merge_duplicates,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -134,7 +134,7 @@ pub fn parse_with_confidence(stem: &str, dirs: &[String]) -> Option<Parsed> {
         if CRC.is_match(inner) { crc.get_or_insert(inner.to_string()); continue; }
         let spaced = inner.replace('_', " ");
         if let Some(m) = RES.find(&spaced) { resolution.get_or_insert(m.as_str().to_string()); continue; }
-        if SPECIAL.is_match(&spaced) && SPECIAL.find(&spaced).map(|m| m.start() == 0).unwrap_or(false) {
+        if SPECIAL.find(&spaced).is_some_and(|m| m.start() == 0) {
             let n = SPECIAL_NUM.captures(&spaced).and_then(|c| c[1].parse().ok());
             bracket_special.get_or_insert(n);
             continue;
@@ -162,55 +162,30 @@ pub fn parse_with_confidence(stem: &str, dirs: &[String]) -> Option<Parsed> {
     // A 4-digit number in the 1900-2099 range is a release year in every branch, not an episode.
     let ep_ok = |c: &regex::Captures, i: usize| c[i].parse::<u32>().ok().and_then(not_year).is_some();
 
-    if let Some(c) = SXXEXX.captures(&work).filter(|c| ep_ok(c, 2)) {
-        season = Some(c[1].parse().ok()?);
-        episode = Some(c[2].parse().ok()?);
+    // Ordered, first match wins. What separated the branches was always data, not logic: which
+    // group holds a season, whether the year filter applies (a special's number is never a year),
+    // whether the marker leads the name rather than ending the title, and whether the guess is
+    // weak enough to send the folder to the LLM assist.
+    let markers: [(&Lazy<Regex>, Option<usize>, usize, bool, bool, bool); 9] = [
+        (&SXXEXX,       Some(1), 2, true,  false, false),
+        (&NXNN,         Some(1), 2, true,  false, false),
+        (&JP_EP,        None,    1, true,  false, false),
+        (&DASH_EP,      None,    1, true,  false, false),
+        (&EP_PREFIX,    None,    1, true,  false, false),
+        (&SPECIAL_NUM,  None,    1, false, false, false),
+        (&TRAILING_NUM, None,    1, true,  false, false),
+        (&LEADING_NUM,  None,    1, true,  true,  true),
+        (&MID_NUM,      None,    1, true,  false, true),
+    ];
+    for (re, season_group, ep_group, year_filter, marker_leads, weak) in markers {
+        let Some(c) = re.captures(&work).filter(|c| !year_filter || ep_ok(c, ep_group)) else { continue };
+        if let Some(i) = season_group { season = Some(c[i].parse().ok()?); }
+        episode = Some(c[ep_group].parse().ok()?);
         let m = c.get(0).unwrap();
-        title_end = m.start();
+        title_end = if marker_leads { 0 } else { m.start() };
         marker = Some((m.start(), m.end()));
-    } else if let Some(c) = NXNN.captures(&work).filter(|c| ep_ok(c, 2)) {
-        season = Some(c[1].parse().ok()?);
-        episode = Some(c[2].parse().ok()?);
-        let m = c.get(0).unwrap();
-        title_end = m.start();
-        marker = Some((m.start(), m.end()));
-    } else if let Some(c) = JP_EP.captures(&work).filter(|c| ep_ok(c, 1)) {
-        episode = Some(c[1].parse().ok()?);
-        let m = c.get(0).unwrap();
-        title_end = m.start();
-        marker = Some((m.start(), m.end()));
-    } else if let Some(c) = DASH_EP.captures(&work).filter(|c| ep_ok(c, 1)) {
-        episode = Some(c[1].parse().ok()?);
-        let m = c.get(0).unwrap();
-        title_end = m.start();
-        marker = Some((m.start(), m.end()));
-    } else if let Some(c) = EP_PREFIX.captures(&work).filter(|c| ep_ok(c, 1)) {
-        episode = Some(c[1].parse().ok()?);
-        let m = c.get(0).unwrap();
-        title_end = m.start();
-        marker = Some((m.start(), m.end()));
-    } else if let Some(c) = SPECIAL_NUM.captures(&work) {
-        episode = Some(c[1].parse().ok()?);
-        let m = c.get(0).unwrap();
-        title_end = m.start();
-        marker = Some((m.start(), m.end()));
-    } else if let Some(c) = TRAILING_NUM.captures(&work).filter(|c| ep_ok(c, 1)) {
-        episode = Some(c[1].parse().ok()?);
-        let m = c.get(0).unwrap();
-        title_end = m.start();
-        marker = Some((m.start(), m.end()));
-    } else if let Some(c) = LEADING_NUM.captures(&work).filter(|c| ep_ok(c, 1)) {
-        episode = Some(c[1].parse().ok()?);
-        let m = c.get(0).unwrap();
-        title_end = 0;
-        marker = Some((m.start(), m.end()));
-        low_confidence = true;
-    } else if let Some(c) = MID_NUM.captures(&work).filter(|c| ep_ok(c, 1)) {
-        episode = Some(c[1].parse().ok()?);
-        let m = c.get(0).unwrap();
-        title_end = m.start();
-        marker = Some((m.start(), m.end()));
-        low_confidence = true;
+        low_confidence |= weak;
+        break;
     }
 
     // Where a special keyword is allowed to count: the marker itself plus anything glued to it

@@ -3,7 +3,7 @@
 Scan folders of anime, group them by show and season, play in mpv, and track what you've watched. Interrupted playback (closing mpv before 90%) reverts the episode to unplayed and remembers the position.
 
 ## AI folder assist (optional)
-Settings → AI folder assist takes an [OpenCode Zen](https://opencode.ai/auth) API key. Zen's free models (default `big-pickle`) are then consulted for folders the filename parser is unsure about during a scan, and on demand via **Inspect with AI** on any show. Decisions are stored as per-file overrides that survive rescans; nothing on disk is touched.
+Settings takes an API key for any OpenAI-compatible provider. Presets are offered for ones with a free tier — OpenRouter, Hugging Face, Groq, Google Gemini, Cerebras — and the model list is fetched from the provider itself, since free model ids rotate. A model is then consulted for folders the filename parser is unsure about during a scan, and on demand via **Inspect with AI** on any show. Decisions are stored as per-file overrides that survive rescans; nothing on disk is touched.
 
 ## Requirements
 - Linux, mpv on `$PATH` (or set the path in Settings)
@@ -37,3 +37,6 @@ with `git flow feature start <name>`; `main` only receives release and hotfix me
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+Bundled third-party material — the application icon and the self-hosted typefaces — carries its
+own licences. See [NOTICE](NOTICE).

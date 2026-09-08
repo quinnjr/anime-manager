@@ -122,14 +122,14 @@ keyword (`NCED - 03`) is treated as a marker and replaced from the parent direct
 
 Tests: table-driven, at least 40 real-world filenames, exact struct equality.
 
-## LLM folder assist (OpenCode Zen)
+## LLM folder assist
 
 An optional, free LLM second opinion for folders the regex parser is unsure about.
 
-Provider: OpenCode Zen, OpenAI-compatible `POST {base_url}/chat/completions`,
+Provider: any OpenAI-compatible `POST {base_url}/chat/completions`,
 `Authorization: Bearer <key>`. Settings keys: `llm_api_key` (empty = disabled),
-`llm_model` (default `big-pickle`), `llm_base_url` (default
-`https://opencode.ai/zen/v1`), `llm_assist_on_scan` (`true`/`false`, default `true`), `llm_delay_ms` (default `500`).
+`llm_model` (no default; ids rotate, so Settings lists them from the provider), `llm_base_url`
+(default `https://openrouter.ai/api/v1`), `llm_assist_on_scan` (`true`/`false`, default `true`), `llm_delay_ms` (default `500`).
 
 Low-confidence parse = any of: title taken from an ancestor directory; stem had a
 title but no episode marker (movie/one-shot); episode came from the leading- or

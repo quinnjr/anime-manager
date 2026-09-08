@@ -6,14 +6,14 @@
   import { toasts } from '$lib/stores/toasts.svelte';
   import { playback } from '$lib/stores/playback.svelte';
   import { isTypingTarget } from '$lib/keys';
-  import EpisodeRow from '$lib/components/EpisodeRow.svelte';
   import RematchModal from '$lib/components/RematchModal.svelte';
   import RenameModal from '$lib/components/RenameModal.svelte';
   import Cover from '$lib/components/Cover.svelte';
+  import { flatten } from '$lib/episodes';
+  import SeasonList from '$lib/components/SeasonList.svelte';
 
   const id = $derived(Number(page.params.id));
   let show = $state<ShowDetail | null>(null);
-  let seasonIdx = $state(0);
   let highlight = $state(0);
   let rematchOpen = $state(false);
   let renameOpen = $state(false);
@@ -22,7 +22,10 @@
   let editingTitle = $state(false);
   let titleDraft = $state('');
 
-  const season = $derived(show?.seasons[seasonIdx] ?? null);
+  // Every season is on the page at once, so the show reads as a whole rather than one tab at a
+  // time. `rows` is that same order flattened, which is what the arrow keys walk.
+  const seasons = $derived(show?.seasons ?? []);
+  const rows = $derived(flatten(seasons));
 
   // A background assist run can merge this show into another and delete it while the page is
   // open; reloading it then errors forever and the page sticks on "Loading…".
@@ -36,8 +39,7 @@
       show = next;
       // Believe the database again rather than statuses cached earlier in the session.
       playback.clearStatuses();
-      if (seasonIdx >= show.seasons.length) seasonIdx = 0;
-      const len = show.seasons[seasonIdx]?.episodes.length ?? 0;
+      const len = flatten(show.seasons).length;
       if (highlight >= len) highlight = Math.max(0, len - 1);
     } catch (e) {
       if (mine !== generation) return;
@@ -67,19 +69,24 @@
     try {
       const r = await api.inspectShow(show.id);
       const summary = r.changes.length
-        ? `AI inspected ${r.folders} folder(s): ${r.changes.length} file(s) re-homed, ${r.ignored} ignored`
-        : `AI inspected ${r.folders} folder(s): parser was already right`;
+        ? `Refiled ${r.changes.length} file${r.changes.length === 1 ? '' : 's'}${r.ignored ? `, ignored ${r.ignored}` : ''}`
+        : 'The season breakdown was already right';
       toasts.push('success', summary);
       for (const n of r.notes.slice(0, 3)) toasts.push('info', n);
       if (r.show_id != null && r.show_id !== show.id) await goto(`/show/${r.show_id}`);
       else if (r.show_id == null) await goto('/');
       else await load();
-    } catch (e) { toasts.error(e); } finally { inspecting = false; }
+    } catch (e) {
+      // The apply loop is not atomic, so a failure part-way through leaves some files already
+      // refiled. Reload rather than leave the old breakdown on screen, or the next Play or
+      // Rename click acts on ids that have moved. `load()` handles the show having been deleted.
+      toasts.error(e);
+      await load();
+    } finally { inspecting = false; }
   }
 
   $effect(() => {
     id; // track
-    seasonIdx = 0;
     highlight = 0;
     load();
   });
@@ -88,10 +95,13 @@
     const us = [onEvent('show-updated', load), onEvent('library-changed', load), onEvent('playback-changed', load)];
     const key = (e: KeyboardEvent) => {
       // Settings lives in the layout, so a local open-flag cannot see it; ask the event target.
-      if (!season || rematchOpen || renameOpen || isTypingTarget(e.target)) return;
-      if (e.key === 'ArrowDown') { e.preventDefault(); highlight = Math.min(highlight + 1, season.episodes.length - 1); }
+      if (rows.length === 0 || rematchOpen || renameOpen || isTypingTarget(e.target)) return;
+      if (e.key === 'ArrowDown') { e.preventDefault(); highlight = Math.min(highlight + 1, rows.length - 1); }
       if (e.key === 'ArrowUp') { e.preventDefault(); highlight = Math.max(highlight - 1, 0); }
-      if (e.key === 'Enter') { const ep = season.episodes[highlight]; if (ep && ep.status !== 'missing') api.play(ep.id).catch((e) => toasts.error(e)); }
+      if (e.key === 'Enter') {
+        const ep = rows[highlight]?.group.primary;
+        if (ep && ep.status !== 'missing') api.play(ep.id).catch((err) => toasts.error(err));
+      }
     };
     window.addEventListener('keydown', key);
     return () => { window.removeEventListener('keydown', key); us.forEach((p) => p.then((u) => u())); };
@@ -135,8 +145,10 @@
         <div class="mt-4 flex flex-wrap gap-2">
           <button class="btn" onclick={() => (rematchOpen = true)}>Re-match</button>
           <button class="btn" onclick={() => openRename({ type: 'show', id: show!.id })}>Rename files</button>
-          <button class="btn" disabled={inspecting} title="Ask the configured model to check this show's folders" onclick={inspect}>
-            {inspecting ? 'Inspecting' : 'Inspect with AI'}
+          <button class="btn" disabled={inspecting}
+            title="Ask the configured model to check every season and episode number in this show"
+            onclick={inspect}>
+            {inspecting ? 'Checking…' : 'Check seasons with AI'}
           </button>
           <button class="btn" title="Use your own title for this show"
             onclick={() => { titleDraft = show!.user_title_override ?? show!.display_title; editingTitle = true; }}>Retitle</button>
@@ -145,26 +157,8 @@
     </div>
   </section>
 
-  <div class="mb-4 flex flex-wrap items-center gap-x-5 gap-y-1 border-b border-edge">
-    {#each show.seasons as s, i (s.id)}
-      <button
-        class="-mb-px border-b-2 pb-2 text-[0.8125rem] font-semibold transition
-               {i === seasonIdx ? 'border-sub text-paper' : 'border-transparent text-muted hover:text-paper'}"
-        onclick={() => { seasonIdx = i; highlight = 0; }}
-      >
-        {s.number === 0 ? 'Specials' : `Season ${s.number}`}
-        <span class="tag ml-1.5 tabular-nums">{s.episodes.length}</span>
-      </button>
-    {/each}
-  </div>
-
-  {#if season}
-    <div class="border border-edge">
-      {#each season.episodes as ep, i (ep.id)}
-        <EpisodeRow episode={ep} highlighted={i === highlight} onRename={() => openRename({ type: 'episode', id: ep.id })} />
-      {/each}
-    </div>
-  {/if}
+  <SeasonList {seasons} highlightedId={rows[highlight]?.group.primary.id ?? null}
+    onRename={(episodeId) => openRename({ type: 'episode', id: episodeId })} />
 
   <RematchModal showId={show.id} initialQuery={show.parsed_title} bind:open={rematchOpen} onDone={load} />
   <RenameModal target={renameTarget} bind:open={renameOpen} onDone={load} />

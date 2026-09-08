@@ -69,10 +69,21 @@ pub struct Episode {
     pub last_played_at: Option<i64>,
 }
 
+/// The four values `parse_overrides.kind` and an LLM file decision may carry. They are a stored
+/// protocol - the CHECK constraint on `parse_overrides` rejects anything else - so they are named
+/// once here rather than spelled as literals at each of the dozen places that compare them.
+pub const KIND_EPISODE: &str = "episode";
+pub const KIND_SPECIAL: &str = "special";
+pub const KIND_MOVIE: &str = "movie";
+pub const KIND_IGNORE: &str = "ignore";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SeasonDetail {
     pub id: i64,
     pub number: u32,
+    /// The name this season was broadcast under when it differs from the show's own, so a
+    /// sequel titled "Non Non Biyori Repeat" reads as season 2 without losing what it is called.
+    pub title: Option<String>,
     pub episodes: Vec<Episode>,
 }
 
@@ -101,6 +112,58 @@ pub struct ShowCard {
     pub cover_path: Option<String>,
     pub episode_count: i64,
     pub unwatched_count: i64,
+}
+
+/// How the library grid is ordered. Every option answers a question someone actually asks of a
+/// shelf this size, rather than exposing every column the table happens to have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShowSort {
+    /// Alphabetical — the way you look something up when you already know what you want.
+    #[default]
+    Title,
+    /// Most unwatched episodes first: what is waiting for you.
+    Unwatched,
+    /// Most recently played first: what you are part-way through.
+    LastPlayed,
+    /// Most recently added to the library first.
+    RecentlyAdded,
+    /// Newest file on disk first: what the downloader brought in.
+    RecentlyUpdated,
+}
+
+impl ShowSort {
+    /// The ORDER BY body for this option. Every option falls back to title so the grid never
+    /// reshuffles arbitrarily between two shows that tie.
+    pub(crate) fn order_by(self, dt: &str) -> String {
+        let episodes_of = "FROM episodes e JOIN seasons se ON e.season_id = se.id WHERE se.show_id = s.id";
+        match self {
+            Self::Title => format!("{dt} COLLATE NOCASE ASC"),
+            Self::Unwatched => format!(
+                "(SELECT COUNT(*) {episodes_of} AND e.status IN ('unplayed','playing')) DESC, {dt} COLLATE NOCASE ASC"),
+            // NULL sorts lowest in SQLite, so never-played shows land at the end under DESC.
+            Self::LastPlayed => format!(
+                "(SELECT MAX(e.last_played_at) {episodes_of}) DESC, {dt} COLLATE NOCASE ASC"),
+            Self::RecentlyAdded => format!("s.created_at DESC, {dt} COLLATE NOCASE ASC"),
+            Self::RecentlyUpdated => format!("(SELECT MAX(e.mtime) {episodes_of}) DESC, {dt} COLLATE NOCASE ASC"),
+        }
+    }
+}
+
+/// What the library currently holds, so the settings page can say what work is outstanding
+/// instead of offering an unlabelled button.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct LibraryStatus {
+    pub roots: i64,
+    pub shows: i64,
+    pub episodes: i64,
+    pub missing_episodes: i64,
+    /// Shows no provider has matched, which therefore have no artwork to fetch.
+    pub unmatched: i64,
+    /// Matched shows whose cover art is not on disk.
+    pub missing_art: i64,
+    /// Show rows that duplicate another row already matched to the same series.
+    pub duplicates: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

@@ -1,0 +1,22 @@
+Third-party material bundled with this project
+==============================================
+
+Application icon
+----------------
+Derived from "Hatsune Miku" by shadok
+  https://commons.wikimedia.org/wiki/File:Hatsune_Miku.svg
+Licensed under Creative Commons Attribution 3.0 Unported (CC BY 3.0)
+  https://creativecommons.org/licenses/by/3.0/
+Changes: cropped to the head and recomposed on a solid background.
+
+The icon files under src-tauri/icons/ are covered by CC BY 3.0, not the MIT
+licence that covers the rest of this repository.
+
+Hatsune Miku is a character owned by Crypton Future Media, Inc. This project is
+unaffiliated with and unendorsed by Crypton, and is non-commercial.
+
+Typefaces
+---------
+static/fonts/archivo.woff2      Archivo, SIL Open Font License 1.1
+static/fonts/publicsans.woff2   Public Sans, SIL Open Font License 1.1
+static/fonts/plexmono-*.woff2   IBM Plex Mono, SIL Open Font License 1.1

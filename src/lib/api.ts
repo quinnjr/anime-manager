@@ -10,16 +10,49 @@ export interface Episode {
   release_group: string | null; resolution: string | null; crc: string | null;
   status: EpisodeStatus; position_secs: number; duration_secs: number | null; last_played_at: number | null;
 }
-export interface SeasonDetail { id: number; number: number; episodes: Episode[] }
+export interface SeasonDetail { id: number; number: number; title: string | null; episodes: Episode[] }
 export interface ShowDetail {
   id: number; parsed_title: string; display_title: string; canonical_title: string | null;
   anilist_id: number | null; match_source: MetadataSource | null;
   cover_url: string | null; cover_path: string | null; total_episodes: number | null;
   user_title_override: string | null; seasons: SeasonDetail[];
 }
+export type ShowSort = 'title' | 'unwatched' | 'last-played' | 'recently-added' | 'recently-updated';
+
+/** Label for each ordering, phrased as what the reader gets rather than which column it uses. */
+export const SHOW_SORTS: { value: ShowSort; label: string }[] = [
+  { value: 'title', label: 'Title' },
+  { value: 'unwatched', label: 'Most unwatched' },
+  { value: 'last-played', label: 'Recently played' },
+  { value: 'recently-added', label: 'Recently added' },
+  { value: 'recently-updated', label: 'Newest files' }
+];
+
 export interface ShowCard { id: number; display_title: string; cover_url: string | null; cover_path: string | null; episode_count: number; unwatched_count: number }
 export interface ScanSummary { files_seen: number; episodes_added: number; episodes_updated: number; episodes_missing: number; errors: string[]; low_confidence_folders: string[] }
 export interface InspectChange { path: string; from: string; to: string }
+export interface LibraryStatus {
+  roots: number; shows: number; episodes: number; missing_episodes: number;
+  unmatched: number; missing_art: number; duplicates: number;
+}
+
+/** OpenAI-compatible routers with a free tier. The client only needs a base URL and a key, so
+ *  these are presets rather than integrations; the model list comes from the provider itself. */
+export interface LlmProvider { id: string; label: string; baseUrl: string; keyUrl: string; note: string }
+export const LLM_PROVIDERS: LlmProvider[] = [
+  { id: 'openrouter', label: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1',
+    keyUrl: 'https://openrouter.ai/keys', note: 'Model ids ending in :free cost nothing.' },
+  { id: 'huggingface', label: 'Hugging Face', baseUrl: 'https://router.huggingface.co/v1',
+    keyUrl: 'https://huggingface.co/settings/tokens', note: 'Monthly free credits on a signed-in account.' },
+  { id: 'groq', label: 'Groq', baseUrl: 'https://api.groq.com/openai/v1',
+    keyUrl: 'https://console.groq.com/keys', note: 'Free tier with per-minute limits.' },
+  { id: 'gemini', label: 'Google Gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    keyUrl: 'https://aistudio.google.com/apikey', note: 'Free tier through AI Studio.' },
+  { id: 'cerebras', label: 'Cerebras', baseUrl: 'https://api.cerebras.ai/v1',
+    keyUrl: 'https://cloud.cerebras.ai', note: 'Free tier with daily limits.' },
+  { id: 'custom', label: 'Something else', baseUrl: '', keyUrl: '', note: 'Any OpenAI-compatible endpoint.' }
+];
+
 export interface MatchProgress { done: number; total: number; title: string; phase: string; changed: number | null; running: boolean }
 export interface AssistProgress { done: number; total: number; folder: string; running: boolean }
 export interface InspectReport { folders: number; ignored: number; changes: InspectChange[]; notes: string[]; show_id: number | null }
@@ -41,7 +74,7 @@ export const api = {
   removeRoot: (id: number) => invoke<void>('remove_root', { id }),
   listRoots: () => invoke<Root[]>('list_roots'),
   scan: () => invoke<ScanSummary>('scan'),
-  listShows: (filter = '') => invoke<ShowCard[]>('list_shows', { filter }),
+  listShows: (filter = '', sort: ShowSort = 'title') => invoke<ShowCard[]>('list_shows', { filter, sort }),
   getShow: (id: number) => invoke<ShowDetail>('get_show', { id }),
   play: (episodeId: number) => invoke<void>('play', { episodeId }),
   setStatus: (episodeId: number, status: EpisodeStatus) => invoke<void>('set_status', { episodeId, status }),
@@ -56,10 +89,12 @@ export const api = {
   purgeMissing: () => invoke<number>('purge_missing'),
   inspectShow: (showId: number) => invoke<InspectReport>('inspect_show', { showId }),
   llmTest: () => invoke<string>('llm_test'),
+  llmModels: () => invoke<string[]>('llm_models'),
+  libraryStatus: () => invoke<LibraryStatus>('library_status'),
+  mergeDuplicates: () => invoke<number>('merge_duplicates'),
   assistProgress: () => invoke<AssistProgress>('assist_progress'),
   clearAiDecisions: () => invoke<number>('clear_ai_decisions'),
   matchLibrary: () => invoke<number>('match_library'),
-  matchRunning: () => invoke<boolean>('match_progress'),
   setShowTitle: (showId: number, title: string | null) => invoke<ShowDetail>('set_show_title', { showId, title })
 };
 

@@ -41,7 +41,7 @@ pub async fn scan(app: AppHandle, state: State<'_, AppState>) -> Result<ScanSumm
     // let a single background worker drain the queue (a running worker picks up new entries).
     let assist_on = state.db.get_setting("llm_assist_on_scan")?.map(|v| v != "false").unwrap_or(true);
     if assist_on && let Ok(l) = Llm::from_db(&state.db) && l.configured()
-        && !(summary.low_confidence_folders.is_empty() && !state.assist.has_pending()) {
+        && (!summary.low_confidence_folders.is_empty() || state.assist.has_pending()) {
         state.assist.enqueue(summary.low_confidence_folders.iter().cloned());
         if state.assist.has_pending() && !state.assist.is_running() {
             let db_l = state.db.clone();
@@ -53,7 +53,7 @@ pub async fn scan(app: AppHandle, state: State<'_, AppState>) -> Result<ScanSumm
             tauri::async_runtime::spawn(async move {
                 let Some(_guard) = queue.try_start() else { return };
                 let app_p = app_l.clone();
-                let report = queue.run(db_l, Arc::new(l), "llm", &move |p| {
+                let report = queue.run(db_l, Arc::new(l), &move |p| {
                     let _ = app_p.emit("llm-assist-progress", &p);
                     let _ = app_p.emit("library-changed", ());
                 }).await;
@@ -103,12 +103,23 @@ pub fn match_library(app: AppHandle, state: State<'_, AppState>) -> Result<usize
     Ok(pending)
 }
 
+/// Fold show rows that point at the same series. Runs automatically after matching; exposed so
+/// it can be run on its own from Settings.
 #[tauri::command]
-pub fn match_progress(state: State<'_, AppState>) -> Result<bool> { Ok(state.matching.is_running()) }
+pub fn merge_duplicates(app: AppHandle, state: State<'_, AppState>) -> Result<usize> {
+    let n = state.db.merge_duplicate_shows()?;
+    if n > 0 && let Err(e) = app.emit("library-changed", ()) {
+        eprintln!("merge finished but the library-changed event did not reach the window: {e}");
+    }
+    Ok(n)
+}
 
 #[tauri::command]
-pub fn list_shows(state: State<'_, AppState>, filter: Option<String>) -> Result<Vec<ShowCard>> {
-    state.db.list_shows(filter.as_deref().unwrap_or(""))
+pub fn library_status(state: State<'_, AppState>) -> Result<LibraryStatus> { state.db.library_status() }
+
+#[tauri::command]
+pub fn list_shows(state: State<'_, AppState>, filter: Option<String>, sort: Option<ShowSort>) -> Result<Vec<ShowCard>> {
+    state.db.list_shows(filter.as_deref().unwrap_or(""), sort.unwrap_or_default())
 }
 
 #[tauri::command]
@@ -227,6 +238,12 @@ pub async fn inspect_show(app: AppHandle, state: State<'_, AppState>, show_id: i
     Ok(report)
 }
 
+/// Model ids offered by whatever provider is configured right now.
+#[tauri::command]
+pub async fn llm_models(state: State<'_, AppState>) -> Result<Vec<String>> {
+    Llm::from_db(&state.db)?.models().await
+}
+
 #[tauri::command]
 pub async fn llm_test(state: State<'_, AppState>) -> Result<String> {
     Llm::from_db(&state.db)?.test().await
@@ -237,7 +254,7 @@ pub fn assist_progress(state: State<'_, AppState>) -> Result<AssistProgress> { O
 
 #[tauri::command]
 pub fn clear_ai_decisions(app: AppHandle, state: State<'_, AppState>) -> Result<usize> {
-    let n = state.db.clear_overrides(Some("llm"))?;
+    let n = state.db.clear_overrides(llm::OVERRIDE_SOURCE)?;
     let _ = app.emit("library-changed", ());
     Ok(n)
 }

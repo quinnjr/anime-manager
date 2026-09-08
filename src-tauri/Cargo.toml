@@ -1,6 +1,6 @@
 [package]
 name = "anime-manager"
-version = "0.2.0"
+version = "0.3.0"
 description = "Scan an anime collection, play episodes in mpv and track what you have watched"
 authors = ["Joseph R. Quinn <quinn.josephr@gmail.com>"]
 license = "MIT"
@@ -21,6 +21,7 @@ tauri-build = { version = "2.6.3", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }

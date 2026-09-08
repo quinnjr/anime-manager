@@ -169,7 +169,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         let e1 = seed(&db, dir.path(), "Show", 1, "[G] Show - 01.mkv");
         let _e2 = seed(&db, dir.path(), "Show", 2, "[G] Show - 02.mkv");
-        let show_id = db.list_shows("").unwrap()[0].id;
+        let show_id = db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].id;
 
         let plan = preview(&db, RenameTarget::Show(show_id)).unwrap();
         assert_eq!(plan.entries.len(), 2);
@@ -208,7 +208,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_memory().unwrap();
         let _ = seed(&db, dir.path(), "Show", 1, "Show - S01E01.mkv");
-        let show_id = db.list_shows("").unwrap()[0].id;
+        let show_id = db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].id;
         assert!(preview(&db, RenameTarget::Show(show_id)).unwrap().entries.is_empty());
     }
 
@@ -218,7 +218,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         let e1 = seed(&db, dir.path(), "Show", 1, "[G] Show - 01.mkv");
         let e2 = seed(&db, dir.path(), "Show", 2, "[G] Show - 02.mkv");
-        let show_id = db.list_shows("").unwrap()[0].id;
+        let show_id = db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].id;
         apply(&db, preview(&db, RenameTarget::Show(show_id)).unwrap()).unwrap();
         // user moves one renamed file away before undo
         fs::rename(dir.path().join("Show - S01E02.mkv"), dir.path().join("elsewhere.mkv")).unwrap();
@@ -246,7 +246,7 @@ mod tests {
         let mtime = fs::metadata(&path).unwrap().modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
         let p = ParsedName { title: "Show".into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
         db.upsert_episode(&p, &RawFile { path: path.clone(), size: 3, mtime, stem: "".into(), dirs: vec![] }).unwrap();
-        let show_id = db.list_shows("").unwrap()[0].id;
+        let show_id = db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].id;
         let plan = preview(&db, RenameTarget::Show(show_id)).unwrap();
         assert_eq!(plan.entries.len(), 2);
         assert!(plan.entries[0].conflict.is_none());
@@ -258,7 +258,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_memory().unwrap();
         seed(&db, dir.path(), "Show", 1, "[G] Show - 01.mkv");
-        let show_id = db.list_shows("").unwrap()[0].id;
+        let show_id = db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].id;
         let plan = preview(&db, RenameTarget::Show(show_id)).unwrap();
         assert_eq!(apply(&db, plan).unwrap().renamed, 1);
         // A v2 re-download lands back on the original name.
@@ -276,10 +276,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_memory().unwrap();
         seed(&db, dir.path(), "Alpha", 1, "[G] Alpha - 01.mkv");
-        let alpha = db.list_shows("Alpha").unwrap()[0].id;
+        let alpha = db.list_shows("Alpha", crate::models::ShowSort::Title).unwrap()[0].id;
         apply(&db, preview(&db, RenameTarget::Show(alpha)).unwrap()).unwrap();
         seed(&db, dir.path(), "Beta", 1, "[G] Beta - 01.mkv");
-        let beta = db.list_shows("Beta").unwrap()[0].id;
+        let beta = db.list_shows("Beta", crate::models::ShowSort::Title).unwrap()[0].id;
         apply(&db, preview(&db, RenameTarget::Show(beta)).unwrap()).unwrap();
         // Beta's renamed file is deleted outright.
         fs::remove_file(dir.path().join("Beta - S01E01.mkv")).unwrap();
@@ -297,13 +297,13 @@ mod tests {
         db.add_root(dir.path().to_str().unwrap()).unwrap();
         seed(&db, dir.path(), "Frieren", 1, "[G] Frieren - 01.mkv");
         seed(&db, dir.path(), "Frieren", 2, "[G] Frieren - 02.mkv");
-        let id = db.list_shows("").unwrap()[0].id;
+        let id = db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].id;
         let hit = MetadataHit { id: 154587, source: "anilist".into(), title_romaji: "Sousou no Frieren".into(), title_english: None,
             cover_url: Some("https://img/x.jpg".into()), episodes: Some(28) };
         db.set_anilist(id, &hit).unwrap();
         assert_eq!(apply(&db, preview(&db, RenameTarget::Show(id)).unwrap()).unwrap().renamed, 2);
         crate::db::run_scan(&db, &mut |_| {}).unwrap();
-        let shows = db.list_shows("").unwrap();
+        let shows = db.list_shows("", crate::models::ShowSort::Title).unwrap();
         assert_eq!(shows.len(), 1, "renaming must not split the show in two: {:?}",
             shows.iter().map(|s| s.display_title.clone()).collect::<Vec<_>>());
         assert_eq!(shows[0].display_title, "Sousou no Frieren");
@@ -318,7 +318,7 @@ mod tests {
         seed(&db, dir.path(), "Show", 1, "[G] Show - 01.mkv");
         let old = dir.path().join("[G] Show - 01.mkv").to_string_lossy().to_string();
         let new = dir.path().join("Show - S01E01.mkv").to_string_lossy().to_string();
-        let id = db.list_shows("").unwrap()[0].id;
+        let id = db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].id;
         apply(&db, preview(&db, RenameTarget::Show(id)).unwrap()).unwrap();
         assert!(db.get_override(&new).unwrap().is_some(), "the override follows the file");
         assert!(db.get_override(&old).unwrap().is_none(), "and does not linger on the old path");
