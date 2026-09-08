@@ -51,6 +51,16 @@ pub fn run() {
     let db = Arc::new(db::Db::open(&db_path()).expect("open database"));
     db.reset_playing().expect("reset playing rows");
     tauri::Builder::default()
+        // Must be registered first. A second launch would otherwise open its own window over
+        // the same SQLite file, and two scan or match passes would race each other.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            use tauri::Manager;
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .manage(commands::AppState { db, player: Arc::new(player::Player::new()), providers: Arc::new(metadata::Providers::new()), matching: Arc::new(llm::AssistQueue::default()), assist: Arc::new(llm::AssistQueue::default()) })
         .invoke_handler(tauri::generate_handler![

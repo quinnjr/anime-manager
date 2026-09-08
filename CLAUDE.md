@@ -122,6 +122,15 @@ is a sequence, so numbering would decorate rather than inform.
 
 ## Platform quirks
 
+WebKitGTK draws native widgets for form controls: a `<select>` honours `color` but ignores
+`background`, so paper-white text landed on the platform's near-white control and vanished.
+`select.field` in `app.css` sets `appearance: none` and draws its own chevron. Any new native
+control needs the same check — verify it on screen, not in a browser.
+
+Only one instance may run: `tauri_plugin_single_instance` is registered first in `lib::run`, so a
+second launch focuses the existing window and exits rather than opening a rival onto the same
+SQLite file, where two scan or match passes would race.
+
 `lib::apply_dmabuf_workaround` sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` when running under
 Wayland on the proprietary NVIDIA driver, before GTK initialises. Without it WebKitGTK fails
 to allocate GBM buffers, issues an invalid Wayland request, and the compositor drops the client
