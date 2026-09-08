@@ -1038,10 +1038,18 @@ mod tests {
         // Alpha was created first; make its ordering by created_at unambiguous.
         db.with(|c| { c.execute("UPDATE shows SET created_at = CASE parsed_title WHEN 'Alpha' THEN 10 WHEN 'Mid' THEN 20 ELSE 30 END", [])?; Ok(()) }).unwrap();
 
+        // Resolve the episode ids BEFORE taking the connection: Db::with holds a plain
+        // std::sync::Mutex, which is not reentrant, so calling get_show from inside the
+        // closure deadlocks against the lock the closure is already holding.
         let ep_of = |show: i64| db.get_show(show).unwrap().seasons[0].episodes[0].id;
-        db.set_status(ep_of(mid), EpisodeStatus::Played).unwrap();
-        db.with(|c| { c.execute("UPDATE episodes SET last_played_at = 500 WHERE id = ?1", params![ep_of(mid)])?; Ok(()) }).unwrap();
-        db.with(|c| { c.execute("UPDATE episodes SET last_played_at = 900 WHERE id = ?1", params![ep_of(alpha)])?; Ok(()) }).unwrap();
+        let (mid_ep, alpha_ep) = (ep_of(mid), ep_of(alpha));
+        db.set_status(mid_ep, EpisodeStatus::Played).unwrap();
+        db.with(|c| {
+            c.execute("UPDATE episodes SET last_played_at = 500 WHERE id = ?1", params![mid_ep])?;
+            c.execute("UPDATE episodes SET last_played_at = 900 WHERE id = ?1", params![alpha_ep])?;
+            Ok(())
+        })
+        .unwrap();
 
         let titles = |s: ShowSort| db.list_shows("", s).unwrap().into_iter().map(|c| c.display_title).collect::<Vec<_>>();
         assert_eq!(titles(ShowSort::Title), ["Alpha", "Mid", "Zulu"]);
