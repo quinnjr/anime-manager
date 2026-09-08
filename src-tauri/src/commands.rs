@@ -107,6 +107,9 @@ pub fn match_library(app: AppHandle, state: State<'_, AppState>) -> Result<usize
 pub fn match_progress(state: State<'_, AppState>) -> Result<bool> { Ok(state.matching.is_running()) }
 
 #[tauri::command]
+pub fn library_status(state: State<'_, AppState>) -> Result<LibraryStatus> { state.db.library_status() }
+
+#[tauri::command]
 pub fn list_shows(state: State<'_, AppState>, filter: Option<String>, sort: Option<ShowSort>) -> Result<Vec<ShowCard>> {
     state.db.list_shows(filter.as_deref().unwrap_or(""), sort.unwrap_or_default())
 }
@@ -225,6 +228,12 @@ pub async fn inspect_show(app: AppHandle, state: State<'_, AppState>, show_id: i
     let _ = app.emit("library-changed", ());
     if let Some(id) = report.show_id { let _ = app.emit("show-updated", id); }
     Ok(report)
+}
+
+/// Model ids offered by whatever provider is configured right now.
+#[tauri::command]
+pub async fn llm_models(state: State<'_, AppState>) -> Result<Vec<String>> {
+    Llm::from_db(&state.db)?.models().await
 }
 
 #[tauri::command]

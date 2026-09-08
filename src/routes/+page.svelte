@@ -4,7 +4,6 @@
   import { isTypingTarget } from '$lib/keys';
   import { toasts } from '$lib/stores/toasts.svelte';
   import ShowCard from '$lib/components/ShowCard.svelte';
-  import ScanBar from '$lib/components/ScanBar.svelte';
 
   let shows = $state<ShowCardT[]>([]);
   let filter = $state('');
@@ -65,8 +64,6 @@
       {shows.length}<span class="ml-1.5 text-faint">{shows.length === 1 ? 'show' : 'shows'}</span>
     </h1>
   </div>
-  <span class="hidden h-8 w-px bg-edge sm:block"></span>
-  <ScanBar onFinished={load} />
   <span class="flex-1"></span>
   <label class="flex items-center gap-2">
     <span class="eyebrow">order</span>
@@ -92,7 +89,8 @@
 {#if shows.length === 0}
   <div class="border border-dashed border-edge px-6 py-14 text-center">
     <p class="spine text-lg text-paper">Nothing on the shelf yet</p>
-    <p class="mt-1.5 text-sm text-muted">Add the folder your anime lives in and it will be read and catalogued.</p>
+    <p class="mt-1.5 text-sm text-muted">Point it at the folder your anime lives in and it will be read and catalogued.</p>
+    <a class="btn btn-key mt-4 inline-block" href="/settings">Add a folder</a>
   </div>
 {:else}
   <div class="grid grid-cols-[repeat(auto-fill,minmax(142px,1fr))] gap-x-4 gap-y-6">

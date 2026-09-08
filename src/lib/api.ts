@@ -31,6 +31,28 @@ export const SHOW_SORTS: { value: ShowSort; label: string }[] = [
 export interface ShowCard { id: number; display_title: string; cover_url: string | null; cover_path: string | null; episode_count: number; unwatched_count: number }
 export interface ScanSummary { files_seen: number; episodes_added: number; episodes_updated: number; episodes_missing: number; errors: string[]; low_confidence_folders: string[] }
 export interface InspectChange { path: string; from: string; to: string }
+export interface LibraryStatus {
+  roots: number; shows: number; episodes: number; missing_episodes: number;
+  unmatched: number; missing_art: number;
+}
+
+/** OpenAI-compatible routers with a free tier. The client only needs a base URL and a key, so
+ *  these are presets rather than integrations; the model list comes from the provider itself. */
+export interface LlmProvider { id: string; label: string; baseUrl: string; keyUrl: string; note: string }
+export const LLM_PROVIDERS: LlmProvider[] = [
+  { id: 'openrouter', label: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1',
+    keyUrl: 'https://openrouter.ai/keys', note: 'Model ids ending in :free cost nothing.' },
+  { id: 'huggingface', label: 'Hugging Face', baseUrl: 'https://router.huggingface.co/v1',
+    keyUrl: 'https://huggingface.co/settings/tokens', note: 'Monthly free credits on a signed-in account.' },
+  { id: 'groq', label: 'Groq', baseUrl: 'https://api.groq.com/openai/v1',
+    keyUrl: 'https://console.groq.com/keys', note: 'Free tier with per-minute limits.' },
+  { id: 'gemini', label: 'Google Gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
+    keyUrl: 'https://aistudio.google.com/apikey', note: 'Free tier through AI Studio.' },
+  { id: 'cerebras', label: 'Cerebras', baseUrl: 'https://api.cerebras.ai/v1',
+    keyUrl: 'https://cloud.cerebras.ai', note: 'Free tier with daily limits.' },
+  { id: 'custom', label: 'Something else', baseUrl: '', keyUrl: '', note: 'Any OpenAI-compatible endpoint.' }
+];
+
 export interface MatchProgress { done: number; total: number; title: string; phase: string; changed: number | null; running: boolean }
 export interface AssistProgress { done: number; total: number; folder: string; running: boolean }
 export interface InspectReport { folders: number; ignored: number; changes: InspectChange[]; notes: string[]; show_id: number | null }
@@ -67,6 +89,8 @@ export const api = {
   purgeMissing: () => invoke<number>('purge_missing'),
   inspectShow: (showId: number) => invoke<InspectReport>('inspect_show', { showId }),
   llmTest: () => invoke<string>('llm_test'),
+  llmModels: () => invoke<string[]>('llm_models'),
+  libraryStatus: () => invoke<LibraryStatus>('library_status'),
   assistProgress: () => invoke<AssistProgress>('assist_progress'),
   clearAiDecisions: () => invoke<number>('clear_ai_decisions'),
   matchLibrary: () => invoke<number>('match_library'),

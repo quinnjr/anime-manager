@@ -556,6 +556,22 @@ impl Db {
             .collect())
     }
 
+    pub fn library_status(&self) -> Result<LibraryStatus> {
+        let (roots, shows, episodes, missing_episodes, unmatched) = self.with(|c| {
+            Ok((
+                c.query_row("SELECT COUNT(*) FROM roots", [], |r| r.get(0))?,
+                c.query_row("SELECT COUNT(*) FROM shows", [], |r| r.get(0))?,
+                c.query_row("SELECT COUNT(*) FROM episodes", [], |r| r.get(0))?,
+                c.query_row("SELECT COUNT(*) FROM episodes WHERE status = 'missing'", [], |r| r.get(0))?,
+                c.query_row("SELECT COUNT(*) FROM shows WHERE match_source IS NULL", [], |r| r.get(0))?,
+            ))
+        })?;
+        // Counted through the same filesystem check the fetcher uses, so the number shown is
+        // the number of downloads pressing the button would actually do.
+        let missing_art = self.shows_needing_cover()?.len() as i64;
+        Ok(LibraryStatus { roots, shows, episodes, missing_episodes, unmatched, missing_art })
+    }
+
     pub fn display_title(&self, show_id: i64) -> Result<String> {
         self.with(|c| Ok(c.query_row(&format!("SELECT {} FROM shows WHERE id=?1", display_title_sql()), params![show_id], |r| r.get(0))?))
     }
@@ -1029,6 +1045,34 @@ mod tests {
         assert_eq!(db.get_show(id).unwrap().user_title_override.as_deref(), Some("Bloom Into You"));
         db.set_title_override(id, Some("   ")).unwrap();
         assert_eq!(db.display_title(id).unwrap(), "Yagate Kimi ni Naru", "blank clears the override");
+    }
+
+    #[test]
+    fn library_status_counts_what_is_outstanding() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_memory().unwrap();
+        db.add_root("/lib").unwrap();
+        db.upsert_episode(&pn("Matched", 1, 1), &rf("/lib/a1.mkv", 1, 1)).unwrap();
+        db.upsert_episode(&pn("Matched", 1, 2), &rf("/lib/a2.mkv", 1, 1)).unwrap();
+        db.upsert_episode(&pn("Unmatched", 1, 1), &rf("/lib/b1.mkv", 1, 1)).unwrap();
+        let matched = db.list_shows("Matched", ShowSort::Title).unwrap()[0].id;
+        db.set_anilist(matched, &MetadataHit { id: 1, source: "kitsu".into(), title_romaji: "Matched".into(),
+            title_english: None, cover_url: Some("https://img/x.jpg".into()), episodes: None }).unwrap();
+
+        let s = db.library_status().unwrap();
+        assert_eq!((s.roots, s.shows, s.episodes), (1, 2, 3));
+        assert_eq!(s.unmatched, 1, "the show no provider matched");
+        assert_eq!(s.missing_art, 1, "matched but nothing on disk yet");
+        assert_eq!(s.missing_episodes, 0);
+
+        // Once the art is really there, the outstanding count drops.
+        let f = dir.path().join("c.jpg");
+        std::fs::write(&f, b"x").unwrap();
+        db.set_cover_path(matched, f.to_str().unwrap()).unwrap();
+        assert_eq!(db.library_status().unwrap().missing_art, 0);
+
+        db.mark_missing_except(&[]).unwrap();
+        assert_eq!(db.library_status().unwrap().missing_episodes, 3);
     }
 
     #[test]

@@ -139,6 +139,20 @@ impl ShowSort {
     }
 }
 
+/// What the library currently holds, so the settings page can say what work is outstanding
+/// instead of offering an unlabelled button.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct LibraryStatus {
+    pub roots: i64,
+    pub shows: i64,
+    pub episodes: i64,
+    pub missing_episodes: i64,
+    /// Shows no provider has matched, which therefore have no artwork to fetch.
+    pub unmatched: i64,
+    /// Matched shows whose cover art is not on disk.
+    pub missing_art: i64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ScanSummary {
     pub files_seen: usize,
