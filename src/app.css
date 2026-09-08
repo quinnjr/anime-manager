@@ -177,6 +177,13 @@ select.field option {
   color: var(--color-paper);
 }
 
+/* Checkboxes are native too; at least tint them so they belong to the palette. */
+input[type="checkbox"] {
+  accent-color: var(--color-sub);
+  width: 0.9rem;
+  height: 0.9rem;
+}
+
 /* One focus treatment everywhere, always visible. */
 :where(a, button, input, select, textarea, [tabindex]):focus-visible {
   outline: 2px solid var(--color-sub);

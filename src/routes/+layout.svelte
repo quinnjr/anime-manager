@@ -7,10 +7,8 @@
   import { matching } from '$lib/stores/matching.svelte';
   import { toasts } from '$lib/stores/toasts.svelte';
   import Toasts from '$lib/components/Toasts.svelte';
-  import SettingsDrawer from '$lib/components/SettingsDrawer.svelte';
 
   let { children } = $props();
-  let settingsOpen = $state(false);
 
   onMount(() => {
     const unlisteners = [
@@ -50,9 +48,8 @@
         <span class="tag">reading {assist.progress.done}/{assist.progress.total}</span>
       </span>
     {/if}
-    <button class="btn" onclick={() => (settingsOpen = true)}>Settings</button>
+    <a class="btn" href="/settings">Settings</a>
   </header>
   <main class="flex-1 px-6 py-7">{@render children()}</main>
 </div>
 <Toasts />
-<SettingsDrawer bind:open={settingsOpen} />

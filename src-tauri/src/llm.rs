@@ -1,4 +1,9 @@
-//! Optional LLM second opinion on folder contents, via OpenCode Zen (OpenAI-compatible).
+//! Optional LLM second opinion on folder contents.
+//!
+//! Any OpenAI-compatible provider works, because all this needs is a base URL, a bearer key and
+//! a model id. Settings offers presets for the ones with a free tier (OpenRouter, Hugging Face,
+//! Groq, Gemini, Cerebras) and lists each provider's models from its own /models endpoint,
+//! since free model ids rotate.
 use crate::db::Db;
 use crate::error::{AppError, Result};
 use crate::models::{AssistProgress, InspectChange, InspectReport, ParseOverride};
@@ -9,8 +14,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub const DEFAULT_BASE_URL: &str = "https://opencode.ai/zen/v1";
-pub const DEFAULT_MODEL: &str = "big-pickle";
+pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
+/// Deliberately empty: free model ids rotate, so the settings page lists what the chosen
+/// provider actually offers rather than shipping a name that quietly stops existing.
+pub const DEFAULT_MODEL: &str = "";
 pub const MAX_FILES_PER_FOLDER: usize = 200;
 /// Attempts per request; waits grow as retry_base * 2^n and honour Retry-After.
 pub const MAX_ATTEMPTS: u32 = 6;
@@ -113,7 +120,10 @@ impl Llm {
     pub fn model(&self) -> &str { &self.model }
 
     pub async fn chat(&self, system: &str, user: &str) -> Result<String> {
-        let key = self.api_key.as_ref().ok_or_else(|| AppError::Network("LLM not configured: set an OpenCode Zen API key in Settings".into()))?;
+        let key = self.api_key.as_ref().ok_or_else(|| AppError::Network("LLM not configured: set an API key in Settings".into()))?;
+        if self.model.trim().is_empty() {
+            return Err(AppError::Network("No model chosen: pick one in Settings (press List)".into()));
+        }
         let body = json!({
             "model": self.model,
             "temperature": 0,
@@ -147,6 +157,31 @@ impl Llm {
         let content = v.pointer("/choices/0/message/content").and_then(|c| c.as_str())
             .ok_or_else(|| AppError::Parse("LLM response had no choices[0].message.content".into()))?;
         Ok(content.to_string())
+    }
+
+    /// Model ids the configured provider actually offers. Every OpenAI-compatible router
+    /// exposes this, so the settings page can list what is available instead of hard-coding
+    /// names that go stale as providers rotate their free tiers.
+    pub async fn models(&self) -> Result<Vec<String>> {
+        let key = self.api_key.as_ref().ok_or_else(|| {
+            AppError::Network("LLM not configured: set an API key in Settings".into())
+        })?;
+        let resp = self.client.get(format!("{}/models", self.base_url)).bearer_auth(key).send().await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            let snippet: String = text.chars().take(200).collect();
+            return Err(AppError::Network(format!("provider returned {status}: {snippet}")));
+        }
+        let v: Value = serde_json::from_str(&text)?;
+        let mut ids: Vec<String> = v
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|a| a.iter().filter_map(|m| m.get("id")?.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
     }
 
     /// One-line round trip for the Settings "Test connection" button.
@@ -241,7 +276,7 @@ async fn inspect_one(db: &Db, llm: &Llm, roots: &[String], folder: &str, source:
 /// Failures on one folder are recorded in `report.notes` and do not stop the others.
 pub async fn inspect_folders(db: Arc<Db>, llm: Arc<Llm>, folders: Vec<String>, source: &str) -> Result<InspectReport> {
     if !llm.configured() {
-        return Err(AppError::Network("LLM not configured: set an OpenCode Zen API key in Settings".into()));
+        return Err(AppError::Network("LLM not configured: set an API key in Settings".into()));
     }
     let mut report = InspectReport::default();
     let roots: Vec<String> = db.list_roots().unwrap_or_default().into_iter().map(|r| r.path).collect();
@@ -379,6 +414,38 @@ mod tests {
         json!({"choices": [{"message": {"role": "assistant", "content": content}}]})
     }
 
+    #[tokio::test]
+    async fn a_blank_model_is_refused_with_a_clear_reason() {
+        // Free model ids rotate, so there is no safe default to ship; say so rather than
+        // sending an empty model name and surfacing whatever the provider says about it.
+        let llm = Llm::with("http://unused".into(), Some("k".into()), "  ".into());
+        match llm.chat("s", "u").await {
+            Err(AppError::Network(m)) => assert!(m.contains("No model chosen"), "{m}"),
+            o => panic!("{o:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn models_lists_what_the_provider_offers() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [
+                {"id": "zeta"}, {"id": "alpha"}, {"id": "alpha"}, {"no_id": true}
+            ]})))
+            .mount(&server).await;
+        let llm = Llm::with(server.uri(), Some("k".into()), "m".into());
+        assert_eq!(llm.models().await.unwrap(), vec!["alpha", "zeta"], "sorted and de-duplicated");
+
+        let bad = MockServer::start().await;
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(401).set_body_string("nope")).mount(&bad).await;
+        let llm = Llm::with(bad.uri(), Some("k".into()), "m".into());
+        assert!(matches!(llm.models().await, Err(AppError::Network(_))));
+
+        // No key configured is a clear error, not an empty list.
+        let none = Llm::with(server.uri(), None, "m".into());
+        assert!(none.models().await.is_err());
+    }
+
     #[test]
     fn parses_fenced_and_plain_json() {
         let plain = r#"{"title":"Sekirei","season":1,"files":[{"name":"01_Sekirei_KDG.mkv","kind":"episode","season":1,"episode":1,"title":null}],"notes":"ok"}"#;
@@ -409,9 +476,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST")).and(path("/chat/completions")).and(header("authorization", "Bearer sk-test"))
             .respond_with(ResponseTemplate::new(200).set_body_json(reply("ok"))).mount(&server).await;
-        let llm = Llm::with(server.uri(), Some("sk-test".into()), "big-pickle".into());
-        assert_eq!(llm.test().await.unwrap(), "big-pickle replied: ok");
-        let none = Llm::with(server.uri(), None, "big-pickle".into());
+        let llm = Llm::with(server.uri(), Some("sk-test".into()), "test-model".into());
+        assert_eq!(llm.test().await.unwrap(), "test-model replied: ok");
+        let none = Llm::with(server.uri(), None, "test-model".into());
         assert!(matches!(none.test().await, Err(AppError::Network(_))));
         let bad = MockServer::start().await;
         Mock::given(method("POST")).respond_with(ResponseTemplate::new(429).set_body_string("rate limited")).mount(&bad).await;
