@@ -22,6 +22,9 @@ pub const MAX_FILES_PER_FOLDER: usize = 200;
 /// A cap on how many existing titles travel with a request, so a large library does not turn
 /// every inspection into a huge prompt.
 pub const MAX_KNOWN_TITLES: usize = 400;
+/// Every override this module writes is attributed to the model, and `clear_ai_decisions`
+/// deletes on exactly this string - no other value can round-trip.
+pub const OVERRIDE_SOURCE: &str = "llm";
 /// Longest `Retry-After` worth honouring in-process; beyond this the quota is spent, not busy.
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// Attempts per request; waits grow as retry_base * 2^n and honour Retry-After.
@@ -220,10 +223,6 @@ impl Llm {
         Ok(format!("{} replied: {}", self.model, reply.trim()))
     }
 
-    pub async fn inspect_folder(&self, rel_folder: &str, files: &[FileGuess]) -> Result<FolderInspection> {
-        self.inspect_folder_with(rel_folder, files, &[]).await
-    }
-
     /// Judge a whole show's season breakdown in one request.
     pub async fn inspect_show_breakdown(&self, title: &str, files: &[FileGuess]) -> Result<FolderInspection> {
         let mut user = format!(
@@ -249,7 +248,7 @@ impl Llm {
         parse_inspection(&reply)
     }
 
-    /// As `inspect_folder`, plus the titles the library already holds so the answer can join an
+    /// Judge one folder, given the titles the library already holds so the answer can join an
     /// existing show rather than coining a synonym for it.
     pub async fn inspect_folder_with(
         &self,
@@ -308,7 +307,7 @@ fn rel_to_roots(roots: &[String], folder: &str) -> String {
 
 /// Inspect one folder and apply the model's decisions as parse overrides.
 /// Returns Ok(false) when the folder held no known episodes.
-async fn inspect_one(db: &Db, llm: &Llm, roots: &[String], folder: &str, source: &str, report: &mut InspectReport) -> Result<bool> {
+async fn inspect_one(db: &Db, llm: &Llm, roots: &[String], folder: &str, report: &mut InspectReport) -> Result<bool> {
     let rows = db.episodes_in_folder(folder)?;
     if rows.is_empty() { return Ok(false); }
     let files: Vec<FileGuess> = rows.iter().map(|(path, title, season, number)| FileGuess {
@@ -333,7 +332,7 @@ async fn inspect_one(db: &Db, llm: &Llm, roots: &[String], folder: &str, source:
         let Some((path, cur_title, cur_season, cur_number)) = by_name.get(d.name.as_str()).map(|r| (&r.0, &r.1, r.2, r.3)) else { continue };
         let from = format!("{cur_title} S{cur_season}E{cur_number}");
         if d.kind == KIND_IGNORE {
-            db.set_override(&ParseOverride { path: path.clone(), title: String::new(), season: 0, number: 0, kind: KIND_IGNORE.into(), source: source.into() })?;
+            db.set_override(&ParseOverride { path: path.clone(), title: String::new(), season: 0, number: 0, kind: KIND_IGNORE.into(), source: OVERRIDE_SOURCE.into() })?;
             db.delete_episode_by_path(path)?;
             report.ignored += 1;
             report.changes.push(InspectChange { path: path.clone(), from, to: "ignored".into() });
@@ -344,30 +343,13 @@ async fn inspect_one(db: &Db, llm: &Llm, roots: &[String], folder: &str, source:
         let season = if kind == KIND_SPECIAL { 0 } else { d.season.or(inspection.season).unwrap_or(1) };
         let number = d.episode.unwrap_or(if kind == KIND_MOVIE { 1 } else { cur_number });
         let season_title = if season == 0 { None } else { d.season_title.clone().or_else(|| inspection.season_title.clone()) };
-        db.set_override(&ParseOverride { path: path.clone(), title: title.clone(), season, number, kind, source: source.into() })?;
+        db.set_override(&ParseOverride { path: path.clone(), title: title.clone(), season, number, kind, source: OVERRIDE_SOURCE.into() })?;
         db.reassign_episode(path, &title, season, number, season_title.as_deref())?;
         let to = format!("{title} S{season}E{number}");
         if to != from { report.changes.push(InspectChange { path: path.clone(), from, to }); }
     }
     db.prune_empty()?;
     Ok(true)
-}
-
-/// Send each folder to the model and apply its decisions as parse overrides.
-/// Failures on one folder are recorded in `report.notes` and do not stop the others.
-pub async fn inspect_folders(db: Arc<Db>, llm: Arc<Llm>, folders: Vec<String>, source: &str) -> Result<InspectReport> {
-    if !llm.configured() {
-        return Err(AppError::Network("LLM not configured: set an API key in Settings".into()));
-    }
-    let mut report = InspectReport::default();
-    let roots: Vec<String> = db.list_roots().unwrap_or_default().into_iter().map(|r| r.path).collect();
-    let mut first = true;
-    for folder in folders {
-        if !first { tokio::time::sleep(llm.delay_between_folders).await; }
-        first = false;
-        inspect_one(&db, &llm, &roots, &folder, source, &mut report).await?;
-    }
-    Ok(report)
 }
 
 /// Background work list of folders awaiting an LLM opinion. Scans enqueue; one worker drains.
@@ -445,14 +427,14 @@ impl AssistQueue {
     }
 
     /// Drain the queue one folder at a time, reporting progress after each.
-    pub async fn run(&self, db: Arc<Db>, llm: Arc<Llm>, source: &str, on_progress: &(dyn Fn(AssistProgress) + Send + Sync)) -> InspectReport {
+    pub async fn run(&self, db: Arc<Db>, llm: Arc<Llm>, on_progress: &(dyn Fn(AssistProgress) + Send + Sync)) -> InspectReport {
         let mut report = InspectReport::default();
         let roots: Vec<String> = db.list_roots().unwrap_or_default().into_iter().map(|r| r.path).collect();
         let mut first = true;
         while let Some(folder) = self.next_or_finish() {
             if !first { tokio::time::sleep(llm.delay_between_folders).await; }
             first = false;
-            if let Err(e) = inspect_one(&db, &llm, &roots, &folder, source, &mut report).await {
+            if let Err(e) = inspect_one(&db, &llm, &roots, &folder, &mut report).await {
                 report.notes.push(format!("{folder}: {e}"));
             }
             let (done, total) = {
@@ -466,7 +448,6 @@ impl AssistQueue {
     }
 }
 
-/// On-demand inspection of every folder that holds an episode of `show_id`.
 /// Check one show's whole season breakdown in a single request.
 ///
 /// The per-folder pass cannot see across seasons: each folder is judged alone, so a release
@@ -528,14 +509,14 @@ pub async fn inspect_show(db: Arc<Db>, llm: Arc<Llm>, queue: Arc<AssistQueue>, s
     }
 
     for d in &inspection.files {
-        let key = if by_name.contains_key(d.name.as_str()) {
-            d.name.as_str()
-        } else if let Some(Some(unique)) = by_base.get(d.name.as_str()) {
-            unique
-        } else {
-            continue;
-        };
-        let Some((path, cur_season, cur_number)) = by_name.get(key).copied() else { continue };
+        // One lookup, not two: the basename map only ever stores names that are keys of
+        // by_name, so a hit there cannot then miss here. `key` stays the relative path in both
+        // branches, which is what the per-file note below reports.
+        let Some((key, path, cur_season, cur_number)) = by_name
+            .get_key_value(d.name.as_str())
+            .or_else(|| by_base.get(d.name.as_str()).copied().flatten().and_then(|n| by_name.get_key_value(n)))
+            .map(|(k, v)| (*k, v.0, v.1, v.2))
+        else { continue };
         let from = format!("{display} S{cur_season}E{cur_number}");
 
         // One file failing must not abandon the rest, nor throw away the record of what already
@@ -573,7 +554,7 @@ fn apply_decision(
     report: &mut InspectReport,
 ) -> Result<()> {
     if d.kind == KIND_IGNORE {
-        db.set_override(&ParseOverride { path: path.clone(), title: String::new(), season: 0, number: 0, kind: KIND_IGNORE.into(), source: "llm".into() })?;
+        db.set_override(&ParseOverride { path: path.clone(), title: String::new(), season: 0, number: 0, kind: KIND_IGNORE.into(), source: OVERRIDE_SOURCE.into() })?;
         db.delete_episode_by_path(path)?;
         report.ignored += 1;
         report.changes.push(InspectChange { path: path.clone(), from, to: "ignored".into() });
@@ -593,7 +574,7 @@ fn apply_decision(
     let season = if kind == KIND_SPECIAL { 0 } else { d.season.unwrap_or(cur_season) };
     let number = d.episode.unwrap_or(cur_number);
     if new_title == parsed && season == cur_season && number == cur_number { return Ok(()); }
-    db.set_override(&ParseOverride { path: path.clone(), title: new_title.clone(), season, number, kind, source: "llm".into() })?;
+    db.set_override(&ParseOverride { path: path.clone(), title: new_title.clone(), season, number, kind, source: OVERRIDE_SOURCE.into() })?;
     let season_title = if season == 0 { None } else { d.season_title.as_deref().or(fallback_season_title) };
     db.reassign_episode(path, &new_title, season, number, season_title)?;
     report.changes.push(InspectChange { path: path.clone(), from, to: format!("{new_title} S{season}E{number}") });
@@ -977,7 +958,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let s2 = seen.clone();
         let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()).with_timing(Duration::from_millis(1), Duration::ZERO));
-        let report = q.run(db.clone(), llm, "llm", &move |p| s2.lock().unwrap().push(p)).await;
+        let report = q.run(db.clone(), llm, &move |p| s2.lock().unwrap().push(p)).await;
         drop(guard);
         assert_eq!(report.folders, n, "every folder inspected, none capped");
         assert_eq!(report.changes.len(), n);
@@ -998,7 +979,9 @@ mod tests {
         let pn = ParsedName { title: "X".into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
         db.upsert_episode(&pn, &RawFile { path: "/lib/X/01.mkv".into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] }).unwrap();
         let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()));
-        let r = inspect_folders(db.clone(), llm, vec!["/lib/X".into()], "llm").await.unwrap();
+        let q = AssistQueue::default();
+        q.enqueue(vec!["/lib/X".to_string()]);
+        let r = q.run(db.clone(), llm, &|_| {}).await;
         assert_eq!(r.folders, 0);
         assert_eq!(r.notes.len(), 1);
         assert!(r.notes[0].contains("parse"));
@@ -1040,7 +1023,7 @@ mod tests {
         q.enqueue(vec!["/lib/A".to_string()]);
         let guard = q.try_start().expect("worker starts");
         let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()).with_timing(Duration::from_millis(1), Duration::ZERO));
-        q.run(db.clone(), llm, "llm", &|_| {}).await;
+        q.run(db.clone(), llm, &|_| {}).await;
         // run() cleared `running` under the same lock that enqueue takes, so a scan landing now
         // must be able to start a fresh worker rather than adding folders no one will drain.
         assert!(!q.is_running());

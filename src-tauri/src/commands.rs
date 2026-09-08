@@ -41,7 +41,7 @@ pub async fn scan(app: AppHandle, state: State<'_, AppState>) -> Result<ScanSumm
     // let a single background worker drain the queue (a running worker picks up new entries).
     let assist_on = state.db.get_setting("llm_assist_on_scan")?.map(|v| v != "false").unwrap_or(true);
     if assist_on && let Ok(l) = Llm::from_db(&state.db) && l.configured()
-        && !(summary.low_confidence_folders.is_empty() && !state.assist.has_pending()) {
+        && (!summary.low_confidence_folders.is_empty() || state.assist.has_pending()) {
         state.assist.enqueue(summary.low_confidence_folders.iter().cloned());
         if state.assist.has_pending() && !state.assist.is_running() {
             let db_l = state.db.clone();
@@ -53,7 +53,7 @@ pub async fn scan(app: AppHandle, state: State<'_, AppState>) -> Result<ScanSumm
             tauri::async_runtime::spawn(async move {
                 let Some(_guard) = queue.try_start() else { return };
                 let app_p = app_l.clone();
-                let report = queue.run(db_l, Arc::new(l), "llm", &move |p| {
+                let report = queue.run(db_l, Arc::new(l), &move |p| {
                     let _ = app_p.emit("llm-assist-progress", &p);
                     let _ = app_p.emit("library-changed", ());
                 }).await;
@@ -102,9 +102,6 @@ pub fn match_library(app: AppHandle, state: State<'_, AppState>) -> Result<usize
     spawn_match_pass(&app, &state);
     Ok(pending)
 }
-
-#[tauri::command]
-pub fn match_progress(state: State<'_, AppState>) -> Result<bool> { Ok(state.matching.is_running()) }
 
 /// Fold show rows that point at the same series. Runs automatically after matching; exposed so
 /// it can be run on its own from Settings.
@@ -257,7 +254,7 @@ pub fn assist_progress(state: State<'_, AppState>) -> Result<AssistProgress> { O
 
 #[tauri::command]
 pub fn clear_ai_decisions(app: AppHandle, state: State<'_, AppState>) -> Result<usize> {
-    let n = state.db.clear_overrides(Some("llm"))?;
+    let n = state.db.clear_overrides(llm::OVERRIDE_SOURCE)?;
     let _ = app.emit("library-changed", ());
     Ok(n)
 }

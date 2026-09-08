@@ -175,7 +175,7 @@ fn row_to_root(r: &rusqlite::Row) -> rusqlite::Result<Root> {
     })
 }
 
-fn display_title_sql() -> &'static str { "COALESCE(user_title_override, canonical_title, parsed_title)" }
+const DISPLAY_TITLE_SQL: &str = "COALESCE(user_title_override, canonical_title, parsed_title)";
 
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
@@ -341,14 +341,13 @@ impl Db {
             .optional()?))
     }
 
-    pub fn clear_overrides(&self, source: Option<&str>) -> Result<usize> {
-        self.with(|c| Ok(match source {
-            Some(s) => c.execute("DELETE FROM parse_overrides WHERE source = ?1", params![s])?,
-            None => c.execute("DELETE FROM parse_overrides", [])?,
-        }))
+    /// Drop every override a given source wrote. Deliberately not offered as "drop them all":
+    /// the merge fold and `rename::apply` also write overrides, and losing those un-merges the
+    /// library and strands renamed files.
+    pub fn clear_overrides(&self, source: &str) -> Result<usize> {
+        self.with(|c| Ok(c.execute("DELETE FROM parse_overrides WHERE source = ?1", params![source])?))
     }
 
-    /// Re-home an existing episode row under (title, season, number). Returns false if no row has that path.
     /// Move an episode under `title` season `season`, creating either if needed.
     ///
     /// `season_title` names the season when the sequel was broadcast under a title of its own
@@ -435,22 +434,6 @@ impl Db {
         })
     }
 
-    /// Mark everything not in `seen` as missing, regardless of root. Only safe when every root
-    /// scanned cleanly; `run_scan` uses `mark_missing_within` instead.
-    pub fn mark_missing_except(&self, seen: &[String]) -> Result<usize> {
-        self.with(|c| {
-            let tx = c.unchecked_transaction()?;
-            tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS seen(path TEXT PRIMARY KEY); DELETE FROM seen;")?;
-            {
-                let mut ins = tx.prepare("INSERT OR IGNORE INTO seen(path) VALUES (?1)")?;
-                for p in seen { ins.execute(params![p])?; }
-            }
-            let n = tx.execute("UPDATE episodes SET prev_status = status, status='missing' WHERE status != 'missing' AND path NOT IN (SELECT path FROM seen)", [])?;
-            tx.commit()?;
-            Ok(n)
-        })
-    }
-
     pub fn purge_missing(&self) -> Result<usize> {
         self.with(|c| {
             let n = c.execute("DELETE FROM episodes WHERE status='missing'", [])?;
@@ -462,7 +445,7 @@ impl Db {
 
     pub fn list_shows(&self, filter: &str, sort: ShowSort) -> Result<Vec<ShowCard>> {
         self.with(|c| {
-            let dt = display_title_sql();
+            let dt = DISPLAY_TITLE_SQL;
             let sql = format!(
                 "SELECT s.id, {dt}, s.cover_url, s.cover_path,
                         (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id=se.id WHERE se.show_id=s.id AND e.status!='missing'),
@@ -479,7 +462,7 @@ impl Db {
     }
 
     fn show_row(c: &Connection, id: i64) -> Result<ShowDetail> {
-        let sql = format!("SELECT id, parsed_title, {}, canonical_title, anilist_id, cover_url, total_episodes, user_title_override, cover_path, match_source FROM shows WHERE id=?1", display_title_sql());
+        let sql = format!("SELECT id, parsed_title, {}, canonical_title, anilist_id, cover_url, total_episodes, user_title_override, cover_path, match_source FROM shows WHERE id=?1", DISPLAY_TITLE_SQL);
         let mut show = c.query_row(&sql, params![id], |r| Ok(ShowDetail {
             id: r.get(0)?, parsed_title: r.get(1)?, display_title: r.get(2)?, canonical_title: r.get(3)?, anilist_id: r.get(4)?,
             cover_url: r.get(5)?, total_episodes: r.get(6)?, user_title_override: r.get(7)?, cover_path: r.get(8)?,
@@ -580,7 +563,6 @@ impl Db {
         })
     }
 
-    /// Shows with cover art on AniList that has not been copied locally yet.
     /// Shows whose cover art is not actually on disk: never downloaded, or downloaded and since
     /// gone. The recorded path is not taken on trust — a row that keeps a path to a file that no
     /// longer exists would otherwise be skipped forever, with no way to re-fetch it.
@@ -709,13 +691,13 @@ impl Db {
     /// answer with one of them instead of coining a synonym that becomes a second row.
     pub fn known_titles(&self) -> Result<Vec<String>> {
         self.with(|c| {
-            let mut st = c.prepare(&format!("SELECT DISTINCT {} FROM shows ORDER BY 1", display_title_sql()))?;
+            let mut st = c.prepare(&format!("SELECT DISTINCT {} FROM shows ORDER BY 1", DISPLAY_TITLE_SQL))?;
             Ok(st.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?)
         })
     }
 
     pub fn display_title(&self, show_id: i64) -> Result<String> {
-        self.with(|c| Ok(c.query_row(&format!("SELECT {} FROM shows WHERE id=?1", display_title_sql()), params![show_id], |r| r.get(0))?))
+        self.with(|c| Ok(c.query_row(&format!("SELECT {} FROM shows WHERE id=?1", DISPLAY_TITLE_SQL), params![show_id], |r| r.get(0))?))
     }
 
     pub fn update_episode_path(&self, id: i64, path: &str) -> Result<()> {
@@ -758,12 +740,6 @@ impl Db {
             }
             Ok(out)
         })
-    }
-
-    /// The newest batch with unreverted entries, or None.
-    #[allow(clippy::type_complexity)]
-    pub fn latest_unreverted_batch(&self) -> Result<Option<(String, Vec<(i64, Option<i64>, String, String)>)>> {
-        Ok(self.unreverted_batches()?.into_iter().next())
     }
 
     pub fn mark_log_entry_reverted(&self, log_id: i64) -> Result<()> {
@@ -965,13 +941,13 @@ mod tests {
         let db = Db::open_memory().unwrap();
         db.upsert_episode(&pn("Show", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
         db.upsert_episode(&pn("Show", 1, 2), &rf("/a/2.mkv", 1, 1)).unwrap();
-        assert_eq!(db.mark_missing_except(&["/a/1.mkv".to_string()]).unwrap(), 1);
+        assert_eq!(db.mark_missing_within(&["/a".to_string()], &["/a/1.mkv".to_string()]).unwrap(), vec![1]);
         let detail = db.get_show(db.list_shows("", ShowSort::Title).unwrap()[0].id).unwrap();
         assert_eq!(detail.seasons[0].episodes[1].status, EpisodeStatus::Missing);
         // a missing file that reappears is restored to unplayed
         db.upsert_episode(&pn("Show", 1, 2), &rf("/a/2.mkv", 1, 1)).unwrap();
         assert_eq!(db.get_show(detail.id).unwrap().seasons[0].episodes[1].status, EpisodeStatus::Unplayed);
-        db.mark_missing_except(&[]).unwrap();
+        db.mark_missing_within(&["/a".to_string()], &[]).unwrap();
         assert_eq!(db.purge_missing().unwrap(), 2);
     }
 
@@ -1074,7 +1050,7 @@ mod tests {
         assert_eq!((other.seasons[0].number, other.seasons[0].episodes[0].number), (0, 7));
         assert!(db.show_id_for_path(&p3).unwrap().is_none());
         assert_eq!(db.get_override(&p2).unwrap().unwrap().kind, "special");
-        assert_eq!(db.clear_overrides(Some("llm")).unwrap(), 2);
+        assert_eq!(db.clear_overrides("llm").unwrap(), 2);
     }
 
     #[test]
@@ -1172,7 +1148,7 @@ mod tests {
         db.upsert_episode(&pn("Show", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
         let ep = db.get_show(db.list_shows("", ShowSort::Title).unwrap()[0].id).unwrap().seasons[0].episodes[0].id;
         db.set_status(ep, EpisodeStatus::Played).unwrap();
-        db.mark_missing_except(&[]).unwrap();
+        db.mark_missing_within(&["/a".to_string()], &[]).unwrap();
         assert_eq!(db.get_episode(ep).unwrap().status, EpisodeStatus::Missing);
         db.upsert_episode(&pn("Show", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
         assert_eq!(db.get_episode(ep).unwrap().status, EpisodeStatus::Played, "a file that returns keeps its watched flag");
@@ -1365,7 +1341,7 @@ mod tests {
         db.set_cover_path(matched, f.to_str().unwrap()).unwrap();
         assert_eq!(db.library_status().unwrap().missing_art, 0);
 
-        db.mark_missing_except(&[]).unwrap();
+        db.mark_missing_within(&["/lib".to_string()], &[]).unwrap();
         assert_eq!(db.library_status().unwrap().missing_episodes, 3);
     }
 
@@ -1484,7 +1460,7 @@ mod tests {
         let ep = db.get_show(db.list_shows("", ShowSort::Title).unwrap()[0].id).unwrap().seasons[0].episodes[0].id;
         db.log_rename("batch", ep, "/a/old.mkv", "/a/new.mkv").unwrap();
         db.delete_episode_by_path("/a/new.mkv").unwrap();
-        let (_, rows) = db.latest_unreverted_batch().unwrap().expect("history survives the delete");
+        let (_, rows) = db.unreverted_batches().unwrap().into_iter().next().expect("history survives the delete");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].3, "/a/new.mkv");
     }

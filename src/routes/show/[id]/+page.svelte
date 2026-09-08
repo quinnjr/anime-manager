@@ -6,7 +6,6 @@
   import { toasts } from '$lib/stores/toasts.svelte';
   import { playback } from '$lib/stores/playback.svelte';
   import { isTypingTarget } from '$lib/keys';
-  import EpisodeRow from '$lib/components/EpisodeRow.svelte';
   import RematchModal from '$lib/components/RematchModal.svelte';
   import RenameModal from '$lib/components/RenameModal.svelte';
   import Cover from '$lib/components/Cover.svelte';
