@@ -10,7 +10,7 @@ export interface Episode {
   release_group: string | null; resolution: string | null; crc: string | null;
   status: EpisodeStatus; position_secs: number; duration_secs: number | null; last_played_at: number | null;
 }
-export interface SeasonDetail { id: number; number: number; episodes: Episode[] }
+export interface SeasonDetail { id: number; number: number; title: string | null; episodes: Episode[] }
 export interface ShowDetail {
   id: number; parsed_title: string; display_title: string; canonical_title: string | null;
   anilist_id: number | null; match_source: MetadataSource | null;
@@ -33,7 +33,7 @@ export interface ScanSummary { files_seen: number; episodes_added: number; episo
 export interface InspectChange { path: string; from: string; to: string }
 export interface LibraryStatus {
   roots: number; shows: number; episodes: number; missing_episodes: number;
-  unmatched: number; missing_art: number;
+  unmatched: number; missing_art: number; duplicates: number;
 }
 
 /** OpenAI-compatible routers with a free tier. The client only needs a base URL and a key, so
@@ -91,6 +91,7 @@ export const api = {
   llmTest: () => invoke<string>('llm_test'),
   llmModels: () => invoke<string[]>('llm_models'),
   libraryStatus: () => invoke<LibraryStatus>('library_status'),
+  mergeDuplicates: () => invoke<number>('merge_duplicates'),
   assistProgress: () => invoke<AssistProgress>('assist_progress'),
   clearAiDecisions: () => invoke<number>('clear_ai_decisions'),
   matchLibrary: () => invoke<number>('match_library'),

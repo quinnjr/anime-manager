@@ -36,7 +36,12 @@ CREATE TABLE IF NOT EXISTS shows (
   match_source TEXT);
 CREATE TABLE IF NOT EXISTS seasons (
   id INTEGER PRIMARY KEY, show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
-  number INTEGER NOT NULL, UNIQUE(show_id, number));
+  number INTEGER NOT NULL,
+  -- the name this season was released under, when it differs from the show's: a sequel
+  -- broadcast as "Non Non Biyori Repeat" is season 2, not a second show. NULL means the
+  -- season carries no name of its own and is shown as plain "Season 2".
+  title TEXT,
+  UNIQUE(show_id, number));
 CREATE TABLE IF NOT EXISTS episodes (
   id INTEGER PRIMARY KEY, season_id INTEGER NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
   number INTEGER NOT NULL, path TEXT NOT NULL UNIQUE, size INTEGER NOT NULL, mtime INTEGER NOT NULL,
@@ -59,7 +64,7 @@ CREATE INDEX IF NOT EXISTS idx_episodes_season ON episodes(season_id);
 CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status);
 "#;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// Bring an existing database up to `SCHEMA_VERSION`. Fresh databases get the current shape
 /// from SCHEMA directly; older ones are altered in place so no user data is lost.
@@ -90,6 +95,9 @@ fn upgrade(conn: &Connection) -> Result<()> {
     }
     if !has("shows", "cover_path")? {
         conn.execute_batch("ALTER TABLE shows ADD COLUMN cover_path TEXT;")?;
+    }
+    if !has("seasons", "title")? {
+        conn.execute_batch("ALTER TABLE seasons ADD COLUMN title TEXT;")?;
     }
     for col in ["last_scan_at", "last_files_seen", "last_added", "last_updated", "last_missing", "last_errors", "last_readable"] {
         if !has("roots", col)? {
@@ -341,16 +349,35 @@ impl Db {
     }
 
     /// Re-home an existing episode row under (title, season, number). Returns false if no row has that path.
-    pub fn reassign_episode(&self, path: &str, title: &str, season: u32, number: u32) -> Result<bool> {
+    /// Move an episode under `title` season `season`, creating either if needed.
+    ///
+    /// `season_title` names the season when the sequel was broadcast under a title of its own
+    /// ("Non Non Biyori Repeat" is season 2 of "Non Non Biyori"). It is only ever written when it
+    /// says something the show's own title does not, so a caller passing the show title back is a
+    /// no-op rather than a season labelled with its parent's name. Once set it is left alone:
+    /// clearing it would silently discard the name on the next file that arrives without one.
+    pub fn reassign_episode(&self, path: &str, title: &str, season: u32, number: u32, season_title: Option<&str>) -> Result<bool> {
         self.with(|c| {
             let Some(id) = c.query_row("SELECT id FROM episodes WHERE path = ?1", params![path], |r| r.get::<_, i64>(0)).optional()? else { return Ok(false) };
             c.execute("INSERT OR IGNORE INTO shows(parsed_title, created_at) VALUES (?1, ?2)", params![title, now()])?;
             let show_id: i64 = c.query_row("SELECT id FROM shows WHERE parsed_title = ?1", params![title], |r| r.get(0))?;
             c.execute("INSERT OR IGNORE INTO seasons(show_id, number) VALUES (?1, ?2)", params![show_id, season])?;
             let season_id: i64 = c.query_row("SELECT id FROM seasons WHERE show_id = ?1 AND number = ?2", params![show_id, season], |r| r.get(0))?;
+            if let Some(st) = season_title.map(str::trim).filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case(title)) {
+                c.execute("UPDATE seasons SET title = ?2 WHERE id = ?1 AND title IS NULL", params![season_id, st])?;
+            }
             c.execute("UPDATE episodes SET season_id = ?2, number = ?3 WHERE id = ?1", params![id, season_id, number])?;
             Ok(true)
         })
+    }
+
+    /// The season's own release title, or None when it has none. Used by tests and by the show
+    /// view; the season list falls back to "Season N" when this is empty.
+    pub fn season_title(&self, show_title: &str, season: u32) -> Result<Option<String>> {
+        self.with(|c| Ok(c.query_row(
+            "SELECT se.title FROM seasons se JOIN shows s ON se.show_id = s.id
+             WHERE s.parsed_title = ?1 AND se.number = ?2",
+            params![show_title, season], |r| r.get(0)).optional()?.flatten()))
     }
 
     pub fn delete_episode_by_path(&self, path: &str) -> Result<bool> {
@@ -381,6 +408,21 @@ impl Db {
                  WHERE substr(e.path, 1, length(?1)) = ?1 AND instr(substr(e.path, length(?1) + 1), '/') = 0
                  ORDER BY e.path")?;
             let rows = st.query_map(params![prefix], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u32, r.get::<_, i64>(3)? as u32)))?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
+        })
+    }
+
+    /// Every episode of a show with the season and number it is currently filed under, so a
+    /// whole-show inspection can judge the breakdown rather than one folder at a time.
+    pub fn episodes_of_show(&self, show_id: i64) -> Result<Vec<(String, u32, u32)>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT e.path, se.number, e.number FROM episodes e
+                 JOIN seasons se ON e.season_id = se.id
+                 WHERE se.show_id = ?1 ORDER BY se.number, e.number, e.path")?;
+            let rows = st.query_map(params![show_id], |r| {
+                Ok((r.get(0)?, r.get::<_, i64>(1)? as u32, r.get::<_, i64>(2)? as u32))
+            })?;
             Ok(rows.collect::<std::result::Result<_, _>>()?)
         })
     }
@@ -443,12 +485,12 @@ impl Db {
             cover_url: r.get(5)?, total_episodes: r.get(6)?, user_title_override: r.get(7)?, cover_path: r.get(8)?,
             match_source: r.get(9)?, seasons: vec![],
         }))?;
-        let mut st = c.prepare("SELECT id, number FROM seasons WHERE show_id=?1 ORDER BY number")?;
-        let seasons: Vec<(i64, u32)> = st.query_map(params![id], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u32)))?.collect::<std::result::Result<_, _>>()?;
+        let mut st = c.prepare("SELECT id, number, title FROM seasons WHERE show_id=?1 ORDER BY number")?;
+        let seasons: Vec<(i64, u32, Option<String>)> = st.query_map(params![id], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u32, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?;
         let mut eps = c.prepare(&format!("SELECT {EP_COLS} FROM episodes WHERE season_id=?1 ORDER BY number"))?;
-        for (sid, number) in seasons {
+        for (sid, number, title) in seasons {
             let episodes = eps.query_map(params![sid], row_to_episode)?.collect::<std::result::Result<_, _>>()?;
-            show.seasons.push(SeasonDetail { id: sid, number, episodes });
+            show.seasons.push(SeasonDetail { id: sid, number, title, episodes });
         }
         Ok(show)
     }
@@ -556,6 +598,88 @@ impl Db {
             .collect())
     }
 
+    /// Fold show rows that different folders produced for the same series into one.
+    ///
+    /// The scanner keys a show on the title parsed from its filenames, so one series spread over
+    /// folders named differently ("Bloom Into You" and "Yagate Kimi ni Naru") becomes two rows,
+    /// splitting its watched state. Once both have been matched to the same provider entry the
+    /// app already knows they are the same thing, so no model is needed to say so.
+    ///
+    /// The survivor is the row carrying the most episodes, so the smaller row's episodes move the
+    /// shorter distance; a title the user set by hand always wins, and any artwork or metadata
+    /// only the loser had is carried over rather than dropped. Returns how many rows were folded away.
+    pub fn merge_duplicate_shows(&self) -> Result<usize> {
+        self.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            let groups: Vec<(String, i64)> = {
+                let mut st = tx.prepare(
+                    "SELECT match_source, anilist_id FROM shows
+                     WHERE match_source IS NOT NULL AND anilist_id IS NOT NULL
+                     GROUP BY match_source, anilist_id HAVING COUNT(*) > 1")?;
+                st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?
+            };
+
+            let mut folded = 0usize;
+            for (source, ext_id) in groups {
+                let ids: Vec<i64> = {
+                    let mut st = tx.prepare(
+                        "SELECT s.id FROM shows s WHERE s.match_source = ?1 AND s.anilist_id = ?2
+                         ORDER BY (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id = se.id
+                                   WHERE se.show_id = s.id) DESC, s.id ASC")?;
+                    st.query_map(params![source, ext_id], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
+                };
+                let Some((&keep, losers)) = ids.split_first() else { continue };
+
+                for &loser in losers {
+                    // Pin every moved file to the survivor's title before it moves. Without this
+                    // the fold lasts until the next scan: the files still parse to the folded
+                    // row's title, `upsert_episode` recreates that row and the episodes walk back
+                    // out of the survivor. Only the title is re-pointed - a season or kind already
+                    // decided for a path was a deliberate judgement and is left alone.
+                    tx.execute(
+                        "INSERT INTO parse_overrides(path, title, season, number, kind, source, created_at)
+                         SELECT e.path, (SELECT parsed_title FROM shows WHERE id = ?1), se.number, e.number,
+                                COALESCE((SELECT po.kind FROM parse_overrides po WHERE po.path = e.path),
+                                         CASE WHEN se.number = 0 THEN 'special' ELSE 'episode' END),
+                                'merge', ?3
+                         FROM episodes e JOIN seasons se ON e.season_id = se.id
+                         WHERE se.show_id = ?2
+                         ON CONFLICT(path) DO UPDATE SET title = excluded.title, source = 'merge'",
+                        params![keep, loser, now()])?;
+                    // Seasons are UNIQUE(show_id, number), so episodes move season by season into
+                    // the survivor's season of the same number rather than the season row moving.
+                    let numbers: Vec<i64> = {
+                        let mut st = tx.prepare("SELECT number FROM seasons WHERE show_id = ?1")?;
+                        st.query_map(params![loser], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
+                    };
+                    for n in numbers {
+                        tx.execute("INSERT OR IGNORE INTO seasons(show_id, number) VALUES (?1, ?2)", params![keep, n])?;
+                        let dest: i64 = tx.query_row(
+                            "SELECT id FROM seasons WHERE show_id = ?1 AND number = ?2", params![keep, n], |r| r.get(0))?;
+                        tx.execute(
+                            "UPDATE episodes SET season_id = ?1 WHERE season_id =
+                             (SELECT id FROM seasons WHERE show_id = ?2 AND number = ?3)",
+                            params![dest, loser, n])?;
+                    }
+                    // Keep anything only the loser had: a hand-set title, downloaded art, counts.
+                    tx.execute(
+                        "UPDATE shows SET
+                           user_title_override = COALESCE(user_title_override, (SELECT user_title_override FROM shows WHERE id = ?2)),
+                           canonical_title     = COALESCE(canonical_title,     (SELECT canonical_title     FROM shows WHERE id = ?2)),
+                           cover_url           = COALESCE(cover_url,           (SELECT cover_url           FROM shows WHERE id = ?2)),
+                           cover_path          = COALESCE(cover_path,          (SELECT cover_path          FROM shows WHERE id = ?2)),
+                           total_episodes      = COALESCE(total_episodes,      (SELECT total_episodes      FROM shows WHERE id = ?2))
+                         WHERE id = ?1",
+                        params![keep, loser])?;
+                    tx.execute("DELETE FROM shows WHERE id = ?1", params![loser])?;
+                    folded += 1;
+                }
+            }
+            tx.commit()?;
+            Ok(folded)
+        })
+    }
+
     pub fn library_status(&self) -> Result<LibraryStatus> {
         let (roots, shows, episodes, missing_episodes, unmatched) = self.with(|c| {
             Ok((
@@ -569,7 +693,25 @@ impl Db {
         // Counted through the same filesystem check the fetcher uses, so the number shown is
         // the number of downloads pressing the button would actually do.
         let missing_art = self.shows_needing_cover()?.len() as i64;
-        Ok(LibraryStatus { roots, shows, episodes, missing_episodes, unmatched, missing_art })
+        // Rows beyond the first in each same-series group: what merging would remove.
+        let duplicates: i64 = self.with(|c| {
+            Ok(c.query_row(
+                "SELECT COALESCE(SUM(n - 1), 0) FROM (
+                   SELECT COUNT(*) AS n FROM shows
+                   WHERE match_source IS NOT NULL AND anilist_id IS NOT NULL
+                   GROUP BY match_source, anilist_id HAVING COUNT(*) > 1)",
+                [], |r| r.get(0))?)
+        })?;
+        Ok(LibraryStatus { roots, shows, episodes, missing_episodes, unmatched, missing_art, duplicates })
+    }
+
+    /// Every show title the library already holds, so an inspection can be told what exists and
+    /// answer with one of them instead of coining a synonym that becomes a second row.
+    pub fn known_titles(&self) -> Result<Vec<String>> {
+        self.with(|c| {
+            let mut st = c.prepare(&format!("SELECT DISTINCT {} FROM shows ORDER BY 1", display_title_sql()))?;
+            Ok(st.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?)
+        })
     }
 
     pub fn display_title(&self, show_id: i64) -> Result<String> {
@@ -690,7 +832,7 @@ pub fn run_scan(db: &Db, on_progress: &mut dyn FnMut(ScanProgress)) -> Result<Sc
                 Err(e) => { summary.errors.push(e.to_string()); scan.errors += 1; continue; }
             };
             let parsed = match db.get_override(&path_str)? {
-                Some(o) if o.kind == "ignore" => { seen_paths.push(path_str); continue; }
+                Some(o) if o.kind == KIND_IGNORE => { seen_paths.push(path_str); continue; }
                 Some(o) => {
                     let base = parser::parse(&f.stem, &f.dirs);
                     ParsedName {
@@ -949,12 +1091,39 @@ mod tests {
     }
 
     #[test]
+    fn a_season_keeps_the_name_it_was_released_under() {
+        let db = Db::open_memory().unwrap();
+        for (n, e) in [("s1.mkv", 1u32), ("g1.mkv", 2), ("g2.mkv", 3)] {
+            db.upsert_episode(&pn("Symphogear", 1, e), &rf(&format!("/a/{n}"), 1, 1)).unwrap();
+        }
+        db.reassign_episode("/a/g1.mkv", "Symphogear", 2, 1, Some("Symphogear G")).unwrap();
+        // A second file of the same season repeats the name; that must not disturb it.
+        db.reassign_episode("/a/g2.mkv", "Symphogear", 2, 2, Some("Symphogear G")).unwrap();
+        assert_eq!(db.season_title("Symphogear", 2).unwrap().as_deref(), Some("Symphogear G"));
+        assert_eq!(db.season_title("Symphogear", 1).unwrap(), None, "season 1 was never named");
+
+        // A later file arriving with no name of its own must not erase the one already recorded.
+        db.upsert_episode(&pn("Symphogear", 1, 4), &rf("/a/g3.mkv", 1, 1)).unwrap();
+        db.reassign_episode("/a/g3.mkv", "Symphogear", 2, 3, None).unwrap();
+        assert_eq!(db.season_title("Symphogear", 2).unwrap().as_deref(), Some("Symphogear G"));
+
+        // Echoing the show's own title back is not a name; it would read "Season 1 - Symphogear".
+        db.reassign_episode("/a/s1.mkv", "Symphogear", 1, 1, Some("Symphogear")).unwrap();
+        assert_eq!(db.season_title("Symphogear", 1).unwrap(), None);
+
+        let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+        let named: Vec<(u32, Option<String>)> =
+            db.get_show(id).unwrap().seasons.iter().map(|s| (s.number, s.title.clone())).collect();
+        assert_eq!(named, vec![(1, None), (2, Some("Symphogear G".into()))], "one show, two seasons");
+    }
+
+    #[test]
     fn reassign_moves_episode_and_prune_drops_empty_show() {
         let db = Db::open_memory().unwrap();
         db.upsert_episode(&pn("Wrong Title", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
         let old_id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
-        assert!(db.reassign_episode("/a/1.mkv", "Right Title", 0, 3).unwrap());
-        assert!(!db.reassign_episode("/nope.mkv", "X", 1, 1).unwrap());
+        assert!(db.reassign_episode("/a/1.mkv", "Right Title", 0, 3, None).unwrap());
+        assert!(!db.reassign_episode("/nope.mkv", "X", 1, 1, None).unwrap());
         db.prune_empty().unwrap();
         let shows = db.list_shows("", ShowSort::Title).unwrap();
         assert_eq!(shows.len(), 1);
@@ -1045,6 +1214,131 @@ mod tests {
         assert_eq!(db.get_show(id).unwrap().user_title_override.as_deref(), Some("Bloom Into You"));
         db.set_title_override(id, Some("   ")).unwrap();
         assert_eq!(db.display_title(id).unwrap(), "Yagate Kimi ni Naru", "blank clears the override");
+    }
+
+    #[test]
+    fn shows_matched_to_the_same_series_are_folded_into_one() {
+        let db = Db::open_memory().unwrap();
+        // One series the scanner split in two, exactly as the real library did with
+        // "Bloom Into You" and "Yagate Kimi ni Naru".
+        db.upsert_episode(&pn("Bloom Into You", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
+        db.upsert_episode(&pn("Bloom Into You", 1, 2), &rf("/a/2.mkv", 1, 1)).unwrap();
+        db.upsert_episode(&pn("Bloom Into You", 0, 1), &rf("/a/sp.mkv", 1, 1)).unwrap();
+        db.upsert_episode(&pn("Yagate Kimi ni Naru", 1, 1), &rf("/b/1.mkv", 1, 1)).unwrap();
+        db.upsert_episode(&pn("Unrelated", 1, 1), &rf("/c/1.mkv", 1, 1)).unwrap();
+
+        let id = |t: &str| db.list_shows(t, ShowSort::Title).unwrap()[0].id;
+        let (big, small, other) = (id("Bloom"), id("Yagate"), id("Unrelated"));
+        let hit = |n: &str| MetadataHit { id: 41240, source: "kitsu".into(), title_romaji: n.into(),
+            title_english: None, cover_url: Some("https://img/x.jpg".into()), episodes: Some(13) };
+        db.set_anilist(big, &hit("Yagate Kimi ni Naru")).unwrap();
+        db.set_anilist(small, &hit("Yagate Kimi ni Naru")).unwrap();
+        // A different series must not be touched.
+        db.set_anilist(other, &MetadataHit { id: 999, source: "kitsu".into(), title_romaji: "Unrelated".into(),
+            title_english: None, cover_url: None, episodes: None }).unwrap();
+        // Something only the smaller row carries has to survive the fold.
+        db.set_title_override(small, Some("My Own Name")).unwrap();
+
+        assert_eq!(db.library_status().unwrap().duplicates, 1, "status reports what merging would remove");
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+        assert_eq!(db.library_status().unwrap().duplicates, 0);
+        let shows = db.list_shows("", ShowSort::Title).unwrap();
+        assert_eq!(shows.len(), 2, "the pair became one, the unrelated show is untouched");
+
+        let merged = db.get_show(big).unwrap();
+        assert_eq!(merged.user_title_override.as_deref(), Some("My Own Name"), "a hand-set title is kept");
+        // Seasons are UNIQUE(show_id, number): the two season 1s combine rather than collide.
+        let s1 = merged.seasons.iter().find(|s| s.number == 1).unwrap();
+        assert_eq!(s1.episodes.len(), 3, "both rows' season 1 episodes are here");
+        assert_eq!(merged.seasons.iter().find(|s| s.number == 0).unwrap().episodes.len(), 1);
+        assert!(db.get_show(small).is_err(), "the folded row is gone");
+        // No episode was lost or orphaned.
+        assert_eq!(db.library_status().unwrap().episodes, 5);
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 0, "running again is a no-op");
+    }
+
+    #[test]
+    fn a_fold_survives_the_next_scan() {
+        // Without an override the fold lasts until the next scan: the files still parse to the
+        // folded row's title, upsert_episode recreates that row, and the episodes walk back out.
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Bloom Into You", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
+        db.upsert_episode(&pn("Yagate Kimi ni Naru", 1, 2), &rf("/b/2.mkv", 1, 1)).unwrap();
+        let id = |t: &str| db.list_shows(t, ShowSort::Title).unwrap()[0].id;
+        let (big, small) = (id("Bloom"), id("Yagate"));
+        let hit = MetadataHit { id: 41240, source: "kitsu".into(), title_romaji: "Yagate Kimi ni Naru".into(),
+            title_english: None, cover_url: None, episodes: None };
+        db.set_anilist(big, &hit).unwrap();
+        db.set_anilist(small, &hit).unwrap();
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+
+        let o = db.get_override("/b/2.mkv").unwrap().expect("the moved file is pinned to the survivor");
+        assert_eq!(o.title, "Bloom Into You", "pinned by parsed_title, which is what a scan keys on");
+        assert_eq!((o.season, o.number), (1, 2), "where it sits is unchanged; only the title is re-pointed");
+        assert!(db.get_override("/a/1.mkv").unwrap().is_none(),
+            "the survivor's own files already parse to its title and need no pin");
+
+        // Re-parsing the file to its original title must not resurrect the folded row.
+        let existing = db.get_override("/b/2.mkv").unwrap().unwrap();
+        db.upsert_episode(&pn(&existing.title, existing.season, existing.number), &rf("/b/2.mkv", 1, 1)).unwrap();
+        assert_eq!(db.list_shows("", ShowSort::Title).unwrap().len(), 1, "still one show after a rescan");
+    }
+
+    #[test]
+    fn a_fold_keeps_every_field_only_one_row_carried() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Big", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
+        db.upsert_episode(&pn("Big", 1, 2), &rf("/a/2.mkv", 1, 1)).unwrap();
+        db.upsert_episode(&pn("Small", 1, 1), &rf("/b/1.mkv", 1, 1)).unwrap();
+        let id = |t: &str| db.list_shows(t, ShowSort::Title).unwrap()[0].id;
+        let (big, small) = (id("Big"), id("Small"));
+        // The survivor is matched without art or a count; the folded row has both.
+        db.set_anilist(big, &MetadataHit { id: 7, source: "kitsu".into(), title_romaji: "Canon Big".into(),
+            title_english: None, cover_url: None, episodes: None }).unwrap();
+        db.set_anilist(small, &MetadataHit { id: 7, source: "kitsu".into(), title_romaji: "Canon Small".into(),
+            title_english: None, cover_url: Some("https://img/s.jpg".into()), episodes: Some(13) }).unwrap();
+        db.set_cover_path(small, "/covers/small.jpg").unwrap();
+        db.set_title_override(small, Some("My Own Name")).unwrap();
+
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+        let m = db.get_show(big).unwrap();
+        assert_eq!(m.user_title_override.as_deref(), Some("My Own Name"));
+        assert_eq!(m.cover_url.as_deref(), Some("https://img/s.jpg"), "art the survivor never had");
+        assert_eq!(m.cover_path.as_deref(), Some("/covers/small.jpg"));
+        assert_eq!(m.total_episodes, Some(13));
+        // canonical_title is the one field the survivor already had: its own value wins.
+        assert_eq!(m.canonical_title.as_deref(), Some("Canon Big"), "the survivor's own value is not overwritten");
+    }
+
+    #[test]
+    fn a_fold_that_ties_on_episode_count_keeps_the_older_row() {
+        // Equal counts fall through to the lower id. Without this the survivor - and so which
+        // row's data is discarded - would depend on SQLite's unspecified ordering.
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("First", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
+        db.upsert_episode(&pn("Second", 1, 1), &rf("/b/1.mkv", 1, 1)).unwrap();
+        let id = |t: &str| db.list_shows(t, ShowSort::Title).unwrap()[0].id;
+        let (first, second) = (id("First"), id("Second"));
+        assert!(first < second, "First was created first");
+        let hit = MetadataHit { id: 3, source: "kitsu".into(), title_romaji: "X".into(),
+            title_english: None, cover_url: None, episodes: None };
+        db.set_anilist(first, &hit).unwrap();
+        db.set_anilist(second, &hit).unwrap();
+
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+        assert!(db.get_show(first).is_ok(), "the older row survives");
+        assert!(db.get_show(second).is_err());
+    }
+
+    #[test]
+    fn unmatched_lookalikes_are_left_alone() {
+        // Without a shared provider id there is no evidence these are the same series, and
+        // guessing from titles alone would merge distinct shows.
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Show", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
+        db.upsert_episode(&pn("Show 2nd Season", 1, 1), &rf("/b/1.mkv", 1, 1)).unwrap();
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 0);
+        assert_eq!(db.list_shows("", ShowSort::Title).unwrap().len(), 2);
     }
 
     #[test]

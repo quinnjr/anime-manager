@@ -106,6 +106,17 @@ pub fn match_library(app: AppHandle, state: State<'_, AppState>) -> Result<usize
 #[tauri::command]
 pub fn match_progress(state: State<'_, AppState>) -> Result<bool> { Ok(state.matching.is_running()) }
 
+/// Fold show rows that point at the same series. Runs automatically after matching; exposed so
+/// it can be run on its own from Settings.
+#[tauri::command]
+pub fn merge_duplicates(app: AppHandle, state: State<'_, AppState>) -> Result<usize> {
+    let n = state.db.merge_duplicate_shows()?;
+    if n > 0 && let Err(e) = app.emit("library-changed", ()) {
+        eprintln!("merge finished but the library-changed event did not reach the window: {e}");
+    }
+    Ok(n)
+}
+
 #[tauri::command]
 pub fn library_status(state: State<'_, AppState>) -> Result<LibraryStatus> { state.db.library_status() }
 

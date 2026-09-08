@@ -90,6 +90,21 @@
     try { await api.removeRoot(id); await loadLibrary(); } catch (e) { toasts.error(e); }
   }
 
+  let merging = $state(false);
+
+  // Two folders named differently for one series become two shows, splitting its watched state.
+  // Once both are matched the app knows they are the same, so this needs no model.
+  async function mergeDuplicates() {
+    merging = true;
+    try {
+      const n = await api.mergeDuplicates();
+      toasts.push(n === 0 ? 'info' : 'success',
+        n === 0 ? 'No duplicate shows to fold.' : `Folded ${n} duplicate show${n === 1 ? '' : 's'} into their originals.`);
+      await loadLibrary();
+    } catch (e) { toasts.error(e); }
+    finally { merging = false; }
+  }
+
   async function matchLibrary() {
     matchingNow = true;
     try {
@@ -213,17 +228,22 @@
     <h2 class="eyebrow mb-3">Titles &amp; artwork</h2>
     <p class="mb-3 max-w-prose text-sm text-muted">
       Looks up each show on AniList and Kitsu, then downloads its cover art. This does not re-read
-      your files, so it is safe to run after a provider outage.
+      your files, so it is safe to run after a provider outage. Matching also folds together rows
+      that turn out to be the same series under two different folder names.
     </p>
     {#if status}
       <p class="tag mb-3">
         {status.unmatched === 0 ? 'every show matched' : `${status.unmatched} unmatched`}
         · {status.missing_art === 0 ? 'every cover on disk' : `${status.missing_art} covers to fetch`}
+        {#if status.duplicates > 0}· <span class="text-sub">{status.duplicates} duplicate {status.duplicates === 1 ? 'row' : 'rows'}</span>{/if}
       </p>
     {/if}
     <div class="flex flex-wrap items-center gap-2">
       <button class="btn btn-key" disabled={matchingNow || matching.active} onclick={matchLibrary}>
         {matching.active ? 'Working…' : 'Match & fetch art'}
+      </button>
+      <button class="btn" disabled={merging || (status?.duplicates ?? 0) === 0} onclick={mergeDuplicates}>
+        {merging ? 'Folding…' : 'Merge duplicate shows'}
       </button>
       {#if matching.active}
         <span class="tag tabular-nums" title={matching.progress.title}>

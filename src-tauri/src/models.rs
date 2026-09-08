@@ -69,10 +69,21 @@ pub struct Episode {
     pub last_played_at: Option<i64>,
 }
 
+/// The four values `parse_overrides.kind` and an LLM file decision may carry. They are a stored
+/// protocol - the CHECK constraint on `parse_overrides` rejects anything else - so they are named
+/// once here rather than spelled as literals at each of the dozen places that compare them.
+pub const KIND_EPISODE: &str = "episode";
+pub const KIND_SPECIAL: &str = "special";
+pub const KIND_MOVIE: &str = "movie";
+pub const KIND_IGNORE: &str = "ignore";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SeasonDetail {
     pub id: i64,
     pub number: u32,
+    /// The name this season was broadcast under when it differs from the show's own, so a
+    /// sequel titled "Non Non Biyori Repeat" reads as season 2 without losing what it is called.
+    pub title: Option<String>,
     pub episodes: Vec<Episode>,
 }
 
@@ -151,6 +162,8 @@ pub struct LibraryStatus {
     pub unmatched: i64,
     /// Matched shows whose cover art is not on disk.
     pub missing_art: i64,
+    /// Show rows that duplicate another row already matched to the same series.
+    pub duplicates: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

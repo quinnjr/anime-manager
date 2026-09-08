@@ -70,7 +70,7 @@ pub fn run() {
             commands::play, commands::search_metadata, commands::rematch,
             commands::preview_rename, commands::apply_rename, commands::undo_rename,
             commands::inspect_show, commands::llm_test, commands::llm_models, commands::assist_progress, commands::clear_ai_decisions, commands::set_show_title,
-            commands::match_library, commands::match_progress, commands::library_status,
+            commands::match_library, commands::match_progress, commands::library_status, commands::merge_duplicates,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
