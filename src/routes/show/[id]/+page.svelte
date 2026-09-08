@@ -77,7 +77,13 @@
       if (r.show_id != null && r.show_id !== show.id) await goto(`/show/${r.show_id}`);
       else if (r.show_id == null) await goto('/');
       else await load();
-    } catch (e) { toasts.error(e); } finally { inspecting = false; }
+    } catch (e) {
+      // The apply loop is not atomic, so a failure part-way through leaves some files already
+      // refiled. Reload rather than leave the old breakdown on screen, or the next Play or
+      // Rename click acts on ids that have moved. `load()` handles the show having been deleted.
+      toasts.error(e);
+      await load();
+    } finally { inspecting = false; }
   }
 
   $effect(() => {
@@ -152,7 +158,8 @@
     </div>
   </section>
 
-  <SeasonList {seasons} {highlight} onRename={(episodeId) => openRename({ type: 'episode', id: episodeId })} />
+  <SeasonList {seasons} highlightedId={rows[highlight]?.group.primary.id ?? null}
+    onRename={(episodeId) => openRename({ type: 'episode', id: episodeId })} />
 
   <RematchModal showId={show.id} initialQuery={show.parsed_title} bind:open={rematchOpen} onDone={load} />
   <RenameModal target={renameTarget} bind:open={renameOpen} onDone={load} />

@@ -70,6 +70,12 @@ errors is skipped rather than failing the search. This is not hypothetical redun
 disabled its API outright in September 2026 (403, "temporarily disabled due to severe stability
 issues") and Jikan was returning 504 at the same time, while Kitsu stayed up. Kitsu needs no key.
 
+`seasons.title` holds the name a season was *broadcast* under when it differs from the show's:
+a sequel released as "Non Non Biyori Repeat" or "Senki Zesshou Symphogear G" is season 2, not a
+second show. Only the LLM assist sets it — providers give such a sequel its own entry, so the
+merge pass cannot see the relationship. It is never overwritten once set, never applied to
+season 0, and a reply echoing the show's own title back counts as no name at all.
+
 `shows.match_source` records which provider matched, and `anilist_id` holds *that provider's* id,
 so it is only an AniList id when `match_source = 'anilist'`. Auto-match is gated on
 `match_source IS NULL`, not `anilist_id IS NULL`, or a Kitsu-matched show would be re-searched on
@@ -180,6 +186,10 @@ These exist because their absence destroyed data in review. Do not "simplify" th
 - `rename_log.episode_id` is nullable `ON DELETE SET NULL`; deleting an episode must not destroy its undo record.
 - A special keyword (`OVA`, `NCOP`, `Special`, …) counts only inside a bracket token, inside the matched episode marker, or in a stem with no marker at all. Matching it anywhere sends real episodes to season 0 and drops shows whose title starts with such a word.
 - Paths that are not valid UTF-8 are reported in `ScanSummary.errors`, never stored lossily.
+- **`shows.parsed_title` is the identity every write keys on.** `display_title` (`COALESCE(user_title_override, canonical_title, parsed_title)`) is for humans and for prompts; `reassign_episode` and `set_override` look a show up by `parsed_title`. Writing a display title back creates a second row for every *matched* show and splits it in half — permanently, because the override survives a rescan and the new row carries no provider id for the merge pass to fold.
+- **`merge_duplicate_shows` writes a `parse_overrides` row for every path it moves.** The files on disk still parse to the folded row's title, so without the pin the next scan recreates that row and the episodes walk back out: the fold would last until the next scan and no further. Only the title is re-pointed; a season or kind already decided for a path stays.
+- **A whole-show LLM decision is keyed on the path below the library root, not the basename.** Every rip names its first episode `01.mkv`, so a basename is ambiguous exactly where the feature is aimed — a decision meant for `Season 2/01.mkv` would also move `Season 1/01.mkv`.
+- The whole-show path never falls back to the reply's show-level `season` for a file that gave none. That number is one value for a multi-season show; using it would collapse every season into one on a lazy reply.
 
 ## Validating parser changes
 

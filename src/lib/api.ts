@@ -10,7 +10,7 @@ export interface Episode {
   release_group: string | null; resolution: string | null; crc: string | null;
   status: EpisodeStatus; position_secs: number; duration_secs: number | null; last_played_at: number | null;
 }
-export interface SeasonDetail { id: number; number: number; episodes: Episode[] }
+export interface SeasonDetail { id: number; number: number; title: string | null; episodes: Episode[] }
 export interface ShowDetail {
   id: number; parsed_title: string; display_title: string; canonical_title: string | null;
   anilist_id: number | null; match_source: MetadataSource | null;

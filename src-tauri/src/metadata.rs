@@ -99,10 +99,12 @@ pub async fn auto_match_all(
     }
     // Matching is what reveals that two rows are the same series, so fold them now rather than
     // leaving the library showing one show twice with its watched state split between them.
-    if let Ok(n) = db.merge_duplicate_shows()
-        && n > 0
-    {
-        eprintln!("merged {n} duplicate show rows");
+    match db.merge_duplicate_shows() {
+        Ok(0) => {}
+        Ok(n) => eprintln!("merged {n} duplicate show rows"),
+        // Silence here would read as "there was nothing to merge": the duplicate count in
+        // Settings simply never drops and the library keeps showing one series as two rows.
+        Err(e) => eprintln!("merging duplicate shows failed: {e}"),
     }
     matched
 }
@@ -186,6 +188,32 @@ mod tests {
         assert_eq!(seen.iter().filter(|p| p.changed.is_some()).count(), 1);
         assert_eq!(db.shows_needing_match().unwrap().len(), 1, "the unmatched one stays pending");
         assert!(seen.iter().all(|p| p.running && p.phase == "matching"));
+    }
+
+    #[tokio::test]
+    async fn matching_folds_the_rows_it_just_proved_are_one_series() {
+        // The fold is what makes matching self-healing; a refactor that drops the call, or moves
+        // it before matching finishes, would leave the library showing one series as two rows.
+        use crate::parser::ParsedName;
+        use crate::scanner::RawFile;
+        let (dead, live) = one_provider_down().await;
+        let db = std::sync::Arc::new(crate::db::Db::open_memory().unwrap());
+        // Two folder names for the same series, exactly as the real library had them.
+        for (t, f) in [("Sousou no Frieren", "/a/1.mkv"), ("Frieren Beyond Journey's End", "/b/1.mkv")] {
+            let pn = ParsedName { title: t.into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
+            db.upsert_episode(&pn, &RawFile { path: f.into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] }).unwrap();
+        }
+        assert_eq!(db.list_shows("", crate::models::ShowSort::Title).unwrap().len(), 2);
+        let p = std::sync::Arc::new(Providers {
+            anilist: AniList::with_endpoint(dead.uri()).with_retry_base(std::time::Duration::from_millis(1)),
+            kitsu: Kitsu::with_endpoint(live.uri()),
+        });
+        auto_match_all(db.clone(), p, |_| {}).await;
+
+        assert_eq!(db.library_status().unwrap().duplicates, 0, "nothing is left duplicated");
+        assert_eq!(db.list_shows("", crate::models::ShowSort::Title).unwrap().len(), 1,
+            "matching both to one provider entry folded them without a second pass");
+        assert_eq!(db.library_status().unwrap().episodes, 2, "and kept both files");
     }
 
     #[tokio::test]

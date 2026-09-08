@@ -6,7 +6,7 @@
 //! since free model ids rotate.
 use crate::db::Db;
 use crate::error::{AppError, Result};
-use crate::models::{AssistProgress, InspectChange, InspectReport, ParseOverride};
+use crate::models::{AssistProgress, InspectChange, InspectReport, ParseOverride, KIND_EPISODE, KIND_IGNORE, KIND_MOVIE, KIND_SPECIAL};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, VecDeque};
@@ -22,6 +22,8 @@ pub const MAX_FILES_PER_FOLDER: usize = 200;
 /// A cap on how many existing titles travel with a request, so a large library does not turn
 /// every inspection into a huge prompt.
 pub const MAX_KNOWN_TITLES: usize = 400;
+/// Longest `Retry-After` worth honouring in-process; beyond this the quota is spent, not busy.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// Attempts per request; waits grow as retry_base * 2^n and honour Retry-After.
 pub const MAX_ATTEMPTS: u32 = 6;
 /// Default pause between folders so free-tier rate limits are not hammered.
@@ -34,8 +36,14 @@ If a file belongs to a different anime than the folder (e.g. a bundled spin-off)
 You may be given the titles this library already holds. If this folder is the same series as one of them - a different \
 release, a different naming of it, or another season - reply with that exact existing title, character for character, so \
 the episodes join it instead of starting a second entry. Only coin a new title when it is genuinely a different series. \
+Sequels are very often broadcast under a name of their own rather than a numbered season - \"Non Non Biyori Repeat\" is \
+season 2 of \"Non Non Biyori\", \"Senki Zesshou Symphogear G\" is season 2 of \"Senki Zesshou Symphogear\", \"K-On!!\" is \
+season 2 of \"K-On!\". Treat these as a later season of the parent series, not as a separate show: put the parent series in \
+\"title\", the season number in \"season\", and the name that season was released under in \"season_title\". Set \
+\"season_title\" to null when the season has no name of its own beyond a number. A remake, a spin-off with its own cast, \
+or a film is a different work, not a later season. \
 Respond with JSON only, no prose, exactly this shape: \
-{\"title\": string, \"season\": integer|null, \"files\": [{\"name\": string, \"kind\": \"episode\"|\"special\"|\"movie\"|\"ignore\", \"season\": integer, \"episode\": integer, \"title\": string|null}], \"notes\": string}. \
+{\"title\": string, \"season\": integer|null, \"season_title\": string|null, \"files\": [{\"name\": string, \"kind\": \"episode\"|\"special\"|\"movie\"|\"ignore\", \"season\": integer, \"episode\": integer, \"title\": string|null, \"season_title\": string|null}], \"notes\": string}. \
 \"name\" must be copied verbatim from the input. Keep episode numbers as printed in the file name (do not renumber to absolute).";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +74,10 @@ pub struct FileDecision {
     pub episode: Option<u32>,
     #[serde(default)]
     pub title: Option<String>,
+    /// The name this file's season was released under, when the sequel carries its own title.
+    /// Per-file because one whole-show request can span several differently-named seasons.
+    #[serde(default)]
+    pub season_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -73,6 +85,9 @@ pub struct FolderInspection {
     pub title: String,
     #[serde(default, deserialize_with = "lenient_u32")]
     pub season: Option<u32>,
+    /// Fallback season name for files that did not carry one of their own.
+    #[serde(default)]
+    pub season_title: Option<String>,
     #[serde(default)]
     pub files: Vec<FileDecision>,
     #[serde(default)]
@@ -157,7 +172,16 @@ impl Llm {
             };
             if !retryable || attempt >= MAX_ATTEMPTS { return Err(err); }
             let backoff = self.retry_base * 2u32.pow(attempt - 1);
-            tokio::time::sleep(wait.unwrap_or(backoff).max(backoff)).await;
+            let asked = wait.unwrap_or(backoff).max(backoff);
+            // A daily-quota 429 answers Retry-After in hours. Honouring that would hold the
+            // single assist lock for the whole wait, with the button reading "Checking..." and
+            // every background run refused; a quota that far out is a failure, not a pause.
+            if asked > MAX_RETRY_AFTER {
+                return Err(AppError::Network(format!(
+                    "{} asked to wait {} minutes before retrying, which usually means the free quota is spent; try again later",
+                    self.model, asked.as_secs() / 60)));
+            }
+            tokio::time::sleep(asked).await;
         };
         let v: Value = serde_json::from_str(&text)?;
         let content = v.pointer("/choices/0/message/content").and_then(|c| c.as_str())
@@ -210,12 +234,16 @@ impl Llm {
             user.push_str(&format!("- {}\n    {}\n", f.name, f.guess));
         }
         if files.len() > MAX_FILES_PER_FOLDER {
-            user.push_str(&format!("... and {} more, decide them by the same pattern.\n", files.len() - MAX_FILES_PER_FOLDER));
+            // Naming a count without inviting guesses: a decision for a file the model never saw
+            // can still land, because an invented name may collide with a real one.
+            user.push_str(&format!("({} further files are not listed; do not judge them.)\n", files.len() - MAX_FILES_PER_FOLDER));
         }
         user.push_str(
             "\nCheck the season and episode of every file and correct anything filed wrongly. \
              Several files may be different rips of the same episode: give them the same season and episode. \
-             Openings, endings, OVAs and extras belong in season 0.\n",
+             Openings, endings, OVAs and extras belong in season 0. \
+             If part of this show was broadcast under a title of its own, keep those files here under the \
+             season number they belong to and give that release name as \"season_title\".\n",
         );
         let reply = self.chat(SYSTEM_PROMPT, &user).await?;
         parse_inspection(&reply)
@@ -288,7 +316,12 @@ async fn inspect_one(db: &Db, llm: &Llm, roots: &[String], folder: &str, source:
         guess: format!("{title} S{season}E{number}"),
     }).collect();
     let rel = rel_to_roots(roots, folder);
-    let known = db.known_titles().unwrap_or_default();
+    // Losing this list silently reverts to the behaviour that coins a synonym for a show the
+    // library already holds, so say so rather than let the run look normal.
+    let known = match db.known_titles() {
+        Ok(k) => k,
+        Err(e) => { report.notes.push(format!("could not read the library's titles, so this folder was judged without them: {e}")); Vec::new() }
+    };
     let inspection = match llm.inspect_folder_with(&rel, &files, &known).await {
         Ok(i) => i,
         Err(e) => { report.notes.push(format!("{rel}: {e}")); return Ok(true); }
@@ -299,19 +332,20 @@ async fn inspect_one(db: &Db, llm: &Llm, roots: &[String], folder: &str, source:
     for d in &inspection.files {
         let Some((path, cur_title, cur_season, cur_number)) = by_name.get(d.name.as_str()).map(|r| (&r.0, &r.1, r.2, r.3)) else { continue };
         let from = format!("{cur_title} S{cur_season}E{cur_number}");
-        if d.kind == "ignore" {
-            db.set_override(&ParseOverride { path: path.clone(), title: String::new(), season: 0, number: 0, kind: "ignore".into(), source: source.into() })?;
+        if d.kind == KIND_IGNORE {
+            db.set_override(&ParseOverride { path: path.clone(), title: String::new(), season: 0, number: 0, kind: KIND_IGNORE.into(), source: source.into() })?;
             db.delete_episode_by_path(path)?;
             report.ignored += 1;
             report.changes.push(InspectChange { path: path.clone(), from, to: "ignored".into() });
             continue;
         }
-        let kind = match d.kind.as_str() { "special" | "movie" | "episode" => d.kind.clone(), _ => "episode".into() };
+        let kind = normalize_kind(&d.kind);
         let title = d.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| inspection.title.clone()).trim().to_string();
-        let season = if kind == "special" { 0 } else { d.season.or(inspection.season).unwrap_or(1) };
-        let number = d.episode.unwrap_or(if kind == "movie" { 1 } else { cur_number });
+        let season = if kind == KIND_SPECIAL { 0 } else { d.season.or(inspection.season).unwrap_or(1) };
+        let number = d.episode.unwrap_or(if kind == KIND_MOVIE { 1 } else { cur_number });
+        let season_title = if season == 0 { None } else { d.season_title.clone().or_else(|| inspection.season_title.clone()) };
         db.set_override(&ParseOverride { path: path.clone(), title: title.clone(), season, number, kind, source: source.into() })?;
-        db.reassign_episode(path, &title, season, number)?;
+        db.reassign_episode(path, &title, season, number, season_title.as_deref())?;
         let to = format!("{title} S{season}E{number}");
         if to != from { report.changes.push(InspectChange { path: path.clone(), from, to }); }
     }
@@ -448,61 +482,138 @@ pub async fn inspect_show(db: Arc<Db>, llm: Arc<Llm>, queue: Arc<AssistQueue>, s
     if episodes.is_empty() {
         return Err(AppError::Db(format!("show {show_id} has no episodes")));
     }
-    let title = db.display_title(show_id).unwrap_or_default();
-    let files: Vec<FileGuess> = episodes
+    // Two different names for one show. `display` is what a model can recognise - the canonical
+    // romaji title once matched - so it is what the prompt says and what the report reads back.
+    // `parsed` is the identity every write keys on, because `reassign_episode` and `set_override`
+    // look a show up by `shows.parsed_title`. Sending the display title and writing it back would
+    // create a second row for every matched show and split it in half, permanently: the override
+    // survives a rescan and the new row carries no provider id for the merge pass to fold.
+    let show = db.get_show(show_id)?;
+    let (parsed, display) = (show.parsed_title, show.display_title);
+    let roots: Vec<String> = db.list_roots().unwrap_or_default().into_iter().map(|r| r.path).collect();
+
+    // Identify a file by its path below the library root, not its basename. Every rip names its
+    // first episode "- 01.mkv", so a basename is ambiguous exactly where this feature is aimed -
+    // a decision meant for "Season 2/01.mkv" would otherwise also move "Season 1/01.mkv".
+    let named: Vec<(String, &String, u32, u32)> = episodes
         .iter()
-        .map(|(path, season, number)| FileGuess {
-            name: Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or(path).to_string(),
-            guess: format!("currently S{season}E{number}"),
-        })
+        .map(|(path, season, number)| (rel_to_roots(&roots, path), path, *season, *number))
+        .collect();
+    let files: Vec<FileGuess> = named
+        .iter()
+        .map(|(name, _, season, number)| FileGuess { name: name.clone(), guess: format!("currently S{season}E{number}") })
         .collect();
 
     let mut report = InspectReport::default();
-    let inspection = llm.inspect_show_breakdown(&title, &files).await?;
+    let inspection = llm.inspect_show_breakdown(&display, &files).await?;
     report.folders = 1;
     if !inspection.notes.trim().is_empty() {
         report.notes.push(inspection.notes.trim().to_string());
     }
-    // Names repeat across folders (every rip calls it "- 01.mkv"), so a decision is applied to
-    // every path with that name rather than to one arbitrary match.
-    let mut by_name: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
-    for (path, _, _) in &episodes {
-        let name = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or(path);
-        by_name.entry(name).or_default().push(path);
+    if files.len() > MAX_FILES_PER_FOLDER {
+        // Say so rather than let the UI report "already right" about files nobody looked at.
+        report.notes.push(format!(
+            "only the first {MAX_FILES_PER_FOLDER} of {} files were examined; run this again to cover the rest",
+            files.len()
+        ));
     }
+    let by_name: BTreeMap<&str, (&String, u32, u32)> =
+        named.iter().map(|(name, path, s, n)| (name.as_str(), (*path, *s, *n))).collect();
+    // A model that answers with the bare file name is still understood, but only where that name
+    // belongs to exactly one file; where it repeats, there is no way to tell which was meant.
+    let mut by_base: BTreeMap<&str, Option<&str>> = BTreeMap::new();
+    for (name, _, _, _) in &named {
+        let base = Path::new(name.as_str()).file_name().and_then(|s| s.to_str()).unwrap_or(name);
+        by_base.entry(base).and_modify(|e| *e = None).or_insert(Some(name.as_str()));
+    }
+
     for d in &inspection.files {
-        let Some(paths) = by_name.get(d.name.as_str()) else { continue };
-        for path in paths {
-            let (_, cur_season, cur_number) = episodes.iter().find(|(p, _, _)| p == *path).unwrap();
-            let from = format!("{title} S{cur_season}E{cur_number}");
-            if d.kind == "ignore" {
-                db.set_override(&ParseOverride { path: (*path).clone(), title: String::new(), season: 0, number: 0, kind: "ignore".into(), source: "llm".into() })?;
-                db.delete_episode_by_path(path)?;
-                report.ignored += 1;
-                report.changes.push(InspectChange { path: (*path).clone(), from, to: "ignored".into() });
-                continue;
-            }
-            let kind = match d.kind.as_str() { "special" | "movie" | "episode" => d.kind.clone(), _ => "episode".into() };
-            let new_title = d.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| inspection.title.clone()).trim().to_string();
-            let season = if kind == "special" { 0 } else { d.season.or(inspection.season).unwrap_or(*cur_season) };
-            let number = d.episode.unwrap_or(*cur_number);
-            if new_title == title && season == *cur_season && number == *cur_number { continue; }
-            db.set_override(&ParseOverride { path: (*path).clone(), title: new_title.clone(), season, number, kind, source: "llm".into() })?;
-            db.reassign_episode(path, &new_title, season, number)?;
-            report.changes.push(InspectChange { path: (*path).clone(), from, to: format!("{new_title} S{season}E{number}") });
+        let key = if by_name.contains_key(d.name.as_str()) {
+            d.name.as_str()
+        } else if let Some(Some(unique)) = by_base.get(d.name.as_str()) {
+            unique
+        } else {
+            continue;
+        };
+        let Some((path, cur_season, cur_number)) = by_name.get(key).copied() else { continue };
+        let from = format!("{display} S{cur_season}E{cur_number}");
+
+        // One file failing must not abandon the rest, nor throw away the record of what already
+        // moved: the writes above it are committed and the report is the only account of them.
+        let fallback = inspection.season_title.as_deref();
+        if let Err(e) = apply_decision(&db, d, path, &parsed, &display, fallback, cur_season, cur_number, from, &mut report) {
+            report.notes.push(format!("{key}: {e}"));
         }
     }
     db.prune_empty()?;
-    report.show_id = db.episode_paths_for_show(show_id).ok()
-        .and_then(|p| p.first().and_then(|p| db.show_id_for_path(p).ok().flatten()))
-        .or(Some(show_id));
+    // Only a genuinely emptied show yields None here; a failed lookup is an error, not a silent
+    // fallback to an id that may no longer exist.
+    let paths = db.episode_paths_for_show(show_id)?;
+    report.show_id = match paths.first() {
+        Some(p) => db.show_id_for_path(p)?,
+        None => db.get_show(show_id).ok().map(|_| show_id),
+    };
     Ok(report)
+}
+
+/// Apply one model decision to one file. Split out so a failure can be reported against that file
+/// and the loop carried on, rather than propagating and discarding the report.
+#[allow(clippy::too_many_arguments)]
+fn apply_decision(
+    db: &Db,
+    d: &FileDecision,
+    path: &String,
+    parsed: &str,
+    display: &str,
+    // Season name for a file that did not carry one of its own.
+    fallback_season_title: Option<&str>,
+    cur_season: u32,
+    cur_number: u32,
+    from: String,
+    report: &mut InspectReport,
+) -> Result<()> {
+    if d.kind == KIND_IGNORE {
+        db.set_override(&ParseOverride { path: path.clone(), title: String::new(), season: 0, number: 0, kind: KIND_IGNORE.into(), source: "llm".into() })?;
+        db.delete_episode_by_path(path)?;
+        report.ignored += 1;
+        report.changes.push(InspectChange { path: path.clone(), from, to: "ignored".into() });
+        return Ok(());
+    }
+    let kind = normalize_kind(&d.kind);
+    let answered = d.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_default().trim().to_string();
+    // The model was shown the display title, so answering with it means "the same show" - which is
+    // the parsed title as far as every write is concerned.
+    let new_title = if answered.is_empty() || answered.eq_ignore_ascii_case(display) || answered.eq_ignore_ascii_case(parsed) {
+        parsed.to_string()
+    } else {
+        answered
+    };
+    // No show-level fallback here: `inspection.season` is one number for a whole multi-season
+    // show, so using it for a file the model left blank would collapse every season into one.
+    let season = if kind == KIND_SPECIAL { 0 } else { d.season.unwrap_or(cur_season) };
+    let number = d.episode.unwrap_or(cur_number);
+    if new_title == parsed && season == cur_season && number == cur_number { return Ok(()); }
+    db.set_override(&ParseOverride { path: path.clone(), title: new_title.clone(), season, number, kind, source: "llm".into() })?;
+    let season_title = if season == 0 { None } else { d.season_title.as_deref().or(fallback_season_title) };
+    db.reassign_episode(path, &new_title, season, number, season_title)?;
+    report.changes.push(InspectChange { path: path.clone(), from, to: format!("{new_title} S{season}E{number}") });
+    Ok(())
+}
+
+/// The model may answer with any string; anything outside the stored protocol is treated as a
+/// plain episode rather than rejected, so one odd word does not lose the file's numbering.
+fn normalize_kind(kind: &str) -> String {
+    if kind == KIND_SPECIAL || kind == KIND_MOVIE || kind == KIND_EPISODE {
+        kind.to_string()
+    } else {
+        KIND_EPISODE.to_string()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::ShowSort;
+    use crate::models::{MetadataHit, ShowSort};
     use crate::parser::ParsedName;
     use crate::scanner::RawFile;
     use wiremock::matchers::{header, method, path};
@@ -638,6 +749,189 @@ mod tests {
         // The decisions persist, so a rescan does not undo them.
         assert_eq!(db.get_override("/lib/Sekirei/s2-01.mkv").unwrap().unwrap().season, 2);
         assert_eq!(db.get_override("/lib/Sekirei/sample.mkv").unwrap().unwrap().kind, "ignore");
+    }
+
+    #[tokio::test]
+    async fn a_matched_show_is_not_forked_into_a_second_row() {
+        // The model is shown the display title, but every write keys on parsed_title. Echoing the
+        // display title back must mean "the same show", not a new row - otherwise every matched
+        // show splits in half the first time this runs, and the override makes it permanent.
+        let server = MockServer::start().await;
+        let content = r#"{"title":"Sousou no Frieren","season":1,"season_title":null,"files":[
+            {"name":"Frieren BD/01.mkv","kind":"episode","season":1,"episode":1,"title":null,"season_title":null},
+            {"name":"Frieren BD/02.mkv","kind":"episode","season":2,"episode":1,"title":null,"season_title":null}
+        ],"notes":""}"#;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply(content)))
+            .mount(&server).await;
+        let db = Arc::new(Db::open_memory().unwrap());
+        db.add_root("/lib").unwrap();
+        let pn = |t: &str, s: u32, e: u32| ParsedName { title: t.into(), season: s, episode: e, release_group: None, resolution: None, crc: None };
+        let rf = |p: &str| RawFile { path: p.into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
+        db.upsert_episode(&pn("Frieren BD", 1, 1), &rf("/lib/Frieren BD/01.mkv")).unwrap();
+        db.upsert_episode(&pn("Frieren BD", 1, 2), &rf("/lib/Frieren BD/02.mkv")).unwrap();
+        let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+        // Matching gives it a canonical title, so display_title != parsed_title from here on.
+        db.set_anilist(id, &MetadataHit { id: 52991, source: "anilist".into(),
+            title_romaji: "Sousou no Frieren".into(), title_english: None, cover_url: None, episodes: None }).unwrap();
+        assert_eq!(db.display_title(id).unwrap(), "Sousou no Frieren");
+
+        let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()));
+        inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), id).await.unwrap();
+
+        let shows = db.list_shows("", ShowSort::Title).unwrap();
+        assert_eq!(shows.len(), 1, "still one show, not a canonical-titled twin");
+        assert_eq!(shows[0].id, id);
+        let d = db.get_show(id).unwrap();
+        assert_eq!(d.seasons.iter().map(|s| (s.number, s.episodes.len())).collect::<Vec<_>>(), vec![(1, 1), (2, 1)]);
+        // The override that persists the move must carry the identity a scan keys on.
+        assert_eq!(db.get_override("/lib/Frieren BD/02.mkv").unwrap().unwrap().title, "Frieren BD");
+    }
+
+    #[tokio::test]
+    async fn a_decision_moves_only_the_file_it_names() {
+        // Every rip names its first episode "01.mkv". Identifying a file by basename alone would
+        // apply a decision meant for one folder to its namesake in another.
+        let server = MockServer::start().await;
+        let content = r#"{"title":"Sekirei","season":1,"season_title":null,"files":[
+            {"name":"Sekirei/S2/01.mkv","kind":"episode","season":2,"episode":1,"title":null,"season_title":null}
+        ],"notes":""}"#;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply(content)))
+            .mount(&server).await;
+        let db = Arc::new(Db::open_memory().unwrap());
+        db.add_root("/lib").unwrap();
+        let pn = |t: &str, s: u32, e: u32| ParsedName { title: t.into(), season: s, episode: e, release_group: None, resolution: None, crc: None };
+        let rf = |p: &str| RawFile { path: p.into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
+        db.upsert_episode(&pn("Sekirei", 1, 1), &rf("/lib/Sekirei/S1/01.mkv")).unwrap();
+        db.upsert_episode(&pn("Sekirei", 1, 2), &rf("/lib/Sekirei/S2/01.mkv")).unwrap();
+        let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+        let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()));
+        inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), id).await.unwrap();
+
+        let d = db.get_show(id).unwrap();
+        let placed: Vec<(u32, String)> = d.seasons.iter()
+            .flat_map(|s| s.episodes.iter().map(move |e| (s.number, e.path.clone())))
+            .collect();
+        assert_eq!(placed, vec![
+            (1, "/lib/Sekirei/S1/01.mkv".to_string()),
+            (2, "/lib/Sekirei/S2/01.mkv".to_string()),
+        ], "the season 1 namesake stayed put");
+        assert!(db.get_override("/lib/Sekirei/S1/01.mkv").unwrap().is_none(), "and was never written");
+    }
+
+    #[tokio::test]
+    async fn a_file_the_reply_gives_no_season_keeps_the_one_it_has() {
+        // The show-level season is a single number for a whole multi-season show; using it as a
+        // per-file fallback would collapse every season into one on a lazy reply.
+        let server = MockServer::start().await;
+        let content = r#"{"title":"Sekirei","season":1,"season_title":null,"files":[
+            {"name":"Sekirei/S2/05.mkv","kind":"episode","season":null,"episode":null,"title":null,"season_title":null}
+        ],"notes":""}"#;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply(content)))
+            .mount(&server).await;
+        let db = Arc::new(Db::open_memory().unwrap());
+        db.add_root("/lib").unwrap();
+        let pn = |t: &str, s: u32, e: u32| ParsedName { title: t.into(), season: s, episode: e, release_group: None, resolution: None, crc: None };
+        let rf = |p: &str| RawFile { path: p.into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
+        db.upsert_episode(&pn("Sekirei", 2, 5), &rf("/lib/Sekirei/S2/05.mkv")).unwrap();
+        let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+        let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()));
+        let r = inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), id).await.unwrap();
+
+        assert!(r.changes.is_empty(), "nothing was said, so nothing moved");
+        assert_eq!(db.get_show(id).unwrap().seasons.iter().map(|s| s.number).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_is_not_json_changes_nothing_and_frees_the_assist() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply("I'm afraid I can't help with that.")))
+            .mount(&server).await;
+        let db = Arc::new(Db::open_memory().unwrap());
+        db.add_root("/lib").unwrap();
+        let pn = |t: &str, s: u32, e: u32| ParsedName { title: t.into(), season: s, episode: e, release_group: None, resolution: None, crc: None };
+        let rf = |p: &str| RawFile { path: p.into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
+        db.upsert_episode(&pn("Sekirei", 1, 1), &rf("/lib/Sekirei/01.mkv")).unwrap();
+        let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+        let queue = Arc::new(AssistQueue::default());
+        let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()));
+
+        assert!(inspect_show(db.clone(), llm, queue.clone(), id).await.is_err());
+        assert!(db.get_override("/lib/Sekirei/01.mkv").unwrap().is_none(), "no decision was written");
+        assert_eq!(db.get_show(id).unwrap().seasons[0].episodes.len(), 1, "the episode is still there");
+        assert!(queue.try_start().is_some(), "the failure released the assist lock");
+    }
+
+    #[tokio::test]
+    async fn files_the_reply_never_mentions_are_left_alone() {
+        let server = MockServer::start().await;
+        // One real file judged, one name that matches nothing in the show.
+        let content = r#"{"title":"Sekirei","season":1,"season_title":null,"files":[
+            {"name":"Sekirei/02.mkv","kind":"episode","season":2,"episode":1,"title":null,"season_title":null},
+            {"name":"Sekirei/invented.mkv","kind":"ignore","season":0,"episode":0,"title":null,"season_title":null}
+        ],"notes":""}"#;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply(content)))
+            .mount(&server).await;
+        let db = Arc::new(Db::open_memory().unwrap());
+        db.add_root("/lib").unwrap();
+        let pn = |t: &str, s: u32, e: u32| ParsedName { title: t.into(), season: s, episode: e, release_group: None, resolution: None, crc: None };
+        let rf = |p: &str| RawFile { path: p.into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
+        db.upsert_episode(&pn("Sekirei", 1, 1), &rf("/lib/Sekirei/01.mkv")).unwrap();
+        db.upsert_episode(&pn("Sekirei", 1, 2), &rf("/lib/Sekirei/02.mkv")).unwrap();
+        let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+        let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()));
+        let r = inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), id).await.unwrap();
+
+        assert_eq!(r.ignored, 0, "a name that matches no file drops nothing");
+        assert_eq!(r.changes.len(), 1);
+        assert!(db.get_override("/lib/Sekirei/01.mkv").unwrap().is_none(), "the unmentioned file is untouched");
+        assert_eq!(db.get_show(id).unwrap().seasons.iter().map(|s| (s.number, s.episodes.len())).collect::<Vec<_>>(),
+            vec![(1, 1), (2, 1)]);
+    }
+
+    #[tokio::test]
+    async fn a_sequel_broadcast_under_its_own_name_becomes_a_named_season() {
+        let server = MockServer::start().await;
+        // Non Non Biyori Repeat is season 2, not a second show. Filing it as a season without
+        // recording what it was called would answer half the question: the library would show a
+        // bare "Season 2" for a release nobody knows by that name.
+        let content = r#"{"title":"Non Non Biyori","season":1,"season_title":null,"files":[
+            {"name":"01.mkv","kind":"episode","season":1,"episode":1,"title":null,"season_title":null},
+            {"name":"repeat-01.mkv","kind":"episode","season":2,"episode":1,"title":null,"season_title":"Non Non Biyori Repeat"},
+            {"name":"repeat-02.mkv","kind":"episode","season":2,"episode":2,"title":null,"season_title":"Non Non Biyori Repeat"},
+            {"name":"OVA.mkv","kind":"special","season":0,"episode":1,"title":null,"season_title":"Non Non Biyori Repeat"}
+        ],"notes":""}"#;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply(content)))
+            .expect(1)
+            .mount(&server).await;
+        let db = Arc::new(Db::open_memory().unwrap());
+        db.add_root("/lib").unwrap();
+        let pn = |t: &str, s: u32, e: u32| ParsedName { title: t.into(), season: s, episode: e, release_group: None, resolution: None, crc: None };
+        let rf = |p: &str| RawFile { path: p.into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
+        for (n, e) in [("01.mkv", 1u32), ("repeat-01.mkv", 2), ("repeat-02.mkv", 3), ("OVA.mkv", 4)] {
+            db.upsert_episode(&pn("Non Non Biyori", 1, e), &rf(&format!("/lib/Non Non Biyori/{n}"))).unwrap();
+        }
+        let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+        let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()));
+        inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), id).await.unwrap();
+
+        let d = db.get_show(id).unwrap();
+        let shape: Vec<(u32, Option<String>, usize)> =
+            d.seasons.iter().map(|s| (s.number, s.title.clone(), s.episodes.len())).collect();
+        assert_eq!(
+            shape,
+            vec![
+                (0, None, 1),
+                (1, None, 1),
+                (2, Some("Non Non Biyori Repeat".into()), 2),
+            ],
+            "one show: an unnamed first season, a named second, and specials that stay unnamed"
+        );
     }
 
     #[tokio::test]

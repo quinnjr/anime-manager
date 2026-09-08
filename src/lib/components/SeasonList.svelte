@@ -1,13 +1,16 @@
 <script lang="ts">
   import EpisodeRow from '$lib/components/EpisodeRow.svelte';
-  import { flatten, groupEpisodes } from '$lib/episodes';
+  import { groupEpisodes } from '$lib/episodes';
   import type { SeasonDetail } from '$lib/api';
 
-  let { seasons, highlight = -1, onRename }:
-    { seasons: SeasonDetail[]; highlight?: number; onRename: (episodeId: number) => void } = $props();
+  // The keyboard cursor arrives as the highlighted episode's id, not a position: an index would
+  // only agree with the caller's list while both sides flattened the seasons the same way.
+  let { seasons, highlightedId = null, onRename }:
+    { seasons: SeasonDetail[]; highlightedId?: number | null; onRename: (episodeId: number) => void } = $props();
 
-  const rows = $derived(flatten(seasons));
   const sectionOf = (n: number) => `season-${n}`;
+  /// What a season is called when it has no release name of its own.
+  const numbered = (n: number) => (n === 0 ? 'Specials' : `Season ${n}`);
   let expanded = $state<Record<number, boolean>>({});
 </script>
 
@@ -17,7 +20,9 @@
       <span class="eyebrow">seasons</span>
       {#each seasons as s (s.id)}
         <a href="#{sectionOf(s.number)}" class="text-[0.8125rem] font-semibold text-muted hover:text-paper">
-          {s.number === 0 ? 'Specials' : `Season ${s.number}`}
+          <!-- A season broadcast under its own name is listed by that name; the number stays as a
+               marker so the order still reads as an order. -->
+          {#if s.title}<span class="tag mr-1">S{s.number}</span>{s.title}{:else}{numbered(s.number)}{/if}
           <span class="tag ml-1 tabular-nums">{groupEpisodes(s).length}</span>
         </a>
       {/each}
@@ -28,7 +33,12 @@
     {@const groups = groupEpisodes(s)}
     <section id={sectionOf(s.number)} class="mb-8 scroll-mt-20">
       <div class="sticky top-[3.25rem] z-10 -mx-1 mb-2 flex items-baseline gap-3 bg-ink/95 px-1 py-1.5 backdrop-blur">
-        <h2 class="spine text-[1.05rem] text-paper">{s.number === 0 ? 'Specials' : `Season ${s.number}`}</h2>
+        {#if s.title}
+          <span class="eyebrow shrink-0">{numbered(s.number)}</span>
+          <h2 class="spine text-[1.05rem] text-paper">{s.title}</h2>
+        {:else}
+          <h2 class="spine text-[1.05rem] text-paper">{numbered(s.number)}</h2>
+        {/if}
         <span class="tag tabular-nums">
           {groups.length} episode{groups.length === 1 ? '' : 's'}
           {#if s.episodes.length > groups.length}· {s.episodes.length} files{/if}
@@ -37,11 +47,10 @@
 
       <div class="border border-edge">
         {#each groups as g (g.primary.id)}
-          {@const idx = rows.findIndex((r) => r.group.primary.id === g.primary.id)}
           <div>
             <EpisodeRow
               episode={g.primary}
-              highlighted={idx === highlight}
+              highlighted={g.primary.id === highlightedId}
               onRename={() => onRename(g.primary.id)}
             />
             {#if g.alternates.length}
