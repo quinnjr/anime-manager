@@ -159,6 +159,24 @@ body {
 }
 .field:focus { outline: none; border-color: var(--color-sub); }
 
+/* WebKitGTK draws a native widget for <select>: it honours `color` but not `background`,
+   so the paper-white text landed on the platform's near-white control and vanished. Take the
+   box over entirely and draw our own chevron. */
+select.field {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 1.7rem;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239c8e7f' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.55rem center;
+  background-size: 0.6rem;
+}
+/* The popup list is drawn by the platform too, so give its rows explicit colours. */
+select.field option {
+  background: var(--color-board);
+  color: var(--color-paper);
+}
+
 /* One focus treatment everywhere, always visible. */
 :where(a, button, input, select, textarea, [tabindex]):focus-visible {
   outline: 2px solid var(--color-sub);
