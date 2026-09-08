@@ -200,6 +200,27 @@ impl Llm {
         self.inspect_folder_with(rel_folder, files, &[]).await
     }
 
+    /// Judge a whole show's season breakdown in one request.
+    pub async fn inspect_show_breakdown(&self, title: &str, files: &[FileGuess]) -> Result<FolderInspection> {
+        let mut user = format!(
+            "Show: {title}\n\nEvery file currently filed under it ({}), with where it sits now:\n",
+            files.len()
+        );
+        for f in files.iter().take(MAX_FILES_PER_FOLDER) {
+            user.push_str(&format!("- {}\n    {}\n", f.name, f.guess));
+        }
+        if files.len() > MAX_FILES_PER_FOLDER {
+            user.push_str(&format!("... and {} more, decide them by the same pattern.\n", files.len() - MAX_FILES_PER_FOLDER));
+        }
+        user.push_str(
+            "\nCheck the season and episode of every file and correct anything filed wrongly. \
+             Several files may be different rips of the same episode: give them the same season and episode. \
+             Openings, endings, OVAs and extras belong in season 0.\n",
+        );
+        let reply = self.chat(SYSTEM_PROMPT, &user).await?;
+        parse_inspection(&reply)
+    }
+
     /// As `inspect_folder`, plus the titles the library already holds so the answer can join an
     /// existing show rather than coining a synonym for it.
     pub async fn inspect_folder_with(
@@ -412,25 +433,76 @@ impl AssistQueue {
 }
 
 /// On-demand inspection of every folder that holds an episode of `show_id`.
+/// Check one show's whole season breakdown in a single request.
+///
+/// The per-folder pass cannot see across seasons: each folder is judged alone, so a release
+/// split over two folders, or a season boundary that falls inside one, is invisible to it. This
+/// sends every file of the show with the season and episode it is currently filed under and asks
+/// for the breakdown as a whole, which is the only way a model can move an episode between
+/// seasons or say two files are the same episode.
 pub async fn inspect_show(db: Arc<Db>, llm: Arc<Llm>, queue: Arc<AssistQueue>, show_id: i64) -> Result<InspectReport> {
-    // Two loops re-homing the same rows would race, and report.show_id would be resolved against
-    // a database the other loop is still changing.
     let Some(_guard) = queue.try_start() else {
         return Err(AppError::Network("AI assist is already running; try again when it finishes".into()));
     };
-    let paths = db.episode_paths_for_show(show_id)?;
-    if paths.is_empty() { return Err(AppError::Db(format!("show {show_id} has no episodes"))); }
-    let mut folders: Vec<String> = paths.iter().filter_map(|p| Path::new(p).parent().map(|d| d.to_string_lossy().to_string())).collect();
-    folders.sort();
-    folders.dedup();
-    let mut report = inspect_folders(db.clone(), llm, folders, "llm").await?;
-    report.show_id = paths.iter().find_map(|p| db.show_id_for_path(p).ok().flatten());
+    let episodes = db.episodes_of_show(show_id)?;
+    if episodes.is_empty() {
+        return Err(AppError::Db(format!("show {show_id} has no episodes")));
+    }
+    let title = db.display_title(show_id).unwrap_or_default();
+    let files: Vec<FileGuess> = episodes
+        .iter()
+        .map(|(path, season, number)| FileGuess {
+            name: Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or(path).to_string(),
+            guess: format!("currently S{season}E{number}"),
+        })
+        .collect();
+
+    let mut report = InspectReport::default();
+    let inspection = llm.inspect_show_breakdown(&title, &files).await?;
+    report.folders = 1;
+    if !inspection.notes.trim().is_empty() {
+        report.notes.push(inspection.notes.trim().to_string());
+    }
+    // Names repeat across folders (every rip calls it "- 01.mkv"), so a decision is applied to
+    // every path with that name rather than to one arbitrary match.
+    let mut by_name: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
+    for (path, _, _) in &episodes {
+        let name = Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or(path);
+        by_name.entry(name).or_default().push(path);
+    }
+    for d in &inspection.files {
+        let Some(paths) = by_name.get(d.name.as_str()) else { continue };
+        for path in paths {
+            let (_, cur_season, cur_number) = episodes.iter().find(|(p, _, _)| p == *path).unwrap();
+            let from = format!("{title} S{cur_season}E{cur_number}");
+            if d.kind == "ignore" {
+                db.set_override(&ParseOverride { path: (*path).clone(), title: String::new(), season: 0, number: 0, kind: "ignore".into(), source: "llm".into() })?;
+                db.delete_episode_by_path(path)?;
+                report.ignored += 1;
+                report.changes.push(InspectChange { path: (*path).clone(), from, to: "ignored".into() });
+                continue;
+            }
+            let kind = match d.kind.as_str() { "special" | "movie" | "episode" => d.kind.clone(), _ => "episode".into() };
+            let new_title = d.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| inspection.title.clone()).trim().to_string();
+            let season = if kind == "special" { 0 } else { d.season.or(inspection.season).unwrap_or(*cur_season) };
+            let number = d.episode.unwrap_or(*cur_number);
+            if new_title == title && season == *cur_season && number == *cur_number { continue; }
+            db.set_override(&ParseOverride { path: (*path).clone(), title: new_title.clone(), season, number, kind, source: "llm".into() })?;
+            db.reassign_episode(path, &new_title, season, number)?;
+            report.changes.push(InspectChange { path: (*path).clone(), from, to: format!("{new_title} S{season}E{number}") });
+        }
+    }
+    db.prune_empty()?;
+    report.show_id = db.episode_paths_for_show(show_id).ok()
+        .and_then(|p| p.first().and_then(|p| db.show_id_for_path(p).ok().flatten()))
+        .or(Some(show_id));
     Ok(report)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::ShowSort;
     use crate::parser::ParsedName;
     use crate::scanner::RawFile;
     use wiremock::matchers::{header, method, path};
@@ -532,38 +604,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inspect_show_applies_overrides_reassigns_and_ignores() {
+    async fn inspect_show_moves_episodes_between_seasons_across_the_whole_show() {
         let server = MockServer::start().await;
+        // A whole-show view is the only way to see that these two files, filed under season 1
+        // by the parser, are really the second season - a per-folder pass never sees both.
         let content = r#"{"title":"Sekirei","season":1,"files":[
-            {"name":"01_Sekirei_KDG.mkv","kind":"episode","season":1,"episode":1,"title":null},
-            {"name":"OVA_Kusano.mkv","kind":"special","season":1,"episode":1,"title":null},
-            {"name":"sample.mkv","kind":"ignore","season":0,"episode":0,"title":null},
-            {"name":"not-in-folder.mkv","kind":"episode","season":1,"episode":9,"title":null}
-        ],"notes":"first season"}"#;
-        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(reply(content))).mount(&server).await;
+            {"name":"01.mkv","kind":"episode","season":1,"episode":1,"title":null},
+            {"name":"s2-01.mkv","kind":"episode","season":2,"episode":1,"title":null},
+            {"name":"s2-02.mkv","kind":"episode","season":2,"episode":2,"title":null},
+            {"name":"OVA.mkv","kind":"special","season":1,"episode":1,"title":null},
+            {"name":"sample.mkv","kind":"ignore","season":0,"episode":0,"title":null}
+        ],"notes":"second season split out"}"#;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply(content)))
+            .expect(1)  // one request for the whole show, not one per folder
+            .mount(&server).await;
         let db = Arc::new(Db::open_memory().unwrap());
         db.add_root("/lib").unwrap();
         let pn = |t: &str, s: u32, e: u32| ParsedName { title: t.into(), season: s, episode: e, release_group: None, resolution: None, crc: None };
         let rf = |p: &str| RawFile { path: p.into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
-        db.upsert_episode(&pn("Season1", 1, 1), &rf("/lib/Sekirei Complete/Season1/01_Sekirei_KDG.mkv")).unwrap();
-        db.upsert_episode(&pn("Season1", 1, 2), &rf("/lib/Sekirei Complete/Season1/OVA_Kusano.mkv")).unwrap();
-        db.upsert_episode(&pn("Season1", 1, 3), &rf("/lib/Sekirei Complete/Season1/sample.mkv")).unwrap();
-        let wrong_id = db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].id;
+        for (n, e) in [("01.mkv", 1u32), ("s2-01.mkv", 2), ("s2-02.mkv", 3), ("OVA.mkv", 4), ("sample.mkv", 5)] {
+            db.upsert_episode(&pn("Sekirei", 1, e), &rf(&format!("/lib/Sekirei/{n}"))).unwrap();
+        }
+        let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
         let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()));
-        let r = inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), wrong_id).await.unwrap();
-        assert_eq!(r.folders, 1);
-        assert_eq!(r.ignored, 1);
-        assert_eq!(r.changes.len(), 3);
-        assert_eq!(r.notes, vec!["Sekirei Complete/Season1: first season"]);
-        let shows = db.list_shows("", crate::models::ShowSort::Title).unwrap();
-        assert_eq!(shows.len(), 1);
-        assert_eq!(shows[0].display_title, "Sekirei");
-        assert_eq!(r.show_id, Some(shows[0].id));
-        let d = db.get_show(shows[0].id).unwrap();
-        let seasons: Vec<(u32, Vec<u32>)> = d.seasons.iter().map(|s| (s.number, s.episodes.iter().map(|e| e.number).collect())).collect();
-        assert_eq!(seasons, vec![(0, vec![1]), (1, vec![1])]);
-        assert_eq!(db.get_override("/lib/Sekirei Complete/Season1/sample.mkv").unwrap().unwrap().kind, "ignore");
-        assert_eq!(db.get_override("/lib/Sekirei Complete/Season1/OVA_Kusano.mkv").unwrap().unwrap().season, 0);
+        let r = inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), id).await.unwrap();
+
+        assert_eq!(r.ignored, 1, "the sample is dropped");
+        let d = db.get_show(id).unwrap();
+        let shape: Vec<(u32, usize)> = d.seasons.iter().map(|s| (s.number, s.episodes.len())).collect();
+        assert_eq!(shape, vec![(0, 1), (1, 1), (2, 2)], "specials, season 1, and a season 2 the parser never saw");
+        assert_eq!(r.notes, vec!["second season split out"]);
+        // The decisions persist, so a rescan does not undo them.
+        assert_eq!(db.get_override("/lib/Sekirei/s2-01.mkv").unwrap().unwrap().season, 2);
+        assert_eq!(db.get_override("/lib/Sekirei/sample.mkv").unwrap().unwrap().kind, "ignore");
     }
 
     #[tokio::test]

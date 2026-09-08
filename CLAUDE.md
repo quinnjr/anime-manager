@@ -101,6 +101,17 @@ state splits. Two mechanisms close that, in order of trust:
   with one verbatim when the folder is the same series. That is what reaches duplicates no provider
   has matched, and it works because `reassign_episode` keys the show on the title string.
 
+## Seasons in the show view
+
+`SeasonList.svelte` renders every season as a section rather than one tab at a time, and groups a
+season's episodes by number (`lib/episodes.ts`). That grouping is not cosmetic: merging show rows
+brings every rip together, so one season legitimately holds eleven files all calling themselves
+episode 1. The row acts on whichever copy carries real progress, and the rest sit behind it.
+
+`llm::inspect_show` sends the whole show in one request — every file with the season and episode
+it currently sits under — rather than folder by folder. Only a whole-show view can move an
+episode between seasons or tell that two files are the same episode, which is the point of it.
+
 ## Cover art
 
 AniList cover URLs are downloaded to `$XDG_DATA_HOME/anime-manager/covers/<show id>.<ext>`

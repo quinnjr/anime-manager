@@ -385,6 +385,21 @@ impl Db {
         })
     }
 
+    /// Every episode of a show with the season and number it is currently filed under, so a
+    /// whole-show inspection can judge the breakdown rather than one folder at a time.
+    pub fn episodes_of_show(&self, show_id: i64) -> Result<Vec<(String, u32, u32)>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT e.path, se.number, e.number FROM episodes e
+                 JOIN seasons se ON e.season_id = se.id
+                 WHERE se.show_id = ?1 ORDER BY se.number, e.number, e.path")?;
+            let rows = st.query_map(params![show_id], |r| {
+                Ok((r.get(0)?, r.get::<_, i64>(1)? as u32, r.get::<_, i64>(2)? as u32))
+            })?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
+        })
+    }
+
     pub fn episode_paths_for_show(&self, show_id: i64) -> Result<Vec<String>> {
         self.with(|c| {
             let mut st = c.prepare("SELECT e.path FROM episodes e JOIN seasons se ON e.season_id = se.id WHERE se.show_id = ?1 ORDER BY e.path")?;
