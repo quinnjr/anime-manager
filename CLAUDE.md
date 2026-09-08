@@ -95,6 +95,11 @@ in `tauri.conf.json`, and a scope covering the directory (`$DATA` is `dirs::data
 base the database uses). There is no `core:asset:*` capability permission — adding one fails the
 build.
 
+`shows_needing_cover` checks the filesystem rather than trusting `cover_path`: a row whose
+recorded file has gone would otherwise be skipped forever, since the query that finds work to do
+was the only thing deciding what still needed art. Deleting the covers directory is therefore a
+safe way to force a re-fetch.
+
 `Cover.svelte` walks `coverSources()` on image error, local copy first and the remote URL second,
 so a scope or protocol mistake degrades to fetching from AniList rather than showing nothing.
 

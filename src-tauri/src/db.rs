@@ -539,12 +539,21 @@ impl Db {
     }
 
     /// Shows with cover art on AniList that has not been copied locally yet.
+    /// Shows whose cover art is not actually on disk: never downloaded, or downloaded and since
+    /// gone. The recorded path is not taken on trust — a row that keeps a path to a file that no
+    /// longer exists would otherwise be skipped forever, with no way to re-fetch it.
     pub fn shows_needing_cover(&self) -> Result<Vec<(i64, String)>> {
-        self.with(|c| {
+        let rows: Vec<(i64, String, Option<String>)> = self.with(|c| {
             let mut st = c.prepare(
-                "SELECT id, cover_url FROM shows WHERE cover_url IS NOT NULL AND cover_path IS NULL ORDER BY id")?;
-            Ok(st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?)
-        })
+                "SELECT id, cover_url, cover_path FROM shows WHERE cover_url IS NOT NULL ORDER BY id")?;
+            Ok(st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<std::result::Result<_, _>>()?)
+        })?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, _, path)| path.as_deref().is_none_or(|p| !Path::new(p).exists()))
+            .map(|(id, url, _)| (id, url))
+            .collect())
     }
 
     pub fn display_title(&self, show_id: i64) -> Result<String> {
@@ -1020,6 +1029,28 @@ mod tests {
         assert_eq!(db.get_show(id).unwrap().user_title_override.as_deref(), Some("Bloom Into You"));
         db.set_title_override(id, Some("   ")).unwrap();
         assert_eq!(db.display_title(id).unwrap(), "Yagate Kimi ni Naru", "blank clears the override");
+    }
+
+    #[test]
+    fn a_cover_whose_file_vanished_is_fetched_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Show", 1, 1), &rf("/a/1.mkv", 1, 1)).unwrap();
+        let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+        db.set_anilist(id, &MetadataHit { id: 1, source: "kitsu".into(), title_romaji: "Show".into(),
+            title_english: None, cover_url: Some("https://img/x.jpg".into()), episodes: None }).unwrap();
+        assert_eq!(db.shows_needing_cover().unwrap().len(), 1, "no file yet");
+
+        // Record a real file: nothing more to do.
+        let f = dir.path().join("1.jpg");
+        std::fs::write(&f, b"x").unwrap();
+        db.set_cover_path(id, f.to_str().unwrap()).unwrap();
+        assert!(db.shows_needing_cover().unwrap().is_empty());
+
+        // The file goes away — a purged cache, a moved data dir, a lost write. The row still
+        // holds a path, and trusting it would strand this show without art forever.
+        std::fs::remove_file(&f).unwrap();
+        assert_eq!(db.shows_needing_cover().unwrap(), vec![(id, "https://img/x.jpg".to_string())]);
     }
 
     #[test]
