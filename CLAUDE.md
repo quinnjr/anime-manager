@@ -85,6 +85,22 @@ no URL until a match is applied, so an unmatched library has nothing to download
 missing" almost always means "nothing is matched". Both phases report `match-progress`
 `{done, total, title, phase, changed, running}`; `changed` names the one show to refresh.
 
+## One series, one show row
+
+The scanner keys a show on the title parsed from its filenames, so one series spread over folders
+named differently ("Bloom Into You" and "Yagate Kimi ni Naru") becomes two rows and its watched
+state splits. Two mechanisms close that, in order of trust:
+
+- `db::merge_duplicate_shows` folds rows already matched to the same `(match_source, anilist_id)`.
+  That is evidence, not a guess, so it needs no model and runs automatically after every matching
+  pass. The survivor is the row with the most episodes; a `user_title_override` and any artwork or
+  counts only a folded row carried are kept. Seasons are `UNIQUE(show_id, number)`, so episodes
+  move season by season into the survivor's season of that number rather than the season row moving.
+  Rows with no shared id are deliberately left alone — titles alone are not evidence.
+- `llm::inspect_folder_with` passes the library's existing titles to the model and asks it to reply
+  with one verbatim when the folder is the same series. That is what reaches duplicates no provider
+  has matched, and it works because `reassign_episode` keys the show on the title string.
+
 ## Cover art
 
 AniList cover URLs are downloaded to `$XDG_DATA_HOME/anime-manager/covers/<show id>.<ext>`

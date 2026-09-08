@@ -19,6 +19,9 @@ pub const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 /// provider actually offers rather than shipping a name that quietly stops existing.
 pub const DEFAULT_MODEL: &str = "";
 pub const MAX_FILES_PER_FOLDER: usize = 200;
+/// A cap on how many existing titles travel with a request, so a large library does not turn
+/// every inspection into a huge prompt.
+pub const MAX_KNOWN_TITLES: usize = 400;
 /// Attempts per request; waits grow as retry_base * 2^n and honour Retry-After.
 pub const MAX_ATTEMPTS: u32 = 6;
 /// Default pause between folders so free-tier rate limits are not hammered.
@@ -28,6 +31,9 @@ const SYSTEM_PROMPT: &str = "You are a meticulous anime media librarian. You rec
 Decide the anime title (romaji as listed on AniList, no release-group tags, no quality tags), the season number, and for every file its kind and numbering. \
 kind is one of: \"episode\" (a numbered TV episode), \"special\" (OVA/OAD/NCOP/NCED/OP/ED/PV/CM/menu/recap/extra; these go to season 0), \"movie\" (a film or one-shot; season 1, episode 1 unless numbered), \"ignore\" (samples, trailers for other works, junk). \
 If a file belongs to a different anime than the folder (e.g. a bundled spin-off), set its own \"title\". \
+You may be given the titles this library already holds. If this folder is the same series as one of them - a different \
+release, a different naming of it, or another season - reply with that exact existing title, character for character, so \
+the episodes join it instead of starting a second entry. Only coin a new title when it is genuinely a different series. \
 Respond with JSON only, no prose, exactly this shape: \
 {\"title\": string, \"season\": integer|null, \"files\": [{\"name\": string, \"kind\": \"episode\"|\"special\"|\"movie\"|\"ignore\", \"season\": integer, \"episode\": integer, \"title\": string|null}], \"notes\": string}. \
 \"name\" must be copied verbatim from the input. Keep episode numbers as printed in the file name (do not renumber to absolute).";
@@ -191,7 +197,26 @@ impl Llm {
     }
 
     pub async fn inspect_folder(&self, rel_folder: &str, files: &[FileGuess]) -> Result<FolderInspection> {
-        let mut user = format!("Folder (relative to the library root): {rel_folder}\n\nFiles ({}):\n", files.len());
+        self.inspect_folder_with(rel_folder, files, &[]).await
+    }
+
+    /// As `inspect_folder`, plus the titles the library already holds so the answer can join an
+    /// existing show rather than coining a synonym for it.
+    pub async fn inspect_folder_with(
+        &self,
+        rel_folder: &str,
+        files: &[FileGuess],
+        known: &[String],
+    ) -> Result<FolderInspection> {
+        let mut user = String::new();
+        if !known.is_empty() {
+            user.push_str("Titles already in this library:\n");
+            for t in known.iter().take(MAX_KNOWN_TITLES) {
+                user.push_str(&format!("- {t}\n"));
+            }
+            user.push('\n');
+        }
+        user.push_str(&format!("Folder (relative to the library root): {rel_folder}\n\nFiles ({}):\n", files.len()));
         for f in files.iter().take(MAX_FILES_PER_FOLDER) {
             user.push_str(&format!("- {}\n    parser guess: {}\n", f.name, f.guess));
         }
@@ -242,7 +267,8 @@ async fn inspect_one(db: &Db, llm: &Llm, roots: &[String], folder: &str, source:
         guess: format!("{title} S{season}E{number}"),
     }).collect();
     let rel = rel_to_roots(roots, folder);
-    let inspection = match llm.inspect_folder(&rel, &files).await {
+    let known = db.known_titles().unwrap_or_default();
+    let inspection = match llm.inspect_folder_with(&rel, &files, &known).await {
         Ok(i) => i,
         Err(e) => { report.notes.push(format!("{rel}: {e}")); return Ok(true); }
     };
@@ -444,6 +470,25 @@ mod tests {
         // No key configured is a clear error, not an empty list.
         let none = Llm::with(server.uri(), None, "m".into());
         assert!(none.models().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_inspection_is_told_what_the_library_already_holds() {
+        use wiremock::matchers::body_string_contains;
+        let server = MockServer::start().await;
+        let content = r#"{"title":"Bloom Into You","season":1,"files":[],"notes":""}"#;
+        Mock::given(method("POST"))
+            .and(body_string_contains("Titles already in this library"))
+            .and(body_string_contains("Bloom Into You"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply(content)))
+            .expect(1)
+            .mount(&server).await;
+        let llm = Llm::with(server.uri(), Some("k".into()), "m".into());
+        let files = vec![FileGuess { name: "01.mkv".into(), guess: "Yagate S1E1".into() }];
+        let known = vec!["Bloom Into You".to_string(), "Frieren".to_string()];
+        let got = llm.inspect_folder_with("Yagate Kimi ni Naru", &files, &known).await.unwrap();
+        // Answering with an existing title is what makes the episodes join that show.
+        assert_eq!(got.title, "Bloom Into You");
     }
 
     #[test]

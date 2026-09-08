@@ -97,6 +97,13 @@ pub async fn auto_match_all(
         // Stay well under AniList's 90 requests/minute; Kitsu is slower than that anyway.
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
     }
+    // Matching is what reveals that two rows are the same series, so fold them now rather than
+    // leaving the library showing one show twice with its watched state split between them.
+    if let Ok(n) = db.merge_duplicate_shows()
+        && n > 0
+    {
+        eprintln!("merged {n} duplicate show rows");
+    }
     matched
 }
 

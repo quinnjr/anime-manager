@@ -151,6 +151,8 @@ pub struct LibraryStatus {
     pub unmatched: i64,
     /// Matched shows whose cover art is not on disk.
     pub missing_art: i64,
+    /// Show rows that duplicate another row already matched to the same series.
+    pub duplicates: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
