@@ -8,12 +8,14 @@
   } from '$lib/api';
   import { toasts } from '$lib/stores/toasts.svelte';
   import { matching } from '$lib/stores/matching.svelte';
+  import { parseAutoScanMins, tryStartScan, endScan } from '$lib/autoScan';
 
   let roots = $state<Root[]>([]);
   let status = $state<LibraryStatus | null>(null);
   let scanning = $state(false);
   let scanProgress = $state<ScanProgress | null>(null);
   let matchingNow = $state(false);
+  let autoScanMins = $state('15');
 
   let mpvPath = $state('mpv');
   let threshold = $state('0.9');
@@ -53,6 +55,7 @@
       llmModel = s.llm_model ?? '';
       llmBaseUrl = s.llm_base_url ?? LLM_PROVIDERS[0].baseUrl;
       llmOnScan = (s.llm_assist_on_scan ?? 'true') !== 'false';
+      autoScanMins = s.auto_scan_interval_mins ?? '15';
       llmDelay = s.llm_delay_ms ?? '500';
       provider = LLM_PROVIDERS.find((p) => p.baseUrl === llmBaseUrl)?.id ?? 'custom';
     } catch (e) { toasts.error(e); }
@@ -70,6 +73,7 @@
   });
 
   async function rescan() {
+    if (!tryStartScan()) { toasts.push('info', 'A scan is already running.'); return; }
     scanning = true;
     try {
       const s: ScanSummary = await api.scan();
@@ -77,7 +81,7 @@
       for (const e of s.errors.slice(0, 3)) toasts.push('error', e);
       await loadLibrary();
     } catch (e) { toasts.error(e); }
-    finally { scanning = false; scanProgress = null; }
+    finally { scanning = false; scanProgress = null; endScan(); }
   }
 
   async function addFolder() {
@@ -126,9 +130,11 @@
   async function saveAll() {
     const t = Number(threshold);
     if (!(t > 0 && t <= 1)) { toasts.push('error', 'Played threshold must be between 0 and 1'); return; }
+    if (!/^\d+$/.test(autoScanMins.trim())) { toasts.push('error', 'Auto-scan interval must be a whole number of minutes (0 turns it off)'); return; }
     try {
       await api.setSetting('mpv_path', mpvPath.trim());
       await api.setSetting('played_threshold', String(t));
+      await api.setSetting('auto_scan_interval_mins', String(parseAutoScanMins(autoScanMins.trim())));
       await api.setSetting('llm_api_key', llmKey.trim());
       await api.setSetting('llm_model', llmModel.trim());
       await api.setSetting('llm_base_url', llmBaseUrl.trim());
@@ -209,6 +215,11 @@
     <div class="flex flex-wrap items-center gap-2">
       <button class="btn btn-key" onclick={addFolder}>Add folder</button>
       <button class="btn" disabled={scanning} onclick={rescan}>{scanning ? 'Reading…' : 'Rescan folders'}</button>
+      <label class="flex items-center gap-2 text-sm">
+        <span class="text-muted">Auto-scan every</span>
+        <input bind:value={autoScanMins} inputmode="numeric" class="field w-16" aria-label="Auto-scan interval in minutes" />
+        <span class="tag">min · 0 is off</span>
+      </label>
       {#if scanProgress}
         <div class="flex items-center gap-2">
           <div class="relative h-[3px] w-40 bg-edge">

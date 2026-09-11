@@ -142,6 +142,7 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String
     m.insert("llm_model".into(), state.db.get_setting("llm_model")?.unwrap_or_else(|| llm::DEFAULT_MODEL.into()));
     m.insert("llm_base_url".into(), state.db.get_setting("llm_base_url")?.unwrap_or_else(|| llm::DEFAULT_BASE_URL.into()));
     m.insert("llm_assist_on_scan".into(), state.db.get_setting("llm_assist_on_scan")?.unwrap_or_else(|| "true".into()));
+    m.insert("auto_scan_interval_mins".into(), state.db.get_setting("auto_scan_interval_mins")?.unwrap_or_else(|| "15".into()));
     m.insert("llm_delay_ms".into(), state.db.get_setting("llm_delay_ms")?.unwrap_or_else(|| llm::DEFAULT_DELAY_MS.to_string()));
     Ok(m)
 }
