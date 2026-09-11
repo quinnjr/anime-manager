@@ -33,6 +33,19 @@ pub fn mpv_binary(db: &Db) -> String {
     db.get_setting("mpv_path").ok().flatten().filter(|s| !s.is_empty()).unwrap_or_else(|| "mpv".into())
 }
 
+/// Fails fast when the file vanished. Called synchronously from `commands::play` for the
+/// toast and defensively at the top of `play_episode` for direct callers.
+pub fn ensure_file_present(path: &str) -> Result<()> {
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
+            Err(AppError::Player(format!("could not open '{path}': file not found"))),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied =>
+            Err(AppError::Player(format!("could not open '{path}': permission denied"))),
+        Err(e) => Err(AppError::Io(e.to_string())),
+    }
+}
+
 fn socket_path(episode_id: i64) -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
     let dir = base.join("anime-manager");
@@ -87,6 +100,7 @@ pub async fn play_episode(
     poll_every: Duration,
 ) -> Result<()> {
     let ep = db.get_episode(episode_id)?;
+    ensure_file_present(&ep.path)?;
     player.claim(episode_id)?;
     let sock = socket_path(episode_id);
     let _ = std::fs::remove_file(&sock);
@@ -173,6 +187,7 @@ mod tests {
         unsafe {
             std::env::set_var("FAKE_MPV_STOP_AT", stop_at);
             std::env::set_var("FAKE_MPV_RUNTIME", runtime);
+            std::env::remove_var("FAKE_MPV_NO_IPC");
         }
     }
 
@@ -180,9 +195,18 @@ mod tests {
         concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake_mpv.py").to_string()
     }
 
+    struct NoIpcGuard;
+    impl NoIpcGuard {
+        fn set() -> Self { unsafe { std::env::set_var("FAKE_MPV_NO_IPC", "1") }; NoIpcGuard }
+    }
+    impl Drop for NoIpcGuard {
+        fn drop(&mut self) { unsafe { std::env::remove_var("FAKE_MPV_NO_IPC") }; }
+    }
+
     fn seeded() -> (Arc<Db>, i64) {
         let db = Arc::new(Db::open_memory().unwrap());
         db.set_setting("mpv_path", &fixture()).unwrap();
+        let _ = std::fs::write("/tmp/fake.mkv", b"fake");
         let p = ParsedName { title: "S".into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
         let f = RawFile { path: PathBuf::from("/tmp/fake.mkv"), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
         db.upsert_episode(&p, &f).unwrap();
@@ -227,6 +251,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_file_is_player_error_and_no_state_change() {
+        fake_mpv("99", "1.0");
+        let db = Arc::new(Db::open_memory().unwrap());
+        db.set_setting("mpv_path", &fixture()).unwrap();
+        let missing = PathBuf::from("/tmp/anime-manager-test-missing.mkv");
+        let _ = std::fs::remove_file(&missing);
+        let p = ParsedName { title: "Gone".into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
+        let f = RawFile { path: missing, size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
+        db.upsert_episode(&p, &f).unwrap();
+        let show_id = db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].id;
+        let missing_id = db.get_show(show_id).unwrap().seasons[0].episodes[0].id;
+        let player = Arc::new(Player::new());
+        let err = play_episode(db.clone(), player.clone(), missing_id, |_| {}, Duration::from_millis(50)).await.unwrap_err();
+        assert!(matches!(err, AppError::Player(ref m) if m.contains("could not open") && m.contains("file not found")), "{err:?}");
+        assert_eq!(db.get_episode(missing_id).unwrap().status, EpisodeStatus::Unplayed);
+        assert!(player.current().is_none(), "rejected launch must not hold the player claim");
+    }
+
+    #[tokio::test]
     async fn second_play_while_playing_is_rejected() {
         fake_mpv("99", "1.0");
         let (db, id) = seeded();
@@ -244,14 +287,24 @@ mod tests {
         // Position and duration are unknown, so nothing may be written back.
         fake_mpv("99", "1.0");
         let (db, id) = seeded();
-        unsafe { std::env::set_var("FAKE_MPV_NO_IPC", "1") };
+        let _guard = NoIpcGuard::set();
         db.set_position(id, 1300.0, Some(1400.0)).unwrap();
         db.set_status(id, EpisodeStatus::Unplayed).unwrap();
         let err = play_episode(db.clone(), Arc::new(Player::new()), id, |_| {}, Duration::from_millis(50)).await.unwrap_err();
-        unsafe { std::env::remove_var("FAKE_MPV_NO_IPC") };
         assert!(matches!(err, AppError::Player(ref m) if m.contains("IPC")), "{err:?}");
         let ep = db.get_episode(id).unwrap();
         assert_eq!(ep.status, EpisodeStatus::Unplayed, "must not be flipped to played from a stale 1300/1400");
         assert_eq!(ep.position_secs, 1300.0, "the resume point must not be rewound");
+    }
+
+    #[test]
+    fn ensure_file_present_rejects_missing_path_with_player_error() {
+        let err = ensure_file_present("/tmp/anime-manager-test-definitely-missing.mkv").unwrap_err();
+        assert!(matches!(err, AppError::Player(ref m) if m.contains("could not open") && m.contains("file not found")), "{err:?}");
+    }
+    #[test]
+    fn ensure_file_present_accepts_existing_path() {
+        let _ = std::fs::write("/tmp/fake.mkv", b"fake");
+        ensure_file_present("/tmp/fake.mkv").unwrap();
     }
 }
