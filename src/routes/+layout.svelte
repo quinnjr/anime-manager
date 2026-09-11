@@ -1,7 +1,9 @@
 <script lang="ts">
   import '../app.css';
   import { onMount } from 'svelte';
+  import { beforeNavigate } from '$app/navigation';
   import { api, onEvent, type PlaybackChanged, type AppError, type InspectReport, type AssistProgress, type MatchProgress } from '$lib/api';
+  import { saveShelfScroll } from '$lib/shelfScroll';
   import { playback } from '$lib/stores/playback.svelte';
   import { assist } from '$lib/stores/assist.svelte';
   import { matching } from '$lib/stores/matching.svelte';
@@ -77,6 +79,13 @@
   }
 
   onMount(() => {
+    // Save the shelf position BEFORE the branch swaps: once the grid's own DOM detaches,
+    // the document collapses and the browser clamps scroll to 0, so the shelf teardown
+    // always stored 0. Matched on route id, not pathname: the static build is served in
+    // a way where the pathname is not '/'. Layout mounts once, so this registers once.
+    beforeNavigate((nav) => {
+      if (nav.from?.route.id === '/') saveShelfScroll(window.scrollY);
+    });
     const unlisteners = [
       onEvent<PlaybackChanged>('playback-changed', (ev) => playback.apply(ev)),
       onEvent<AppError>('error', (e) => toasts.error(e)),
