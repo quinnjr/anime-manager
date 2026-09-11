@@ -8,14 +8,15 @@
   } from '$lib/api';
   import { toasts } from '$lib/stores/toasts.svelte';
   import { matching } from '$lib/stores/matching.svelte';
-  import { parseAutoScanMins, tryStartScan, endScan } from '$lib/autoScan';
+  import { DEFAULT_AUTO_SCAN_MINS, parseValidatedAutoScanMins } from '$lib/autoScan';
+  import { scanSlot } from '$lib/stores/scan.svelte';
 
   let roots = $state<Root[]>([]);
   let status = $state<LibraryStatus | null>(null);
   let scanning = $state(false);
   let scanProgress = $state<ScanProgress | null>(null);
   let matchingNow = $state(false);
-  let autoScanMins = $state('15');
+  let autoScanMins = $state(String(DEFAULT_AUTO_SCAN_MINS));
 
   let mpvPath = $state('mpv');
   let threshold = $state('0.9');
@@ -55,7 +56,7 @@
       llmModel = s.llm_model ?? '';
       llmBaseUrl = s.llm_base_url ?? LLM_PROVIDERS[0].baseUrl;
       llmOnScan = (s.llm_assist_on_scan ?? 'true') !== 'false';
-      autoScanMins = s.auto_scan_interval_mins ?? '15';
+      autoScanMins = s.auto_scan_interval_mins ?? String(DEFAULT_AUTO_SCAN_MINS);
       llmDelay = s.llm_delay_ms ?? '500';
       provider = LLM_PROVIDERS.find((p) => p.baseUrl === llmBaseUrl)?.id ?? 'custom';
     } catch (e) { toasts.error(e); }
@@ -66,22 +67,32 @@
     loadSettings();
     const us = [
       onEvent<ScanProgress>('scan-progress', (p) => (scanProgress = p)),
-      onEvent('library-changed', loadLibrary),
+      // A background pass also emits scan-progress; without a manual scan to clear it
+      // the bar would freeze at its last value, so any finished pass resets it here.
+      onEvent('library-changed', () => { if (!scanning) scanProgress = null; loadLibrary(); }),
       onEvent('show-updated', loadLibrary)
     ];
     return () => us.forEach((p) => p.then((u) => u()));
   });
 
   async function rescan() {
-    if (!tryStartScan()) { toasts.push('info', 'A scan is already running.'); return; }
-    scanning = true;
-    try {
-      const s: ScanSummary = await api.scan();
-      toasts.push('success', `Read ${s.files_seen} files: ${s.episodes_added} new, ${s.episodes_updated} updated, ${s.episodes_missing} now missing`);
-      for (const e of s.errors.slice(0, 3)) toasts.push('error', e);
-      await loadLibrary();
-    } catch (e) { toasts.error(e); }
-    finally { scanning = false; scanProgress = null; endScan(); }
+    // The slot serialises against the background timer; losing the race queues one
+    // follow-up pass instead of dropping the user's explicit request (the in-flight
+    // scan snapshotted roots before this change, so it cannot cover it).
+    const ran = await scanSlot.withSlot(async () => {
+      scanning = true;
+      try {
+        const s: ScanSummary = await api.scan();
+        toasts.push('success', `Read ${s.files_seen} files: ${s.episodes_added} new, ${s.episodes_updated} updated, ${s.episodes_missing} now missing`);
+        for (const e of s.errors.slice(0, 3)) toasts.push('error', e);
+        await loadLibrary();
+      } catch (e) { toasts.error(e); }
+      finally { scanning = false; scanProgress = null; }
+    });
+    if (ran === null) {
+      scanSlot.queuePending();
+      toasts.push('info', 'A scan is already running — queued to run when it finishes.');
+    }
   }
 
   async function addFolder() {
@@ -130,11 +141,12 @@
   async function saveAll() {
     const t = Number(threshold);
     if (!(t > 0 && t <= 1)) { toasts.push('error', 'Played threshold must be between 0 and 1'); return; }
-    if (!/^\d+$/.test(autoScanMins.trim())) { toasts.push('error', 'Auto-scan interval must be a whole number of minutes (0 turns it off)'); return; }
+    const autoMins = parseValidatedAutoScanMins(autoScanMins);
+    if (autoMins === null) { toasts.push('error', 'Auto-scan interval must be a whole number of minutes (0 turns it off)'); return; }
     try {
       await api.setSetting('mpv_path', mpvPath.trim());
       await api.setSetting('played_threshold', String(t));
-      await api.setSetting('auto_scan_interval_mins', String(parseAutoScanMins(autoScanMins.trim())));
+      await api.setSetting('auto_scan_interval_mins', String(autoMins));
       await api.setSetting('llm_api_key', llmKey.trim());
       await api.setSetting('llm_model', llmModel.trim());
       await api.setSetting('llm_base_url', llmBaseUrl.trim());

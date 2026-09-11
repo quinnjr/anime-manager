@@ -69,6 +69,12 @@ export interface RenamePlan { entries: RenameEntry[] }
 export interface RenameResult { renamed: number; skipped: string[] }
 export type RenameTarget = { type: 'show'; id: number } | { type: 'episode'; id: number };
 
+/** Known settings keys on top of the free-form string map, so a typo fails loudly. */
+export type SettingsMap = Record<string, string> & {
+  auto_scan_interval_mins?: string;
+  library_sort?: ShowSort;
+};
+
 export const api = {
   addRoot: (path: string) => invoke<Root>('add_root', { path }),
   removeRoot: (id: number) => invoke<void>('remove_root', { id }),
@@ -84,7 +90,7 @@ export const api = {
   previewRename: (target: RenameTarget) => invoke<RenamePlan>('preview_rename', { target }),
   applyRename: (plan: RenamePlan) => invoke<RenameResult>('apply_rename', { plan }),
   undoRename: () => invoke<RenameResult>('undo_rename'),
-  getSettings: () => invoke<Record<string, string>>('get_settings'),
+  getSettings: () => invoke<SettingsMap>('get_settings'),
   setSetting: (key: string, value: string) => invoke<void>('set_setting', { key, value }),
   purgeMissing: () => invoke<number>('purge_missing'),
   inspectShow: (showId: number) => invoke<InspectReport>('inspect_show', { showId }),

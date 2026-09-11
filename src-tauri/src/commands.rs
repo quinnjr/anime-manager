@@ -133,6 +133,18 @@ pub fn set_status(app: AppHandle, state: State<'_, AppState>, episode_id: i64, s
     Ok(())
 }
 
+/// Settings key for the background auto-scan cadence (string minutes, "0" = off).
+pub const SETTING_AUTO_SCAN_MINS: &str = "auto_scan_interval_mins";
+/// Default cadence. Kept in sync with DEFAULT_AUTO_SCAN_MINS in src/lib/autoScan.ts.
+pub const DEFAULT_AUTO_SCAN_MINS: &str = "15";
+
+/// Fill defaults for settings keys a fresh database has no row for yet. Pure so the
+/// defaults are unit-testable without a Tauri State; get_settings is the only caller.
+pub fn apply_settings_defaults(mut m: HashMap<String, String>) -> HashMap<String, String> {
+    m.entry(SETTING_AUTO_SCAN_MINS.into()).or_insert_with(|| DEFAULT_AUTO_SCAN_MINS.into());
+    m
+}
+
 #[tauri::command]
 pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String>> {
     let mut m = HashMap::new();
@@ -142,9 +154,9 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String
     m.insert("llm_model".into(), state.db.get_setting("llm_model")?.unwrap_or_else(|| llm::DEFAULT_MODEL.into()));
     m.insert("llm_base_url".into(), state.db.get_setting("llm_base_url")?.unwrap_or_else(|| llm::DEFAULT_BASE_URL.into()));
     m.insert("llm_assist_on_scan".into(), state.db.get_setting("llm_assist_on_scan")?.unwrap_or_else(|| "true".into()));
-    m.insert("auto_scan_interval_mins".into(), state.db.get_setting("auto_scan_interval_mins")?.unwrap_or_else(|| "15".into()));
+    if let Some(v) = state.db.get_setting(SETTING_AUTO_SCAN_MINS)? { m.insert(SETTING_AUTO_SCAN_MINS.into(), v); }
     m.insert("llm_delay_ms".into(), state.db.get_setting("llm_delay_ms")?.unwrap_or_else(|| llm::DEFAULT_DELAY_MS.to_string()));
-    Ok(m)
+    Ok(apply_settings_defaults(m))
 }
 
 #[tauri::command]
@@ -265,4 +277,21 @@ pub fn set_show_title(app: AppHandle, state: State<'_, AppState>, show_id: i64, 
     state.db.set_title_override(show_id, title.as_deref())?;
     let _ = app.emit("show-updated", show_id);
     state.db.get_show(show_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_scan_default_applies_when_unset_and_keeps_stored_value() {
+        let empty = apply_settings_defaults(HashMap::new());
+        assert_eq!(empty.get(SETTING_AUTO_SCAN_MINS).map(String::as_str), Some(DEFAULT_AUTO_SCAN_MINS));
+        let mut stored = HashMap::new();
+        stored.insert(SETTING_AUTO_SCAN_MINS.into(), "0".into());
+        stored.insert("mpv_path".into(), "custom".into());
+        let out = apply_settings_defaults(stored);
+        assert_eq!(out.get(SETTING_AUTO_SCAN_MINS).map(String::as_str), Some("0"));
+        assert_eq!(out.get("mpv_path").map(String::as_str), Some("custom"));
+    }
 }

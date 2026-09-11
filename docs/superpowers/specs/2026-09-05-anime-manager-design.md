@@ -70,7 +70,11 @@ rename_log  (id, batch_id, episode_id → episodes ON DELETE SET NULL, old_path,
 parse_overrides (path PRIMARY KEY, title, season, number, kind, source, created_at)
 settings    (key PRIMARY KEY, value)   -- mpv_path, played_threshold (default 0.9),
                                        -- llm_api_key, llm_model, llm_base_url,
-                                       -- llm_assist_on_scan, llm_delay_ms
+                                       -- llm_assist_on_scan, llm_delay_ms,
+                                       -- auto_scan_interval_mins (string minutes,
+                                       -- default "15", "0" = off; upgrades default
+                                       -- on, so an existing library gains the
+                                       -- background scan below)
 ```
 
 Rescan matching order: exact `path` → (`size`, `mtime`) pair **whose recorded path no longer
@@ -292,6 +296,11 @@ Events: `scan-progress {done, total, current_path}`, `library-changed`,
 
 - **Library `/`**: cover grid, unwatched count badge per show, search box (`/` to
   focus), "Add folder" (native dialog), "Rescan", progress bar during scan.
+  A background pass runs the same `scan()` once on boot and every
+  `auto_scan_interval_mins` minutes once a root exists. It is silent (no toasts;
+  failures and degraded summaries go to the console), shares one scan slot with
+  manual rescans (a manual scan that loses the race queues one follow-up pass),
+  and never overlaps itself: a hung scan releases the slot after 10 minutes.
 - **Show `/show/[id]`**: header with cover, display title, re-match button (opens
   picker with top 5 + manual id field), rename button (opens preview modal).
   Season tabs. Episode rows: number, group/resolution chips, status dot, resume
