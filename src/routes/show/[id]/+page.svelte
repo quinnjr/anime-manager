@@ -57,9 +57,10 @@
 
   // Always a fresh navigation to the shelf: the previous history entry is often not the
   // shelf (merge redirects, settings, reload-kept history), and scroll position is
-  // restored from sessionStorage when the shelf repopulates either way.
+  // restored from sessionStorage when the shelf repopulates either way. noScroll opts out
+  // of SvelteKit's built-in scroll-to-top so it cannot contend with that restore.
   async function goBack(): Promise<void> {
-    await goto('/').catch((e) => toasts.error(e));
+    await goto('/', { noScroll: true }).catch((e) => toasts.error(e));
   }
 
   async function saveTitle() {
