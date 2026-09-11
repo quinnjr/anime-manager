@@ -6,9 +6,46 @@
   import { assist } from '$lib/stores/assist.svelte';
   import { matching } from '$lib/stores/matching.svelte';
   import { toasts } from '$lib/stores/toasts.svelte';
+  import { parseAutoScanMins, shouldAutoScan, tryStartScan, endScan } from '$lib/autoScan';
   import Toasts from '$lib/components/Toasts.svelte';
 
   let { children } = $props();
+
+  // Automatic background scan: once on boot and periodically after, whenever a source
+  // folder is set. Each pass re-reads roots and the interval so adding the first folder
+  // or changing the interval takes effect without a reload. Fully silent: the grid
+  // refreshes through the usual library-changed / show-updated events.
+  let autoTimer: ReturnType<typeof setTimeout> | undefined;
+
+  async function autoScanPass(): Promise<void> {
+    let mins = parseAutoScanMins(undefined);
+    let roots = 0;
+    try {
+      const [r, s] = await Promise.all([api.listRoots(), api.getSettings()]);
+      roots = r.length;
+      mins = parseAutoScanMins(s.auto_scan_interval_mins);
+    } catch {
+      scheduleAutoScan(1);
+      return;
+    }
+    if (shouldAutoScan(roots, mins)) {
+      if (!tryStartScan()) {
+        scheduleAutoScan(mins);
+        return;
+      }
+      try { await api.scan(); } catch { /* silent: backend already emitted 'error' */ }
+      finally { endScan(); }
+      scheduleAutoScan(mins);
+    } else {
+      // No folders yet, or the interval is 0 (off): retry soon so a later change is picked up.
+      scheduleAutoScan(1);
+    }
+  }
+
+  function scheduleAutoScan(mins: number): void {
+    clearTimeout(autoTimer);
+    autoTimer = setTimeout(autoScanPass, Math.max(1, mins) * 60_000);
+  }
 
   onMount(() => {
     const unlisteners = [
@@ -22,7 +59,8 @@
       })
     ];
     api.assistProgress().then((p) => assist.apply(p)).catch(() => {});
-    return () => { unlisteners.forEach((p) => p.then((u) => u())); };
+    autoScanPass();
+    return () => { clearTimeout(autoTimer); unlisteners.forEach((p) => p.then((u) => u())); };
   });
 </script>
 
