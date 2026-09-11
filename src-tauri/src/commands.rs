@@ -172,7 +172,10 @@ pub async fn play(app: AppHandle, state: State<'_, AppState>, episode_id: i64) -
     if player.current().is_some() {
         return Err(crate::error::AppError::Player("another episode is already playing".into()));
     }
-    // Validate launch synchronously so the caller sees "mpv not found" immediately.
+    // Validate launch synchronously so the caller sees "mpv not found" or a missing file
+    // immediately as a toast, rather than after the background task's IPC timeout.
+    let ep = db.get_episode(episode_id)?;
+    player::ensure_file_present(&ep.path)?;
     let bin = player::mpv_binary(&db);
     if std::process::Command::new(&bin).arg("--version").output().is_err() {
         return Err(crate::error::AppError::Player(format!("mpv not found at '{bin}'; install mpv or set mpv_path in settings")));

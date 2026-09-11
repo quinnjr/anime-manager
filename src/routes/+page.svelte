@@ -3,6 +3,7 @@
   import { api, onEvent, SHOW_SORTS, type ShowCard as ShowCardT, type ShowSort } from '$lib/api';
   import { isTypingTarget } from '$lib/keys';
   import { toasts } from '$lib/stores/toasts.svelte';
+  import { saveShelfScroll, restoreAfterLoad } from '$lib/shelfScroll';
   import ShowCard from '$lib/components/ShowCard.svelte';
 
   let shows = $state<ShowCardT[]>([]);
@@ -15,12 +16,17 @@
   let generation = 0;
   let debounce: ReturnType<typeof setTimeout> | undefined;
 
-  async function load() {
+  async function load(): Promise<boolean> {
     const mine = ++generation;
     try {
       const rows = await api.listShows(filter, sort);
-      if (mine === generation) shows = rows;
-    } catch (e) { if (mine === generation) toasts.error(e); }
+      if (mine !== generation) return false;
+      shows = rows;
+      return true;
+    } catch (e) {
+      if (mine === generation) toasts.error(e);
+      return false;
+    }
   }
 
   function onSearchInput() {
@@ -42,7 +48,9 @@
         if (saved && SHOW_SORTS.some((o) => o.value === saved)) sort = saved;
       })
       .catch(() => {})
-      .finally(load);
+      // Restore only after the first load repopulates the grid: scrolling earlier lands on
+      // an empty page and clamps to the top, which is the bug this exists to fix.
+      .finally(() => { void restoreAfterLoad(load); });
     const us = [
       onEvent('show-updated', load),
       onEvent('library-changed', load),
@@ -53,7 +61,12 @@
       if (e.key === '/') { e.preventDefault(); search?.focus(); }
     };
     window.addEventListener('keydown', key);
-    return () => { clearTimeout(debounce); window.removeEventListener('keydown', key); us.forEach((p) => p.then((u) => u())); };
+    return () => {
+      saveShelfScroll(window.scrollY);
+      clearTimeout(debounce);
+      window.removeEventListener('keydown', key);
+      us.forEach((p) => p.then((u) => u()));
+    };
   });
 </script>
 
