@@ -55,6 +55,13 @@
 
   function openRename(t: RenameTarget) { renameTarget = t; renameOpen = true; }
 
+  // Always a fresh navigation to the shelf: the previous history entry is often not the
+  // shelf (merge redirects, settings, reload-kept history), and scroll position is
+  // restored from sessionStorage when the shelf repopulates either way.
+  async function goBack(): Promise<void> {
+    await goto('/').catch((e) => toasts.error(e));
+  }
+
   async function saveTitle() {
     if (!show) return;
     try {
@@ -96,6 +103,7 @@
     const key = (e: KeyboardEvent) => {
       // Settings lives in the layout, so a local open-flag cannot see it; ask the event target.
       if (rows.length === 0 || rematchOpen || renameOpen || isTypingTarget(e.target)) return;
+      if (e.key === 'Escape') { void goBack(); return; }
       if (e.key === 'ArrowDown') { e.preventDefault(); highlight = Math.min(highlight + 1, rows.length - 1); }
       if (e.key === 'ArrowUp') { e.preventDefault(); highlight = Math.max(highlight - 1, 0); }
       if (e.key === 'Enter') {
@@ -109,6 +117,7 @@
 </script>
 
 {#if show}
+  <button class="btn mb-4" onclick={() => void goBack()} aria-label="Back to shelf">← Shelf</button>
   <!-- The signature: cover art bled wide with the title set as a fansub subtitle
        riding its lower third, the way a line sits on a frame. One per screen. -->
   <section class="relative -mx-6 -mt-7 mb-7 overflow-hidden border-b border-edge">
