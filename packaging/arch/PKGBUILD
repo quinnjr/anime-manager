@@ -1,7 +1,7 @@
 # Maintainer: Joseph R. Quinn <quinn.josephr@gmail.com>
 
 pkgname=anime-manager
-pkgver=0.5.0
+pkgver=0.5.1
 pkgrel=1
 pkgdesc='Scan an anime collection, play episodes in mpv and track what you have watched'
 arch=('x86_64')
