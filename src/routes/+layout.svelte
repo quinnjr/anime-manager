@@ -6,9 +6,75 @@
   import { assist } from '$lib/stores/assist.svelte';
   import { matching } from '$lib/stores/matching.svelte';
   import { toasts } from '$lib/stores/toasts.svelte';
+  import {
+    DEFAULT_AUTO_SCAN_MINS, RETRY_SOON_MINS,
+    parseAutoScanMins, planPass, toTimeoutMs, withTimeout, SCAN_TIMEOUT_MS
+  } from '$lib/autoScan';
+  import { scanSlot } from '$lib/stores/scan.svelte';
+  import type { ScanSummary } from '$lib/api';
   import Toasts from '$lib/components/Toasts.svelte';
 
   let { children } = $props();
+
+  // Automatic background scan: once on boot and periodically after, whenever a source
+  // folder is set. Each pass re-reads roots and the interval so adding the first folder
+  // or changing the interval takes effect without a reload. Silent by design — the grid
+  // refreshes through the usual library-changed / show-updated events — but failures and
+  // degraded summaries go to the console, because scan() reports errors to its caller
+  // rather than emitting them.
+  let autoTimer: ReturnType<typeof setTimeout> | undefined;
+  let autoCancelled = false;
+
+  async function autoScanPass(): Promise<void> {
+    if (autoCancelled) return;
+    let roots = 0;
+    let mins = DEFAULT_AUTO_SCAN_MINS;
+    try {
+      const [r, s] = await Promise.all([api.listRoots(), api.getSettings()]);
+      roots = r.length;
+      mins = parseAutoScanMins(s.auto_scan_interval_mins);
+    } catch (e) {
+      console.error('auto-scan probe failed', e);
+      scheduleAutoScan(RETRY_SOON_MINS);
+      return;
+    }
+    const plan = planPass(roots, mins);
+    if (plan.action === 'wait') {
+      scheduleAutoScan(plan.waitMins);
+      return;
+    }
+    // The slot serialises against manual rescans; a timeout only abandons the wait — the
+    // backend pass keeps running, and the released slot unblocks the UI.
+    let summary: ScanSummary | null;
+    try {
+      summary = await scanSlot.withSlot(() => withTimeout(api.scan(), SCAN_TIMEOUT_MS));
+    } catch (e) {
+      console.error('auto-scan failed', e);
+      scheduleAutoScan(mins);
+      return;
+    }
+    if (summary === null) {
+      scheduleAutoScan(mins);
+      return;
+    }
+    if (summary.errors.length > 0) console.error('auto-scan reported errors', summary.errors);
+    if (autoCancelled) return;
+    // A manual scan that lost the race queued itself; drain it now rather than making it
+    // wait a full interval (the in-flight pass snapshotted roots before the change).
+    if (scanSlot.takePending()) {
+      void autoScanPass();
+      return;
+    }
+    // Re-read: the user may have changed or disabled the interval mid-scan.
+    const fresh = await api.getSettings().catch(() => null);
+    scheduleAutoScan(fresh ? parseAutoScanMins(fresh.auto_scan_interval_mins) : mins);
+  }
+
+  function scheduleAutoScan(mins: number): void {
+    if (autoCancelled) return;
+    clearTimeout(autoTimer);
+    autoTimer = setTimeout(() => { void autoScanPass(); }, toTimeoutMs(mins));
+  }
 
   onMount(() => {
     const unlisteners = [
@@ -22,7 +88,8 @@
       })
     ];
     api.assistProgress().then((p) => assist.apply(p)).catch(() => {});
-    return () => { unlisteners.forEach((p) => p.then((u) => u())); };
+    void autoScanPass();
+    return () => { autoCancelled = true; clearTimeout(autoTimer); unlisteners.forEach((p) => p.then((u) => u())); };
   });
 </script>
 
