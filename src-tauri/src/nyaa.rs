@@ -8,7 +8,7 @@ use regex::Regex;
 
 use crate::db::Db;
 use crate::error::{AppError, Result};
-use crate::models::EpisodeStatus;
+use crate::models::{EpisodeStatus, ShowDetail};
 use serde::{Deserialize, Serialize};
 
 /// A single Nyaa search result row.
@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 struct NyaaHit {
     pub title: String,
     pub page_url: String,
+    pub torrent_url: Option<String>,
+    pub info_hash: Option<String>,
     pub size_bytes: u64,
     pub seeders: u32,
 }
@@ -316,6 +318,8 @@ struct RawItem {
     link: String,
     #[serde(default)]
     guid: String,
+    #[serde(default, rename = "nyaa:infoHash")]
+    info_hash: String,
     #[serde(default, rename = "nyaa:size")]
     size: String,
     #[serde(default, rename = "nyaa:seeders")]
@@ -333,16 +337,27 @@ fn parse_rss(body: &str) -> Result<Vec<NyaaHit>> {
         let title = item.title.trim().to_string();
         let link = item.link.trim().to_string();
         let guid = item.guid.trim().to_string();
+        let info_hash = item.info_hash.trim().to_string();
         let size = item.size.trim().to_string();
         let seeders = item.seeders.trim().to_string();
         // Live shape: `<link>` is the `.torrent` file, `<guid>`
         // the view page. Prefer the view page; feeds without a
         // guid fall back to the link.
-        let page_url = if guid.is_empty() { link } else { guid };
+        let page_url = if guid.is_empty() {
+            link.clone()
+        } else {
+            guid
+        };
         if !page_url.is_empty() {
             hits.push(NyaaHit {
                 title,
                 page_url,
+                torrent_url: if link.is_empty() { None } else { Some(link) },
+                info_hash: if info_hash.is_empty() {
+                    None
+                } else {
+                    Some(info_hash)
+                },
                 size_bytes: parse_size(&size),
                 seeders: seeders.parse().unwrap_or(0),
             });
@@ -381,6 +396,8 @@ pub fn parse_size(s: &str) -> u64 {
 pub struct WantedHit {
     pub title: String,
     pub page_url: String,
+    pub torrent_url: Option<String>,
+    pub info_hash: Option<String>,
     pub size_bytes: u64,
     pub seeders: u32,
 }
@@ -402,6 +419,31 @@ struct Owned {
     number: u32,
     group: Option<String>,
     resolution: Option<String>,
+}
+
+/// Episodes on disk that vote for preferences and baseline wanted
+/// numbers. Season 0 and missing-status rows never reach this struct.
+/// Extracted verbatim from `find_missing` so `subscribe_derivation`
+/// reuses the same collector instead of duplicating its exclusions.
+fn owned_episodes(show: &ShowDetail) -> Vec<Owned> {
+    let mut owned: Vec<Owned> = Vec::new();
+    for season in &show.seasons {
+        if season.number == 0 {
+            continue;
+        }
+        for ep in &season.episodes {
+            if ep.status == EpisodeStatus::Missing {
+                continue;
+            }
+            owned.push(Owned {
+                season: season.number,
+                number: ep.number,
+                group: ep.release_group.clone(),
+                resolution: ep.resolution.clone(),
+            });
+        }
+    }
+    owned
 }
 
 /// Episode numbers to hunt, per season: gaps strictly inside the owned range,
@@ -490,24 +532,10 @@ fn size_band(sizes: &[u64]) -> Option<(u64, u64)> {
 pub async fn find_missing(db: &Db, nyaa: &Nyaa, show_id: i64) -> Result<Vec<WantedEpisode>> {
     let show = db.get_show(show_id)?;
 
-    let mut owned: Vec<Owned> = Vec::new();
+    let owned = owned_episodes(&show);
     let mut per_season: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    for season in &show.seasons {
-        if season.number == 0 {
-            continue;
-        }
-        for ep in &season.episodes {
-            if ep.status == EpisodeStatus::Missing {
-                continue;
-            }
-            owned.push(Owned {
-                season: season.number,
-                number: ep.number,
-                group: ep.release_group.clone(),
-                resolution: ep.resolution.clone(),
-            });
-            per_season.entry(season.number).or_default().push(ep.number);
-        }
+    for o in &owned {
+        per_season.entry(o.season).or_default().push(o.number);
     }
 
     let total = match show.total_episodes {
@@ -556,6 +584,8 @@ pub async fn find_missing(db: &Db, nyaa: &Nyaa, show_id: i64) -> Result<Vec<Want
                     Some(WantedHit {
                         title: h.title,
                         page_url: h.page_url,
+                        torrent_url: h.torrent_url,
+                        info_hash: h.info_hash,
                         size_bytes: h.size_bytes,
                         seeders: h.seeders,
                     })
@@ -572,6 +602,37 @@ pub async fn find_missing(db: &Db, nyaa: &Nyaa, show_id: i64) -> Result<Vec<Want
         });
     }
     Ok(wanted)
+}
+
+/// Title-only Nyaa RSS feed URL for a show (no episode number, so future
+/// episodes match). Query encoding goes through reqwest::Url — never string concat.
+pub fn feed_url(title: &str) -> String {
+    let mut u = reqwest::Url::parse(NYAA_BASE).expect("const base parses");
+    u.set_path("/");
+    u.query_pairs_mut()
+        .append_pair("page", "rss")
+        .append_pair("q", title)
+        .append_pair("c", "1_2")
+        .append_pair("f", "0");
+    u.to_string()
+}
+
+pub struct FeedDerivation {
+    pub feed_url: String,
+    pub group: Option<String>,
+    pub resolution: Option<String>,
+}
+
+/// Everything torrent_rss_subscribe needs, derived from owned episodes.
+/// Group/resolution reuse the find_missing modals (skip-when-absent, never fail).
+pub fn subscribe_derivation(db: &Db, show_id: i64) -> Result<FeedDerivation> {
+    let show = db.get_show(show_id)?;
+    let owned = owned_episodes(&show);
+    Ok(FeedDerivation {
+        feed_url: feed_url(&show.display_title),
+        group: modal_group(&owned),
+        resolution: modal_resolution(&owned),
+    })
 }
 
 #[cfg(test)]
@@ -603,6 +664,18 @@ mod tests {
         );
         assert_eq!(hits[0].seeders, 42);
         assert_eq!(hits[0].size_bytes, 1_503_238_553);
+        assert_eq!(
+            hits[0].torrent_url.as_deref(),
+            Some("https://nyaa.si/download/12345.torrent")
+        );
+        assert_eq!(
+            hits[0].info_hash.as_deref(),
+            Some("abcdef0123456789abcdef0123456789abcdef01")
+        );
+        assert_eq!(
+            feed_url("Sousou no Frieren"),
+            "https://nyaa.si/?page=rss&q=Sousou+no+Frieren&c=1_2&f=0"
+        );
         assert_eq!(
             hits[1].page_url, "https://nyaa.si/download/9.torrent",
             "link fallback when the feed omits guid"
