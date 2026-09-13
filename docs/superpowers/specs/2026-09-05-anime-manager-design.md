@@ -149,6 +149,10 @@ Triggers:
    `llm_delay_ms` (default 500) between folders; a scan that lands while the worker
    runs extends the same run. 429/5xx/transport errors retry up to 6 times with
    exponential backoff honouring `Retry-After`; 4xx auth errors fail immediately.
+   The worker only starts after a successful `llm_test` against the current key, endpoint
+   and model (`llm_test_ok`); writing a new key, endpoint or model, or a failed test,
+   disarms it again, so a broken config is never pinged in the background. Untested
+   folders are simply re-detected on the next scan — nothing is queued, nothing toasts.
    Events: `llm-assist-progress {done,total,folder,running}` after each folder (also
    readable via `assist_progress()` on startup), `library-changed` as folders change,
    `llm-assist` with the report when the queue is empty.
@@ -179,7 +183,8 @@ never discards the folder's other decisions.
 the on-demand command reports that assist is busy rather than racing the worker.
 
 `llm_test()` sends a one-line prompt and returns the model's reply, for the settings
-drawer's "Test connection" button. Network failures are logged and non-fatal during
+drawer's "Test connection" button. Success arms the background worker for the current
+config; failure disarms it. Network failures are logged and non-fatal during
 scans; on-demand failures surface as toasts.
 
 ## Safety rules

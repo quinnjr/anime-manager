@@ -321,6 +321,7 @@ pub async fn scan(app: AppHandle, state: State<'_, AppState>) -> Result<ScanSumm
         .map(|v| v != "false")
         .unwrap_or(true);
     if assist_on
+        && Llm::test_ok(&state.db)
         && let Ok(l) = Llm::from_db(&state.db)
         && l.configured()
         && (!summary.low_confidence_folders.is_empty() || state.assist.has_pending())
@@ -521,6 +522,16 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String
             .get_setting("llm_delay_ms")?
             .unwrap_or_else(|| llm::DEFAULT_DELAY_MS.to_string()),
     );
+    // Whether the background worker is armed; the settings page reads this so an untested
+    // config says so instead of silently never assisting.
+    m.insert(
+        "llm_test_ok".into(),
+        if Llm::test_ok(&state.db) {
+            "true".into()
+        } else {
+            "false".into()
+        },
+    );
     m.insert(
         SETTING_DLNA_NAME.into(),
         state
@@ -554,6 +565,11 @@ pub fn set_setting(state: State<'_, AppState>, key: String, value: String) -> Re
     }
     if key == SETTING_DLNA_UUID && value.trim().is_empty() {
         return Ok(());
+    }
+    // A new key, endpoint or model un-proves the last successful connection test, so the
+    // background worker stands down until it tests clean again.
+    if Llm::invalidates_test(&key) {
+        Llm::mark_tested(&state.db, false)?;
     }
     state.db.set_setting(&key, &value)
 }
@@ -696,7 +712,14 @@ pub async fn llm_models(state: State<'_, AppState>) -> Result<Vec<String>> {
 
 #[tauri::command]
 pub async fn llm_test(state: State<'_, AppState>) -> Result<String> {
-    Llm::from_db(&state.db)?.test().await
+    let reply = Llm::from_db(&state.db)?.test().await;
+    // Arm (or disarm) the background worker from the outcome: only a config that just
+    // proved itself gets pinged on every scan.
+    match &reply {
+        Ok(_) => Llm::mark_tested(&state.db, true)?,
+        Err(_) => Llm::mark_tested(&state.db, false)?,
+    }
+    reply
 }
 
 #[tauri::command]

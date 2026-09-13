@@ -28,6 +28,10 @@ pub const MAX_KNOWN_TITLES: usize = 400;
 /// Every override this module writes is attributed to the model, and `clear_ai_decisions`
 /// deletes on exactly this string - no other value can round-trip.
 pub const OVERRIDE_SOURCE: &str = "llm";
+/// Settings key recording that `llm_test` last succeeded. The background worker only drains
+/// when this holds TEST_OK_VALUE; see `Llm::test_ok`.
+pub const TEST_OK_KEY: &str = "llm_test_ok";
+const TEST_OK_VALUE: &str = "1";
 /// Longest `Retry-After` worth honouring in-process; beyond this the quota is spent, not busy.
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// Attempts per request; waits grow as retry_base * 2^n and honour Retry-After.
@@ -164,6 +168,33 @@ impl Llm {
 
     pub fn configured(&self) -> bool {
         self.api_key.is_some()
+    }
+
+    /// Background assist only runs after the settings "Test connection" button has succeeded
+    /// against the current key, endpoint and model. A broken config otherwise retries every
+    /// folder on every scan (up to 6 attempts each with backoff) and toasts every pass, so a
+    /// connection that never worked must never be pinged in the background.
+    pub fn test_ok(db: &Db) -> bool {
+        db.get_setting(TEST_OK_KEY)
+            .ok()
+            .flatten()
+            .is_some_and(|v| v == TEST_OK_VALUE)
+    }
+
+    /// Record the outcome of a `llm_test` round trip. Success arms the background worker;
+    /// failure disarms it, so a revoked key stops being pinged until it tests clean again.
+    pub fn mark_tested(db: &Db, ok: bool) -> Result<()> {
+        if ok {
+            db.set_setting(TEST_OK_KEY, TEST_OK_VALUE)
+        } else {
+            db.delete_setting(TEST_OK_KEY)
+        }
+    }
+
+    /// Writing a new key, endpoint or model invalidates the last successful test: the flag
+    /// says the *current* config works, so any change to it re-arms only via another test.
+    pub fn invalidates_test(key: &str) -> bool {
+        matches!(key, "llm_api_key" | "llm_base_url" | "llm_model")
     }
 
     pub fn model(&self) -> &str {
@@ -1718,5 +1749,37 @@ mod tests {
         assert!(r.is_err());
         assert!(!q.is_running(), "the guard must clear `running` on unwind");
         assert!(q.try_start().is_some());
+    }
+
+    #[test]
+    fn background_assist_needs_a_successful_test_first() {
+        // An untested config must never be pinged in the background: every folder would fail
+        // the same way on every scan, retrying each up to 6 times and toasting every pass.
+        let db = Db::open_memory().unwrap();
+        assert!(!Llm::test_ok(&db), "fresh database is disarmed");
+        Llm::mark_tested(&db, true).unwrap();
+        assert!(Llm::test_ok(&db));
+        Llm::mark_tested(&db, false).unwrap();
+        assert!(!Llm::test_ok(&db));
+    }
+
+    #[test]
+    fn rewriting_identity_settings_disarms_the_worker() {
+        let db = Db::open_memory().unwrap();
+        Llm::mark_tested(&db, true).unwrap();
+        for k in ["llm_api_key", "llm_base_url", "llm_model"] {
+            assert!(Llm::invalidates_test(k), "{k} must invalidate the last test");
+        }
+        for k in ["llm_delay_ms", "llm_assist_on_scan", "mpv_path"] {
+            assert!(!Llm::invalidates_test(k), "{k} must not disarm anything");
+        }
+    }
+
+    #[test]
+    fn deleting_a_setting_really_removes_it() {
+        let db = Db::open_memory().unwrap();
+        db.set_setting("llm_test_ok", "1").unwrap();
+        db.delete_setting("llm_test_ok").unwrap();
+        assert!(db.get_setting("llm_test_ok").unwrap().is_none());
     }
 }

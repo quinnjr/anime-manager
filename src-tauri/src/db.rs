@@ -302,6 +302,13 @@ impl Db {
         })
     }
 
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+            Ok(())
+        })
+    }
+
     pub fn played_threshold(&self) -> Result<f64> {
         Ok(self
             .get_setting("played_threshold")?

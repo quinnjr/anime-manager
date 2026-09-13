@@ -7,6 +7,7 @@
     type Root, type ScanProgress, type ScanSummary, type LibraryStatus, type DlnaStatus
   } from '$lib/api';
   import { toasts } from '$lib/stores/toasts.svelte';
+  import ModelPickerModal from '$lib/components/ModelPickerModal.svelte';
   import { matching } from '$lib/stores/matching.svelte';
   import { DEFAULT_AUTO_SCAN_MINS, parseValidatedAutoScanMins } from '$lib/autoScan';
   import { scanSlot } from '$lib/stores/scan.svelte';
@@ -26,9 +27,9 @@
   let llmOnScan = $state(true);
   let llmDelay = $state('500');
   let provider = $state(LLM_PROVIDERS[0].id);
-  let models = $state<string[]>([]);
+  let modelPickerOpen = $state(false);
+  let llmTested = $state(false);
   let testing = $state(false);
-  let loadingModels = $state(false);
 
   let dlnaRunning = $state(false);
   let dlnaPort = $state(0);
@@ -65,6 +66,7 @@
       llmOnScan = (s.llm_assist_on_scan ?? 'true') !== 'false';
       autoScanMins = s.auto_scan_interval_mins ?? String(DEFAULT_AUTO_SCAN_MINS);
       llmDelay = s.llm_delay_ms ?? '500';
+      llmTested = (s.llm_test_ok ?? 'false') === 'true';
       provider = LLM_PROVIDERS.find((p) => p.baseUrl === llmBaseUrl)?.id ?? 'custom';
       dlnaName = s.dlna_name ?? '';
       dlnaPortField = s.dlna_port ?? '28987';
@@ -150,7 +152,6 @@
     provider = id;
     const p = LLM_PROVIDERS.find((x) => x.id === id);
     if (p && p.baseUrl) llmBaseUrl = p.baseUrl;
-    models = [];
   }
 
   async function saveAll() {
@@ -171,15 +172,11 @@
     } catch (e) { toasts.error(e); }
   }
 
-  async function loadModels() {
-    loadingModels = true;
-    try {
-      await api.setSetting('llm_api_key', llmKey.trim());
-      await api.setSetting('llm_base_url', llmBaseUrl.trim());
-      models = await api.llmModels();
-      if (models.length === 0) toasts.push('info', 'The provider returned no models.');
-    } catch (e) { toasts.error(e); }
-    finally { loadingModels = false; }
+  async function refreshTestFlag() {
+    // The picker may have saved a new key or endpoint behind this page's back; only the
+    // flag is re-read, never the fields, so unsaved edits above it survive.
+    try { llmTested = ((await api.getSettings()).llm_test_ok ?? 'false') === 'true'; }
+    catch { /* flag keeps its last value; errors already surfaced where raised */ }
   }
 
   async function testLlm() {
@@ -187,7 +184,8 @@
     try {
       await saveAll();
       toasts.push('success', await api.llmTest());
-    } catch (e) { toasts.error(e); }
+      llmTested = true;
+    } catch (e) { toasts.error(e); llmTested = false; }
     finally { testing = false; }
   }
 
@@ -408,13 +406,11 @@
       <label class="block text-sm">
         <span class="text-muted">Model</span>
         <div class="mt-1 flex gap-2">
-          <input bind:value={llmModel} list="llm-models" class="field flex-1" placeholder="pick or type an id" />
-          <button class="btn shrink-0" disabled={loadingModels || !llmKey.trim()} onclick={loadModels}>
-            {loadingModels ? 'Listing…' : 'List'}
+          <input bind:value={llmModel} class="field flex-1" placeholder="pick or type an id" />
+          <button class="btn shrink-0" disabled={!llmKey.trim()} onclick={() => (modelPickerOpen = true)}>
+            Choose…
           </button>
         </div>
-        <datalist id="llm-models">{#each models as m (m)}<option value={m}></option>{/each}</datalist>
-        {#if models.length}<span class="tag mt-1 block">{models.length} models offered</span>{/if}
       </label>
     </div>
     <div class="mt-3 flex flex-wrap items-center gap-3">
@@ -428,6 +424,7 @@
         <span class="tag">ms</span>
       </label>
       <button class="btn" disabled={testing || !llmKey.trim()} onclick={testLlm}>{testing ? 'Testing…' : 'Test connection'}</button>
+      <span class="tag">{llmTested ? 'tested — background assist armed' : 'untested — background assist stands down until a test succeeds'}</span>
     </div>
   </section>
 
@@ -442,6 +439,12 @@
     <p class="tag mt-2">Forgetting missing episodes deletes their watched state. Files on disk are never touched.</p>
   </section>
 
+  <ModelPickerModal
+    apiKey={llmKey.trim()} baseUrl={llmBaseUrl.trim()} current={llmModel.trim()}
+    bind:open={modelPickerOpen}
+    onPick={(m) => (llmModel = m)}
+    onClose={refreshTestFlag}
+  />
   <div class="sticky bottom-0 -mx-6 border-t border-edge bg-ink/95 px-6 py-3 backdrop-blur">
     <button class="btn btn-key" onclick={saveAll}>Save settings</button>
     <a href="/" class="btn ml-2 inline-block">Back to library</a>
