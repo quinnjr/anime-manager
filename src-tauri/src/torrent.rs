@@ -1,5 +1,5 @@
 use crate::db::Db;
-use crate::error::{AppError, Result};
+use crate::error::Result;
 
 pub const BASE_URL_KEY: &str = "torrent_base_url";
 pub const PASSWORD_KEY: &str = "torrent_password";
