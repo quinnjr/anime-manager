@@ -2,7 +2,8 @@
   import { onMount } from 'svelte';
   import { page } from '$app/state';
   import { goto } from '$app/navigation';
-  import { api, onEvent, type ShowDetail, type RenameTarget } from '$lib/api';
+  import { api, onEvent, type ShowDetail, type RenameTarget, type WantedEpisode } from '$lib/api';
+  import { openUrl } from '@tauri-apps/plugin-opener';
   import { toasts } from '$lib/stores/toasts.svelte';
   import { playback } from '$lib/stores/playback.svelte';
   import { isTypingTarget } from '$lib/keys';
@@ -19,6 +20,9 @@
   let renameOpen = $state(false);
   let renameTarget = $state<RenameTarget | null>(null);
   let inspecting = $state(false);
+  let finding = $state(false);
+  let wanted = $state<WantedEpisode[]>([]);
+  let found = $state(false);
   let editingTitle = $state(false);
   let titleDraft = $state('');
 
@@ -93,9 +97,39 @@
     } finally { inspecting = false; }
   }
 
+  async function findMissing() {
+    if (!show) return;
+    finding = true;
+    try {
+      const r = await api.findMissing(show.id);
+      wanted = r;
+      found = true;
+      // Pure query: nothing on disk or in the database changed, so no reload.
+      if (r.length === 0) toasts.push('info', 'No missing episodes — the owned range has no gaps.');
+      else if (r.every((w) => w.hits.length === 0)) toasts.push('info', 'Missing episodes found, but none has a strict match yet.');
+    } catch (e) {
+      toasts.error(e);
+    } finally { finding = false; }
+  }
+
+  async function openPage(url: string) {
+    try { await openUrl(url); } catch (e) { toasts.error(e); }
+  }
+
+  function formatSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    let v = bytes / 1024;
+    let u = 0;
+    while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
+    return `${v.toFixed(v >= 100 ? 0 : 1)} ${units[u]}`;
+  }
+
   $effect(() => {
     id; // track
     highlight = 0;
+    wanted = [];
+    found = false;
     load();
   });
 
@@ -160,12 +194,42 @@
             onclick={inspect}>
             {inspecting ? 'Checking…' : 'Check seasons with AI'}
           </button>
+          <button class="btn" disabled={finding}
+            title="Search Nyaa for episodes missing from this show"
+            onclick={findMissing}>
+            {finding ? 'Finding…' : 'Find missing'}
+          </button>
           <button class="btn" title="Use your own title for this show"
             onclick={() => { titleDraft = show!.user_title_override ?? show!.display_title; editingTitle = true; }}>Retitle</button>
         </div>
       </div>
     </div>
   </section>
+
+  {#if found}
+    <section aria-label="Missing episodes" class="mb-7 border-b border-edge pb-6">
+      <div class="eyebrow mb-2">Missing episodes</div>
+      {#if wanted.length === 0}
+        <p class="tag">No missing episodes — the owned range has no gaps.</p>
+      {:else}
+        <ul class="flex flex-col gap-2">
+          {#each wanted as w (w.season + ':' + w.number)}
+            {@const best = w.hits[0]}
+            <li class="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <span class="tag-chip shrink-0">S{w.season}E{w.number}</span>
+              {#if best}
+                <span class="min-w-0 flex-1 truncate">{best.title}</span>
+                <span class="tag shrink-0">{formatSize(best.size_bytes)} · {best.seeders} seeder{best.seeders === 1 ? '' : 's'}</span>
+                <button class="btn shrink-0" onclick={() => void openPage(best.page_url)}>Nyaa page</button>
+              {:else}
+                <span class="tag">no strict match</span>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
+  {/if}
 
   <SeasonList {seasons} highlightedId={rows[highlight]?.group.primary.id ?? null}
     onRename={(episodeId) => openRename({ type: 'episode', id: episodeId })} />
