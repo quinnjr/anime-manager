@@ -1103,6 +1103,25 @@ mod tests {
     }
 
     #[test]
+    fn subscribe_derivation_without_group_or_resolution() {
+        // Files with no release group or resolution vote for nothing: the
+        // derivation omits those clauses rather than failing.
+        let db = Db::open_memory().unwrap();
+        for (e, p) in [(1u32, "/lib/N/01.mkv"), (2, "/lib/N/02.mkv")] {
+            db.upsert_episode(&pn("No Group Show", 1, e, None, None), &rf(p))
+                .unwrap();
+        }
+        let show_id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+        let d = subscribe_derivation(&db, show_id).unwrap();
+        assert!(d.group.is_none(), "no group on disk means no group clause");
+        assert!(d.resolution.is_none(), "no resolution on disk means no resolution clause");
+        assert_eq!(
+            d.feed_url, "https://nyaa.si/?page=rss&q=No+Group+Show&c=1_2&f=0",
+            "title-only query in the same shape as feed_url pins"
+        );
+    }
+
+    #[test]
     fn parse_size_extended() {
         assert_eq!(parse_size("1.4 gib"), 1_503_238_553, "lowercase unit");
         assert_eq!(parse_size("  700 MiB  "), 734_003_200, "surrounding spaces");

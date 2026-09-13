@@ -900,6 +900,19 @@ impl Db {
                            total_episodes      = COALESCE(total_episodes,      (SELECT total_episodes      FROM shows WHERE id = ?2))
                          WHERE id = ?1",
                         params![keep, loser])?;
+                    // Torrent state is keyed by show_id with ON DELETE CASCADE, so without a
+                    // re-point the loser's links, prefs and feed labels vanish with its row.
+                    // Links move; a keeper-side pin wins on the same info_hash. Prefs are
+                    // keep-wins (copied only when the keeper has none). Feed labels move.
+                    tx.execute("UPDATE OR IGNORE torrent_links SET show_id = ?1 WHERE show_id = ?2",
+                        params![keep, loser])?;
+                    tx.execute("DELETE FROM torrent_links WHERE show_id = ?1", params![loser])?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO torrent_prefs(show_id, save_path, category)
+                         SELECT ?1, save_path, category FROM torrent_prefs WHERE show_id = ?2",
+                        params![keep, loser])?;
+                    tx.execute("UPDATE rss_feeds SET show_id = ?1 WHERE show_id = ?2",
+                        params![keep, loser])?;
                     tx.execute("DELETE FROM shows WHERE id = ?1", params![loser])?;
                     folded += 1;
                 }
@@ -2045,6 +2058,82 @@ mod tests {
             m.canonical_title.as_deref(),
             Some("Canon Big"),
             "the survivor's own value is not overwritten"
+        );
+    }
+
+    #[test]
+    fn a_fold_carries_torrent_state_to_the_survivor() {
+        // Links, prefs and feed labels are keyed by show_id with ON DELETE CASCADE:
+        // without a re-point the fold would silently wipe the loser's torrent state.
+        let db = Db::open_memory().unwrap();
+        let seed = |big: &str, small: &str, dir: &str| {
+            db.upsert_episode(&pn(big, 1, 1), &rf(&format!("/{dir}/a1.mkv"), 1, 1))
+                .unwrap();
+            db.upsert_episode(&pn(big, 1, 2), &rf(&format!("/{dir}/a2.mkv"), 1, 1))
+                .unwrap();
+            db.upsert_episode(&pn(small, 1, 1), &rf(&format!("/{dir}/b1.mkv"), 1, 1))
+                .unwrap();
+        };
+        seed("BigA", "SmallA", "a");
+        seed("BigB", "SmallB", "b");
+        let id = |t: &str| db.list_shows(t, ShowSort::Title).unwrap()[0].id;
+        let (big_a, small_a) = (id("BigA"), id("SmallA"));
+        let (big_b, small_b) = (id("BigB"), id("SmallB"));
+        let hit = |ext: i64| MetadataHit {
+            id: ext,
+            source: "kitsu".into(),
+            title_romaji: "Canon".into(),
+            title_english: None,
+            cover_url: None,
+            episodes: None,
+        };
+        db.set_anilist(big_a, &hit(101)).unwrap();
+        db.set_anilist(small_a, &hit(101)).unwrap();
+        db.set_anilist(big_b, &hit(202)).unwrap();
+        db.set_anilist(small_b, &hit(202)).unwrap();
+        // Pair A exercises keep-wins: both rows carry prefs. Pair B exercises the
+        // copy path: only the loser has prefs.
+        db.add_torrent_link(&TorrentLink {
+            info_hash: "aaa".into(), show_id: small_a, season: 1, number: 1,
+            added_at: 1,
+        }).unwrap();
+        db.add_torrent_link(&TorrentLink {
+            info_hash: "bbb".into(), show_id: small_b, season: 1, number: 1,
+            added_at: 1,
+        }).unwrap();
+        db.set_prefs(big_a, Some("/tv/BigA"), Some("catA")).unwrap();
+        db.set_prefs(small_a, Some("/tv/SmallA"), Some("catSmallA")).unwrap();
+        db.set_prefs(small_b, Some("/tv/SmallB"), Some("catB")).unwrap();
+        db.add_rss_feed("animemgr:pair-a", small_a).unwrap();
+        db.add_rss_feed("animemgr:pair-b", small_b).unwrap();
+
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 2);
+
+        for (h, loser) in [("aaa", small_a), ("bbb", small_b)] {
+            let got = db.torrent_link(h).unwrap().expect("link survives the fold");
+            assert!(got.show_id == big_a || got.show_id == big_b);
+            assert!(db.links_for_show(loser).unwrap().is_empty(), "loser rows gone");
+            assert!(db.get_show(loser).is_err(), "the folded row is gone");
+        }
+        assert_eq!(db.links_for_show(big_a).unwrap().len(), 1);
+        assert_eq!(db.links_for_show(big_b).unwrap().len(), 1);
+        let prefs_a = db.get_prefs(big_a).unwrap();
+        assert_eq!(
+            (prefs_a.save_path.as_deref(), prefs_a.category.as_deref()),
+            (Some("/tv/BigA"), Some("catA")),
+            "keeper's own prefs win"
+        );
+        let prefs_b = db.get_prefs(big_b).unwrap();
+        assert_eq!(
+            (prefs_b.save_path.as_deref(), prefs_b.category.as_deref()),
+            (Some("/tv/SmallB"), Some("catB")),
+            "loser's prefs carry over when the keeper has none"
+        );
+        assert_eq!(db.rss_feed_show("animemgr:pair-a").unwrap(), Some(big_a));
+        assert_eq!(db.rss_feed_show("animemgr:pair-b").unwrap(), Some(big_b));
+        assert!(
+            db.rss_feeds().unwrap().iter().all(|f| f.show_id == big_a || f.show_id == big_b),
+            "no feed still points at a folded row"
         );
     }
 
