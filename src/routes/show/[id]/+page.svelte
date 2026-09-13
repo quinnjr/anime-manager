@@ -11,6 +11,7 @@
   import RenameModal from '$lib/components/RenameModal.svelte';
   import Cover from '$lib/components/Cover.svelte';
   import { flatten } from '$lib/episodes';
+  import { formatSize, summariseWanted } from '$lib/nyaaDisplay';
   import SeasonList from '$lib/components/SeasonList.svelte';
 
   const id = $derived(Number(page.params.id));
@@ -107,14 +108,17 @@
     if (!show) return;
     const mine = ++searchGeneration;
     finding = true;
+    found = false;
+    wanted = [];
     try {
       const r = await api.findMissing(show.id);
       if (mine !== searchGeneration) return;
       wanted = r;
       found = true;
       // Pure query: nothing on disk or in the database changed, so no reload.
-      if (r.length === 0) toasts.push('info', 'No missing episodes — the owned range has no gaps.');
-      else if (r.every((w) => w.hits.length === 0)) toasts.push('info', 'Missing episodes found, but none has a strict match yet.');
+      const summary = summariseWanted(r);
+      if (summary === 'empty') toasts.push('info', 'No missing episodes — the owned range has no gaps.');
+      else if (summary === 'no-hits') toasts.push('info', 'Missing episodes found, but none has a strict match yet.');
     } catch (e) {
       if (mine !== searchGeneration) return;
       toasts.error(e);
@@ -126,16 +130,18 @@
   }
 
   async function openPage(url: string) {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      toasts.push('error', 'Blocked unexpected Nyaa link.');
+      return;
+    }
+    if (parsed.protocol !== 'https:' || parsed.hostname !== 'nyaa.si') {
+      toasts.push('error', 'Blocked unexpected Nyaa link.');
+      return;
+    }
     try { await openUrl(url); } catch (e) { toasts.error(e); }
-  }
-
-  function formatSize(bytes: number): string {
-    if (bytes < 1024) return `${bytes} B`;
-    const units = ['KiB', 'MiB', 'GiB', 'TiB'];
-    let v = bytes / 1024;
-    let u = 0;
-    while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
-    return `${v.toFixed(v >= 100 ? 0 : 1)} ${units[u]}`;
   }
 
   $effect(() => {

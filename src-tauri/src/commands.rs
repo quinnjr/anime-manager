@@ -747,7 +747,7 @@ pub async fn find_missing(
     state: State<'_, AppState>,
     show_id: i64,
 ) -> Result<Vec<WantedEpisode>> {
-    nyaa::find_missing(&state.db, &Nyaa::with(nyaa::NYAA_BASE.into()), show_id).await
+    nyaa::find_missing(&state.db, &Nyaa::with_endpoint(nyaa::NYAA_BASE.into())?, show_id).await
 }
 
 /// Model ids offered by whatever provider is configured right now.
