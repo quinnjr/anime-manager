@@ -25,13 +25,19 @@ pub fn scan_dir(root: &Path) -> (Vec<RawFile>, Vec<String>) {
     let mut files = Vec::new();
     let mut errors = Vec::new();
     let is_hidden = |e: &walkdir::DirEntry| {
-        e.depth() > 0 && e.file_name().to_str().map(|n| n.starts_with('.')).unwrap_or(false)
+        e.depth() > 0
+            && e.file_name()
+                .to_str()
+                .map(|n| n.starts_with('.'))
+                .unwrap_or(false)
     };
     // Guard against a directory tree that nests itself under the same name (seen on SMB
     // shares where the server resolves a symlink loop into plain directories): allow
     // "Show/Show" but refuse a third identical consecutive component.
     let is_self_nested = |e: &walkdir::DirEntry| {
-        if !e.file_type().is_dir() { return false; }
+        if !e.file_type().is_dir() {
+            return false;
+        }
         let name = e.file_name();
         let mut anc = e.path().ancestors().skip(1);
         let parent = anc.next().and_then(|p| p.file_name());
@@ -46,22 +52,38 @@ pub fn scan_dir(root: &Path) -> (Vec<RawFile>, Vec<String>) {
     for entry in walker {
         let entry = match entry {
             Ok(e) => e,
-            Err(e) => { errors.push(e.to_string()); continue; }
+            Err(e) => {
+                errors.push(e.to_string());
+                continue;
+            }
         };
-        if !entry.file_type().is_file() || !is_video(entry.path()) { continue; }
+        if !entry.file_type().is_file() || !is_video(entry.path()) {
+            continue;
+        }
         let meta = match entry.metadata() {
             Ok(m) => m,
-            Err(e) => { errors.push(format!("{}: {e}", entry.path().display())); continue; }
+            Err(e) => {
+                errors.push(format!("{}: {e}", entry.path().display()));
+                continue;
+            }
         };
-        let mtime = meta.modified().ok()
+        let mtime = meta
+            .modified()
+            .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let path = entry.path().to_path_buf();
         files.push(RawFile {
-            stem: path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string(),
-            dirs: path.ancestors().skip(1)
-                .take_while(|a| a.starts_with(root) )
+            stem: path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string(),
+            dirs: path
+                .ancestors()
+                .skip(1)
+                .take_while(|a| a.starts_with(root))
                 .filter_map(|a| a.file_name().and_then(|s| s.to_str()).map(str::to_string))
                 .collect(),
             size: meta.len(),

@@ -1,10 +1,16 @@
-pub fn encode_id(kind: &str, id: i64) -> String { format!("{kind}:{id}") }
+pub fn encode_id(kind: &str, id: i64) -> String {
+    format!("{kind}:{id}")
+}
 
 pub fn decode_id(s: &str) -> Option<(String, i64)> {
     let (k, v) = s.split_once(':')?;
-    if k != "show" && k != "season" && k != "episode" && k != "root" && k != "shows" { return None; }
+    if k != "show" && k != "season" && k != "episode" && k != "root" && k != "shows" {
+        return None;
+    }
     let id: i64 = v.parse().ok()?;
-    if v.starts_with('-') || v.starts_with('+') { return None; }
+    if v.starts_with('-') || v.starts_with('+') {
+        return None;
+    }
     Some((k.to_string(), id))
 }
 
@@ -23,16 +29,99 @@ pub fn xml_escape(s: &str) -> String {
     o
 }
 
-pub fn didl_for_episode(show_title: &str, season_no: u32, ep: &crate::models::Episode, urls: &[String]) -> String {
+pub fn didl_for_episode(
+    show_title: &str,
+    season_no: u32,
+    ep: &crate::models::Episode,
+    urls: &[String],
+    art: Option<&str>,
+) -> String {
     let mut s = format!(
         "<item id=\"{}\" parentID=\"season:{}\" restricted=\"1\"><dc:title>S{:02}E{:02} {}</dc:title><upnp:class>object.item.videoItem</upnp:class>",
-        xml_escape(&encode_id("episode", ep.id)), ep.season_id, season_no, ep.number, xml_escape(show_title)
+        xml_escape(&encode_id("episode", ep.id)),
+        ep.season_id,
+        season_no,
+        ep.number,
+        xml_escape(show_title)
     );
+    if let Some(u) = art {
+        s.push_str(&format!(
+            "<upnp:albumArtURI>{}</upnp:albumArtURI>",
+            xml_escape(u)
+        ));
+    }
     for u in urls {
-        s.push_str(&format!("<res protocolInfo=\"{}\">{}</res>", res_protocol_info(u), xml_escape(u)));
+        s.push_str(&format!(
+            "<res protocolInfo=\"{}\">{}</res>",
+            res_protocol_info(u),
+            xml_escape(u)
+        ));
     }
     s.push_str("</item>");
     s
+}
+
+/// Album art for a show container or episode item: the local cover file when it
+/// is on disk inside the covers dir (served read-only from GET /covers/<file>
+/// below), else the remote cover URL so online renderers still get art.
+pub fn cover_art_uri(cover_path: Option<&str>, cover_url: Option<&str>) -> Option<String> {
+    if let Some(name) = cover_file_name(&crate::anilist::covers_dir(), cover_path) {
+        return Some(format!("/covers/{name}"));
+    }
+    cover_url.map(|u| u.to_string())
+}
+
+/// Bare file name of `cover_path` when it names an existing file directly
+/// inside `dir`; `None` otherwise. The /covers/ route can only serve such
+/// files, so advertising anything else would hand renderers a dead link.
+fn cover_file_name(dir: &std::path::Path, cover_path: Option<&str>) -> Option<String> {
+    let p = std::path::Path::new(cover_path?);
+    if p.parent() != Some(dir) {
+        return None;
+    }
+    let name = p.file_name()?.to_str()?;
+    if dir.join(name).is_file() {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+/// Read-only cover art over a caller-supplied dir (production passes the
+/// covers dir next to the database). The name must be a bare file name; path
+/// separators and missing files 404, so nothing outside the dir is reachable.
+fn serve_cover_file(dir: &std::path::Path, name: &str) -> HttpResponse {
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return HttpResponse::error(404, "Not Found", "no such cover");
+    }
+    let path = dir.join(name);
+    if !path.is_file() {
+        return HttpResponse::error(404, "Not Found", "no such cover");
+    }
+    let mime = match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
+    };
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let mut r = HttpResponse::text(200, "OK", mime, bytes);
+            // Caches are keyed on <show id>.<ext> and rewritten on re-match,
+            // so a short cache is safe and keeps TVs from re-fetching art.
+            r.headers
+                .push(("Cache-Control".into(), "max-age=3600".into()));
+            r
+        }
+        Err(_) => HttpResponse::error(404, "Not Found", "no such cover"),
+    }
 }
 
 /// One <res> per advertised URL. Direct-play keeps the MKV protocolInfo; the
@@ -60,7 +149,12 @@ pub const REMUX_CACHE_CAP_BYTES: u64 = 2_147_483_648;
 
 /// Cache key: episode id plus the source's size and mtime, so replacing the
 /// file on disk can never serve a stale transcode of the previous bytes.
-pub fn remux_path(cache: &std::path::Path, episode_id: i64, size: i64, mtime: i64) -> std::path::PathBuf {
+pub fn remux_path(
+    cache: &std::path::Path,
+    episode_id: i64,
+    size: i64,
+    mtime: i64,
+) -> std::path::PathBuf {
     cache.join(format!("{episode_id}-{size}-{mtime}.mp4"))
 }
 
@@ -109,7 +203,11 @@ pub fn evict_remux_cache(cache: &std::path::Path, cap_bytes: u64) {
             continue;
         }
         total = total.saturating_add(m.len());
-        files.push((m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), m.len(), p));
+        files.push((
+            m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            m.len(),
+            p,
+        ));
     }
     if total <= cap_bytes {
         return;
@@ -164,7 +262,10 @@ fn escape_filter_path(p: &std::path::Path) -> String {
 /// sibling, so two writers can never interleave into one file. The final
 /// rename(2) is atomic, hence the cache entry is always a complete transcode.
 /// Blocking: callers use spawn_blocking.
-fn ensure_remux(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+fn ensure_remux(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> std::io::Result<std::path::PathBuf> {
     if std::fs::metadata(dst).is_ok() {
         return Ok(dst.to_path_buf());
     }
@@ -187,7 +288,9 @@ fn ensure_remux(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
     }
     let tmp = remux_tmp_path(dst);
     let mut cmd = std::process::Command::new("ffmpeg");
-    cmd.args(["-y", "-i"]).arg(src).args(["-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac"]);
+    cmd.args(["-y", "-i"])
+        .arg(src)
+        .args(["-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac"]);
     if has_ass_subtitles(src) {
         cmd.args(["-vf", &format!("subtitles='{}'", escape_filter_path(src))]);
     } else {
@@ -197,7 +300,10 @@ fn ensure_remux(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
     let out = cmd.output()?;
     if !out.status.success() {
         let _ = std::fs::remove_file(&tmp);
-        return Err(std::io::Error::other(format!("ffmpeg exited with {}", out.status)));
+        return Err(std::io::Error::other(format!(
+            "ffmpeg exited with {}",
+            out.status
+        )));
     }
     std::fs::rename(&tmp, dst)?;
     if let Some(parent) = dst.parent() {
@@ -268,20 +374,29 @@ pub fn browse(db: &crate::db::Db, object_id: &str) -> crate::error::Result<Strin
 /// Browse with the remux fallback: when `ffmpeg` is true every episode carries
 /// a second <res> pointing at the MP4 transcode. The probe runs once at server
 /// startup; `browse` keeps the single-<res> default for callers without it.
-pub fn browse_with_opts(db: &crate::db::Db, object_id: &str, ffmpeg: bool) -> crate::error::Result<String> {
+pub fn browse_with_opts(
+    db: &crate::db::Db,
+    object_id: &str,
+    ffmpeg: bool,
+) -> crate::error::Result<String> {
     use crate::models::ShowSort;
     let (kind, id) = decode_id(object_id).unwrap_or(("root".into(), 0));
     match kind.as_str() {
         "root" => {
-            let s = String::from("<container id=\"shows:0\" parentID=\"root:0\" restricted=\"1\"><dc:title>Shows</dc:title></container>");
+            let s = String::from(
+                "<container id=\"shows:0\" parentID=\"root:0\" restricted=\"1\"><dc:title>Shows</dc:title></container>",
+            );
             let _ = id;
             Ok(s)
         }
         "shows" => {
             let mut s = String::new();
             for c in db.list_shows("", ShowSort::Title)? {
-                s.push_str(&format!("<container id=\"{}\" parentID=\"shows:0\" restricted=\"1\"><dc:title>{}</dc:title></container>",
-                    xml_escape(&encode_id("show", c.id)), xml_escape(&c.display_title)));
+                s.push_str(&format!("<container id=\"{}\" parentID=\"shows:0\" restricted=\"1\"><dc:title>{}</dc:title>{}</container>",
+                    xml_escape(&encode_id("show", c.id)), xml_escape(&c.display_title),
+                    cover_art_uri(c.cover_path.as_deref(), c.cover_url.as_deref())
+                        .map(|u| format!("<upnp:albumArtURI>{}</upnp:albumArtURI>", xml_escape(&u)))
+                        .unwrap_or_default()));
             }
             Ok(s)
         }
@@ -289,7 +404,10 @@ pub fn browse_with_opts(db: &crate::db::Db, object_id: &str, ffmpeg: bool) -> cr
             let d = db.get_show(id)?;
             let mut s = String::new();
             for se in &d.seasons {
-                let label = se.title.clone().unwrap_or_else(|| format!("Season {}", se.number));
+                let label = se
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| format!("Season {}", se.number));
                 s.push_str(&format!("<container id=\"{}\" parentID=\"{}\" restricted=\"1\"><dc:title>{}</dc:title></container>",
                     xml_escape(&encode_id("season", se.id)), xml_escape(object_id), xml_escape(&label)));
             }
@@ -302,13 +420,25 @@ pub fn browse_with_opts(db: &crate::db::Db, object_id: &str, ffmpeg: bool) -> cr
                 let d = db.get_show(c.id)?;
                 for se in &d.seasons {
                     if se.id == id {
+                        let art = cover_art_uri(d.cover_path.as_deref(), d.cover_url.as_deref());
                         for ep in &se.episodes {
-                            if ep.status == crate::models::EpisodeStatus::Missing { continue; }
+                            if ep.status == crate::models::EpisodeStatus::Missing {
+                                continue;
+                            }
                             let mut urls = vec![format!("/media/{}", encode_id("episode", ep.id))];
                             if ffmpeg {
-                                urls.push(format!("/media/{}?remux=1", encode_id("episode", ep.id)));
+                                urls.push(format!(
+                                    "/media/{}?remux=1",
+                                    encode_id("episode", ep.id)
+                                ));
                             }
-                            s.push_str(&didl_for_episode(&d.display_title, se.number, ep, &urls));
+                            s.push_str(&didl_for_episode(
+                                &d.display_title,
+                                se.number,
+                                ep,
+                                &urls,
+                                art.as_deref(),
+                            ));
                         }
                     }
                 }
@@ -477,7 +607,9 @@ impl DlnaServer {
         db: std::sync::Arc<crate::db::Db>,
         stop: tokio::sync::watch::Receiver<bool>,
     ) -> std::io::Result<()> {
-        let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from(([0, 0, 0, 0], self.port))).await?;
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([0, 0, 0, 0], self.port)))
+                .await?;
         self.run_on(listener, db, stop).await
     }
 
@@ -504,7 +636,15 @@ impl DlnaServer {
         let _ = send_notify(&notify_alive(&ip, port, &uuid)).await;
         if let Ok(sock) = ssdp_socket().await {
             let stop_rx = stop.clone();
-            tokio::spawn(ssdp_responder(sock, ip, port, uuid.clone(), name.clone(), ctx.clients_seen.clone(), stop_rx));
+            tokio::spawn(ssdp_responder(
+                sock,
+                ip,
+                port,
+                uuid.clone(),
+                name.clone(),
+                ctx.clients_seen.clone(),
+                stop_rx,
+            ));
         }
 
         loop {
@@ -535,7 +675,8 @@ impl DlnaServer {
     ) -> std::io::Result<std::net::SocketAddr> {
         let data = std::sync::Arc::new(std::fs::read(path)?);
         let mime = mime_for(path).to_string();
-        let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let addr = listener.local_addr()?;
         let xml = self.device_xml();
         let name = self.name.clone();
@@ -609,7 +750,12 @@ impl HttpResponse {
     }
 
     fn error(status: u16, reason: &'static str, msg: &str) -> Self {
-        Self::text(status, reason, "text/plain; charset=\"utf-8\"", msg.as_bytes().to_vec())
+        Self::text(
+            status,
+            reason,
+            "text/plain; charset=\"utf-8\"",
+            msg.as_bytes().to_vec(),
+        )
     }
 
     async fn write_to(self, stream: &mut tokio::net::TcpStream) -> u64 {
@@ -731,7 +877,12 @@ fn soap_fault(code: u16, description: &str) -> HttpResponse {
          <errorCode>{code}</errorCode><errorDescription>{description}</errorDescription>\
          </UPnPError></detail></s:Fault>"
     ));
-    HttpResponse::text(500, "Internal Server Error", "text/xml; charset=\"utf-8\"", body)
+    HttpResponse::text(
+        500,
+        "Internal Server Error",
+        "text/xml; charset=\"utf-8\"",
+        body,
+    )
 }
 
 /// Scan the library for one episode: its show title, season number and row.
@@ -789,7 +940,10 @@ fn serve_file_response(
     headers.push(("Content-Type".into(), mime.into()));
     headers.push(("Accept-Ranges".into(), "bytes".into()));
     headers.push(("transferMode.dlna.org".into(), "Streaming".into()));
-    headers.push(("contentFeatures.dlna.org".into(), DLNA_CONTENT_FEATURES.into()));
+    headers.push((
+        "contentFeatures.dlna.org".into(),
+        DLNA_CONTENT_FEATURES.into(),
+    ));
     headers.push(("Connection".into(), "close".into()));
 
     let (start, end) = match range {
@@ -797,7 +951,8 @@ fn serve_file_response(
             Ok(None) => (0, total.saturating_sub(1)),
             Ok(Some(se)) => se,
             Err(()) => {
-                let mut r = HttpResponse::error(416, "Range Not Satisfiable", "range unsatisfiable");
+                let mut r =
+                    HttpResponse::error(416, "Range Not Satisfiable", "range unsatisfiable");
                 r.headers
                     .push(("Content-Range".into(), format!("bytes */{total}")));
                 return r;
@@ -927,16 +1082,28 @@ fn serve_media(
     // Unknown ids 404 (resolves the Task 2 deferred minor); Missing
     // rows 404 too and are never touched.
     let Some((kind, id)) = decode_id(object_id) else {
-        return (HttpResponse::error(404, "Not Found", "unknown object id"), None);
+        return (
+            HttpResponse::error(404, "Not Found", "unknown object id"),
+            None,
+        );
     };
     if kind != "episode" {
-        return (HttpResponse::error(404, "Not Found", "not a media object"), None);
+        return (
+            HttpResponse::error(404, "Not Found", "not a media object"),
+            None,
+        );
     }
     let Some((_, _, ep)) = find_episode(db, id) else {
-        return (HttpResponse::error(404, "Not Found", "no such episode"), None);
+        return (
+            HttpResponse::error(404, "Not Found", "no such episode"),
+            None,
+        );
     };
     if ep.status == crate::models::EpisodeStatus::Missing {
-        return (HttpResponse::error(404, "Not Found", "episode missing"), None);
+        return (
+            HttpResponse::error(404, "Not Found", "episode missing"),
+            None,
+        );
     }
     let path = std::path::PathBuf::from(&ep.path);
     let Ok(meta) = std::fs::metadata(&path) else {
@@ -964,22 +1131,40 @@ async fn serve_remux(
 ) -> (HttpResponse, Option<MarkCtx>) {
     const UNAVAILABLE: (u16, &str) = (404, "Not Found");
     let Backend::Db { db } = backend else {
-        return (HttpResponse::error(UNAVAILABLE.0, UNAVAILABLE.1, "remux unavailable"), None);
+        return (
+            HttpResponse::error(UNAVAILABLE.0, UNAVAILABLE.1, "remux unavailable"),
+            None,
+        );
     };
     if !ctx.ffmpeg {
-        return (HttpResponse::error(UNAVAILABLE.0, UNAVAILABLE.1, "remux unavailable"), None);
+        return (
+            HttpResponse::error(UNAVAILABLE.0, UNAVAILABLE.1, "remux unavailable"),
+            None,
+        );
     }
     let Some((kind, id)) = decode_id(object_id) else {
-        return (HttpResponse::error(404, "Not Found", "unknown object id"), None);
+        return (
+            HttpResponse::error(404, "Not Found", "unknown object id"),
+            None,
+        );
     };
     if kind != "episode" {
-        return (HttpResponse::error(404, "Not Found", "not a media object"), None);
+        return (
+            HttpResponse::error(404, "Not Found", "not a media object"),
+            None,
+        );
     }
     let Some((_, _, ep)) = find_episode(db, id) else {
-        return (HttpResponse::error(404, "Not Found", "no such episode"), None);
+        return (
+            HttpResponse::error(404, "Not Found", "no such episode"),
+            None,
+        );
     };
     if ep.status == crate::models::EpisodeStatus::Missing {
-        return (HttpResponse::error(404, "Not Found", "episode missing"), None);
+        return (
+            HttpResponse::error(404, "Not Found", "episode missing"),
+            None,
+        );
     }
     let src = std::path::PathBuf::from(&ep.path);
     let Ok(meta) = std::fs::metadata(&src) else {
@@ -1158,7 +1343,11 @@ async fn serve_conn(
             ),
             None,
         ),
-        ("GET", p) if p.starts_with("/media/") => {
+        ("GET", p) if p.starts_with("/covers/") => (
+            serve_cover_file(&crate::anilist::covers_dir(), &p["/covers/".len()..]),
+            None,
+        ),
+        ("GET" | "HEAD", p) if p.starts_with("/media/") => {
             ctx.clients_seen
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let id = &p["/media/".len()..];
@@ -1211,16 +1400,23 @@ async fn serve_conn(
             None,
         ),
     };
-    let (response, mark) = response;
+    let (mut response, mark) = response;
+    // HEAD answers with GET's headers (Content-Length, ranges, DLNA extras)
+    // and an empty body; it never marks played, since nothing was watched.
+    let mark = if method == "HEAD" && path.starts_with("/media/") {
+        response.body = Body::Bytes(Vec::new());
+        None
+    } else {
+        mark
+    };
     let sent = response.write_to(&mut stream).await;
     // Best-effort played marking: a completed transfer (>=85% of bytes out)
     // goes through the existing set_status path, which preserves prev_status.
     // Only Played is ever written here, never Missing, and failures just log.
     if let Some(m) = mark
         && should_mark_played(sent, m.total)
-        && let Err(e) = m
-            .db
-            .set_status(m.episode_id, crate::models::EpisodeStatus::Played)
+        && let Err(e) =
+            m.db.set_status(m.episode_id, crate::models::EpisodeStatus::Played)
     {
         eprintln!("dlna: failed to mark episode {} played: {e}", m.episode_id);
     }
@@ -1358,15 +1554,31 @@ mod tests {
         assert_eq!(s, "episode:42");
         assert_eq!(crate::dlna::decode_id(&s), Some(("episode".into(), 42)));
         assert_eq!(crate::dlna::decode_id("../etc"), None);
-        assert_eq!(crate::dlna::xml_escape("<a>&\"'"), "&lt;a&gt;&amp;&quot;&apos;");
+        assert_eq!(
+            crate::dlna::xml_escape("<a>&\"'"),
+            "&lt;a&gt;&amp;&quot;&apos;"
+        );
     }
 
     #[test]
     fn browse_root_lists_shows_and_hides_missing() {
         use std::path::PathBuf;
         let db = crate::db::Db::open_memory().unwrap();
-        let p = crate::parser::ParsedName { title: "Browse Tree".into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
-        let f = crate::scanner::RawFile { path: PathBuf::from("/lib/Browse Tree/01.mkv"), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
+        let p = crate::parser::ParsedName {
+            title: "Browse Tree".into(),
+            season: 1,
+            episode: 1,
+            release_group: None,
+            resolution: None,
+            crc: None,
+        };
+        let f = crate::scanner::RawFile {
+            path: PathBuf::from("/lib/Browse Tree/01.mkv"),
+            size: 1,
+            mtime: 1,
+            stem: "".into(),
+            dirs: vec![],
+        };
         db.upsert_episode(&p, &f).unwrap();
         let root = crate::dlna::browse(&db, "root:0").unwrap();
         assert!(root.contains("shows:0"));
@@ -1376,11 +1588,14 @@ mod tests {
         let show_out = crate::dlna::browse(&db, &crate::dlna::encode_id("show", show_id)).unwrap();
         assert!(show_out.contains("Season 1"));
         let season_id = db.get_show(show_id).unwrap().seasons[0].id;
-        let season_out = crate::dlna::browse(&db, &crate::dlna::encode_id("season", season_id)).unwrap();
+        let season_out =
+            crate::dlna::browse(&db, &crate::dlna::encode_id("season", season_id)).unwrap();
         assert!(season_out.contains("S01E01"));
         let ep_id = db.get_show(show_id).unwrap().seasons[0].episodes[0].id;
-        db.set_status(ep_id, crate::models::EpisodeStatus::Missing).unwrap();
-        let hidden = crate::dlna::browse(&db, &crate::dlna::encode_id("season", season_id)).unwrap();
+        db.set_status(ep_id, crate::models::EpisodeStatus::Missing)
+            .unwrap();
+        let hidden =
+            crate::dlna::browse(&db, &crate::dlna::encode_id("season", season_id)).unwrap();
         assert!(!hidden.contains("S01E01"));
     }
 
@@ -1389,11 +1604,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("ep.mkv");
         std::fs::write(&f, vec![0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap();
-        let srv = crate::dlna::DlnaServer { port: 0, name: "T".into(), uuid: "uuid:test".into(), clients_seen: Default::default() };
+        let srv = crate::dlna::DlnaServer {
+            port: 0,
+            name: "T".into(),
+            uuid: "uuid:test".into(),
+            clients_seen: Default::default(),
+        };
         let addr = srv.bind_ephemeral_for_test(&f).await.unwrap();
-        let body = reqwest::get(format!("http://{addr}/media/episode:1")).await.unwrap().bytes().await.unwrap();
+        let body = reqwest::get(format!("http://{addr}/media/episode:1"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
         assert!(!body.is_empty());
-        let desc = reqwest::get(format!("http://{addr}/desc.xml")).await.unwrap().text().await.unwrap();
+        let desc = reqwest::get(format!("http://{addr}/desc.xml"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
         assert!(desc.contains("MediaServer"));
     }
 
@@ -1402,7 +1632,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("ep.mkv");
         std::fs::write(&f, vec![0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap();
-        let srv = crate::dlna::DlnaServer { port: 0, name: "T".into(), uuid: "uuid:test".into(), clients_seen: Default::default() };
+        let srv = crate::dlna::DlnaServer {
+            port: 0,
+            name: "T".into(),
+            uuid: "uuid:test".into(),
+            clients_seen: Default::default(),
+        };
         let addr = srv.bind_ephemeral_for_test(&f).await.unwrap();
         let client = reqwest::Client::new();
         let res = client
@@ -1443,18 +1678,19 @@ mod tests {
             )
         );
         // ssdp:all is answered, other device types and NOTIFY packets are not.
-        let all = req.replace(
-            "urn:schemas-upnp-org:device:MediaServer:1",
-            "ssdp:all",
-        );
+        let all = req.replace("urn:schemas-upnp-org:device:MediaServer:1", "ssdp:all");
         assert!(crate::dlna::ssdp_msearch_reply(&all, &ip, 8200, "uuid:test").is_some());
         let other = req.replace("MediaServer:1", "Printer:1");
         assert!(crate::dlna::ssdp_msearch_reply(&other, &ip, 8200, "uuid:test").is_none());
-        assert!(crate::dlna::ssdp_msearch_reply(
-            "NOTIFY * HTTP/1.1\r\nNTS: ssdp:alive\r\n\r\n",
-            &ip, 8200, "uuid:test"
-        )
-        .is_none());
+        assert!(
+            crate::dlna::ssdp_msearch_reply(
+                "NOTIFY * HTTP/1.1\r\nNTS: ssdp:alive\r\n\r\n",
+                &ip,
+                8200,
+                "uuid:test"
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1500,16 +1736,27 @@ mod tests {
         let ep_id = db.get_show(show_id).unwrap().seasons[0].episodes[0].id;
 
         let db = Arc::new(db);
-        let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
+        let listener =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .unwrap();
         let addr = listener.local_addr().unwrap();
-        let srv = crate::dlna::DlnaServer { port: 0, name: "T".into(), uuid: "uuid:test".into(), clients_seen: Default::default() };
+        let srv = crate::dlna::DlnaServer {
+            port: 0,
+            name: "T".into(),
+            uuid: "uuid:test".into(),
+            clients_seen: Default::default(),
+        };
         let (tx, rx) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(async move { srv.run_on(listener, db, rx).await });
         let client = reqwest::Client::new();
 
         // Live episode serves.
         let ok = client
-            .get(format!("http://{addr}/media/{}", crate::dlna::encode_id("episode", ep_id)))
+            .get(format!(
+                "http://{addr}/media/{}",
+                crate::dlna::encode_id("episode", ep_id)
+            ))
             .send()
             .await
             .unwrap();
@@ -1532,15 +1779,27 @@ mod tests {
         let db2 = crate::db::Db::open_memory().unwrap();
         db2.upsert_episode(&p, &raw).unwrap();
         let ep2 = db2.get_show(show_id).unwrap().seasons[0].episodes[0].id;
-        db2.set_status(ep2, crate::models::EpisodeStatus::Missing).unwrap();
+        db2.set_status(ep2, crate::models::EpisodeStatus::Missing)
+            .unwrap();
         let db2 = Arc::new(db2);
-        let listener2 = tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
+        let listener2 =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+                .await
+                .unwrap();
         let addr2 = listener2.local_addr().unwrap();
-        let srv2 = crate::dlna::DlnaServer { port: 0, name: "T".into(), uuid: "uuid:test".into(), clients_seen: Default::default() };
+        let srv2 = crate::dlna::DlnaServer {
+            port: 0,
+            name: "T".into(),
+            uuid: "uuid:test".into(),
+            clients_seen: Default::default(),
+        };
         let (tx2, rx2) = tokio::sync::watch::channel(false);
         let handle2 = tokio::spawn(async move { srv2.run_on(listener2, db2, rx2).await });
         let gone = client
-            .get(format!("http://{addr2}/media/{}", crate::dlna::encode_id("episode", ep2)))
+            .get(format!(
+                "http://{addr2}/media/{}",
+                crate::dlna::encode_id("episode", ep2)
+            ))
             .send()
             .await
             .unwrap();
@@ -1551,7 +1810,10 @@ mod tests {
                     <ObjectID>show:99999</ObjectID></u:Browse></s:Body></s:Envelope>";
         let fault = client
             .post(format!("http://{addr2}/ctl/ContentDirectory"))
-            .header("SOAPAction", "\"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"")
+            .header(
+                "SOAPAction",
+                "\"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"",
+            )
             .header("Content-Type", "text/xml; charset=\"utf-8\"")
             .body(soap)
             .send()
@@ -1568,7 +1830,10 @@ mod tests {
         );
         let res_ok = client
             .post(format!("http://{addr2}/ctl/ContentDirectory"))
-            .header("SOAPAction", "\"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"")
+            .header(
+                "SOAPAction",
+                "\"urn:schemas-upnp-org:service:ContentDirectory:1#Browse\"",
+            )
             .header("Content-Type", "text/xml; charset=\"utf-8\"")
             .body(soap_ok)
             .send()
@@ -1698,8 +1963,11 @@ mod tests {
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir.path().join("ffmpeg"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(
+            dir.path().join("ffmpeg"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         dir
     }
 
@@ -1750,12 +2018,16 @@ mod tests {
         for t in [&a, &b] {
             assert_eq!(t.parent(), dst.parent());
             let name = t.file_name().unwrap().to_string_lossy();
-            assert!(name.starts_with("7-100-5.") && name.ends_with(".tmp"), "{name}");
+            assert!(
+                name.starts_with("7-100-5.") && name.ends_with(".tmp"),
+                "{name}"
+            );
         }
     }
 
     #[test]
-    fn concurrent_remux_same_dst_yields_one_valid_file() {        let fake = fake_ffmpeg_dir_with_sleep(1);
+    fn concurrent_remux_same_dst_yields_one_valid_file() {
+        let fake = fake_ffmpeg_dir_with_sleep(1);
         let _guard = ScopedPath::prepend(fake.path());
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("ep.mkv");
@@ -1812,7 +2084,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("ep.mkv");
         std::fs::write(&f, b"01234567").unwrap();
-        let srv = crate::dlna::DlnaServer { port: 0, name: "T".into(), uuid: "uuid:test".into(), clients_seen: Default::default() };
+        let srv = crate::dlna::DlnaServer {
+            port: 0,
+            name: "T".into(),
+            uuid: "uuid:test".into(),
+            clients_seen: Default::default(),
+        };
         let addr = srv.bind_ephemeral_for_test(&f).await.unwrap();
         let client = reqwest::Client::new();
         let cd = client
@@ -1870,11 +2147,19 @@ mod tests {
                 .await
                 .unwrap();
         let addr = listener.local_addr().unwrap();
-        let srv = crate::dlna::DlnaServer { port: 0, name: "T".into(), uuid: "uuid:test".into(), clients_seen: Default::default() };
+        let srv = crate::dlna::DlnaServer {
+            port: 0,
+            name: "T".into(),
+            uuid: "uuid:test".into(),
+            clients_seen: Default::default(),
+        };
         let (tx, rx) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn(async move { srv.run_on(listener, db, rx).await });
         let client = reqwest::Client::new();
-        let url = format!("http://{addr}/media/{}", crate::dlna::encode_id("episode", ep_id));
+        let url = format!(
+            "http://{addr}/media/{}",
+            crate::dlna::encode_id("episode", ep_id)
+        );
 
         // 1 of 100 bytes: the transfer completes but stays well under the 85%
         // threshold, so the episode must not flip to Played.
@@ -1945,10 +2230,162 @@ mod tests {
             crate::models::EpisodeStatus::Unplayed
         );
         assert!(crate::dlna::should_mark_played(100, 100));
-        db.set_status(ep_id, crate::models::EpisodeStatus::Played).unwrap();
+        db.set_status(ep_id, crate::models::EpisodeStatus::Played)
+            .unwrap();
         assert_eq!(
             db.get_episode(ep_id).unwrap().status,
             crate::models::EpisodeStatus::Played
         );
+    }
+
+    #[test]
+    fn covers_route_serves_images_and_404s_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("5.jpg"), b"fake-jpeg").unwrap();
+        let ok = crate::dlna::serve_cover_file(dir.path(), "5.jpg");
+        assert_eq!(ok.status, 200);
+        assert!(
+            ok.headers
+                .iter()
+                .any(|(k, v)| k == "Content-Type" && v == "image/jpeg")
+        );
+        match ok.body {
+            crate::dlna::Body::Bytes(b) => assert_eq!(b, b"fake-jpeg"),
+            _ => panic!("covers serve reads the file into memory"),
+        }
+        // Missing files, bare parent refs and anything with a separator 404:
+        // nothing outside the covers dir is reachable.
+        assert_eq!(
+            crate::dlna::serve_cover_file(dir.path(), "missing.jpg").status,
+            404
+        );
+        assert_eq!(crate::dlna::serve_cover_file(dir.path(), "..").status, 404);
+        assert_eq!(
+            crate::dlna::serve_cover_file(dir.path(), "../dlna.rs").status,
+            404
+        );
+        assert_eq!(
+            crate::dlna::serve_cover_file(dir.path(), "sub/x.jpg").status,
+            404
+        );
+        std::fs::write(dir.path().join("5.png"), b"fake-png").unwrap();
+        let png = crate::dlna::serve_cover_file(dir.path(), "5.png");
+        assert!(
+            png.headers
+                .iter()
+                .any(|(k, v)| k == "Content-Type" && v == "image/png")
+        );
+    }
+
+    #[test]
+    fn cover_art_uri_prefers_local_file_then_remote() {
+        // No local file anywhere: the remote URL is advertised as-is.
+        assert_eq!(
+            crate::dlna::cover_art_uri(None, Some("https://img/x.jpg")),
+            Some("https://img/x.jpg".to_string())
+        );
+        assert_eq!(crate::dlna::cover_art_uri(None, None), None);
+        // A cover_path outside the covers dir can never be served, so the
+        // remote URL wins even when the file exists.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("x.jpg");
+        std::fs::write(&outside, b"fake").unwrap();
+        assert_eq!(
+            crate::dlna::cover_art_uri(Some(outside.to_str().unwrap()), Some("https://img/x.jpg")),
+            Some("https://img/x.jpg".to_string())
+        );
+        // cover_file_name only accepts an existing file directly inside the dir.
+        assert_eq!(
+            crate::dlna::cover_file_name(dir.path(), Some(outside.to_str().unwrap())),
+            Some("x.jpg".to_string())
+        );
+        assert_eq!(crate::dlna::cover_file_name(dir.path(), None), None);
+        assert_eq!(
+            crate::dlna::cover_file_name(dir.path(), Some("/elsewhere/x.jpg")),
+            None
+        );
+    }
+
+    #[test]
+    fn browse_advertises_cover_art_with_remote_fallback() {
+        use std::path::PathBuf;
+        let db = crate::db::Db::open_memory().unwrap();
+        let p = crate::parser::ParsedName {
+            title: "Cover Art".into(),
+            season: 1,
+            episode: 1,
+            release_group: None,
+            resolution: None,
+            crc: None,
+        };
+        let f = crate::scanner::RawFile {
+            path: PathBuf::from("/lib/Cover Art/01.mkv"),
+            size: 1,
+            mtime: 1,
+            stem: "".into(),
+            dirs: vec![],
+        };
+        db.upsert_episode(&p, &f).unwrap();
+        let show_id = db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].id;
+        // Unmatched: no art element.
+        let plain = crate::dlna::browse(&db, "shows:0").unwrap();
+        assert!(!plain.contains("albumArtURI"));
+        // Matched with only a remote URL: the URL is advertised as-is.
+        db.set_anilist(
+            show_id,
+            &crate::models::MetadataHit {
+                id: 1,
+                source: "anilist".into(),
+                title_romaji: "Cover Art".into(),
+                title_english: None,
+                cover_url: Some("https://img/x.jpg".into()),
+                episodes: None,
+            },
+        )
+        .unwrap();
+        let art = crate::dlna::browse(&db, "shows:0").unwrap();
+        assert!(art.contains("<upnp:albumArtURI>https://img/x.jpg</upnp:albumArtURI>"));
+        // Episode items carry the same art.
+        let season_id = db.get_show(show_id).unwrap().seasons[0].id;
+        let season_out =
+            crate::dlna::browse(&db, &crate::dlna::encode_id("season", season_id)).unwrap();
+        assert!(season_out.contains("<upnp:albumArtURI>https://img/x.jpg</upnp:albumArtURI>"));
+    }
+
+    #[tokio::test]
+    async fn head_media_returns_get_headers_with_empty_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("ep.mkv");
+        std::fs::write(&f, vec![0u8, 1, 2, 3, 4, 5, 6, 7]).unwrap();
+        let srv = crate::dlna::DlnaServer {
+            port: 0,
+            name: "T".into(),
+            uuid: "uuid:test".into(),
+            clients_seen: Default::default(),
+        };
+        let addr = srv.bind_ephemeral_for_test(&f).await.unwrap();
+        let client = reqwest::Client::new();
+        let head = client
+            .head(format!("http://{addr}/media/episode:1"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.status(), reqwest::StatusCode::OK);
+        assert_eq!(head.headers()["Content-Length"], "8");
+        assert_eq!(head.headers()["Content-Type"], "video/x-matroska");
+        assert_eq!(head.headers()["Accept-Ranges"], "bytes");
+        assert!(head.headers().contains_key("contentFeatures.dlna.org"));
+        assert_eq!(head.bytes().await.unwrap().len(), 0);
+        // A ranged HEAD mirrors the GET status and range headers, still bodiless.
+        let ranged = client
+            .head(format!("http://{addr}/media/episode:1"))
+            .header("Range", "bytes=2-5")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ranged.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(ranged.headers()["Content-Range"], "bytes 2-5/8");
+        assert_eq!(ranged.headers()["Content-Length"], "4");
+        assert_eq!(ranged.bytes().await.unwrap().len(), 0);
     }
 }

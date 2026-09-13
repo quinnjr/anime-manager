@@ -206,6 +206,14 @@
     dlnaSaving = true;
     try {
       await api.dlnaSetOptions(dlnaName.trim(), port);
+      if (dlnaRunning) {
+        // The server bumps upward through port..=port+20 when taken; show the
+        // bound port rather than the requested one.
+        const d = await api.dlnaStatus();
+        dlnaRunning = d.running;
+        dlnaPort = d.port;
+        dlnaPortField = String(d.port);
+      }
       toasts.push('success', dlnaRunning ? 'DLNA options saved — server restarted' : 'DLNA options saved');
     } catch (e) { toasts.error(e); }
     finally { dlnaSaving = false; }

@@ -42,26 +42,35 @@ impl Kitsu {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            return Err(AppError::Network(format!("kitsu returned {}", resp.status())));
+            return Err(AppError::Network(format!(
+                "kitsu returned {}",
+                resp.status()
+            )));
         }
         Ok(Some(resp.json().await?))
     }
 
     pub async fn search(&self, q: &str) -> Result<Vec<MetadataHit>> {
         let url = format!("{}/anime", self.endpoint);
-        let v = self.get(&url, &[("filter[text]", q), ("page[limit]", "5")]).await?;
+        let v = self
+            .get(&url, &[("filter[text]", q), ("page[limit]", "5")])
+            .await?;
         Ok(v.as_ref().map(parse_hits).unwrap_or_default())
     }
 
     pub async fn by_id(&self, id: i64) -> Result<Option<MetadataHit>> {
-        let v = self.get(&format!("{}/anime/{id}", self.endpoint), &[]).await?;
+        let v = self
+            .get(&format!("{}/anime/{id}", self.endpoint), &[])
+            .await?;
         // A single fetch returns one object rather than a list.
         Ok(v.as_ref().and_then(|v| v.get("data")).and_then(parse_hit))
     }
 }
 
 impl Default for Kitsu {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn parse_hit(a: &Value) -> Option<MetadataHit> {
@@ -80,8 +89,14 @@ fn parse_hit(a: &Value) -> Option<MetadataHit> {
         id,
         source: SOURCE.to_string(),
         title_romaji: romaji,
-        title_english: at.pointer("/titles/en").and_then(|t| t.as_str()).map(String::from),
-        cover_url: at.pointer("/posterImage/large").and_then(|t| t.as_str()).map(String::from),
+        title_english: at
+            .pointer("/titles/en")
+            .and_then(|t| t.as_str())
+            .map(String::from),
+        cover_url: at
+            .pointer("/posterImage/large")
+            .and_then(|t| t.as_str())
+            .map(String::from),
         episodes: at.get("episodeCount").and_then(|e| e.as_i64()),
     })
 }
@@ -118,17 +133,31 @@ mod tests {
     #[tokio::test]
     async fn search_parses_hits_and_skips_unusable_rows() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/anime"))
+        Mock::given(method("GET"))
+            .and(path("/anime"))
             .respond_with(ResponseTemplate::new(200).set_body_json(body()))
-            .mount(&server).await;
-        let hits = Kitsu::with_endpoint(server.uri()).search("frieren").await.unwrap();
+            .mount(&server)
+            .await;
+        let hits = Kitsu::with_endpoint(server.uri())
+            .search("frieren")
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 2, "the non-numeric id is skipped, not fatal");
         assert_eq!(hits[0].id, 46474);
         assert_eq!(hits[0].source, "kitsu");
-        assert_eq!(hits[0].title_romaji, "Sousou no Frieren", "romaji wins over an English canonicalTitle");
-        assert_eq!(hits[0].title_english.as_deref(), Some("Frieren: Beyond Journey's End"));
+        assert_eq!(
+            hits[0].title_romaji, "Sousou no Frieren",
+            "romaji wins over an English canonicalTitle"
+        );
+        assert_eq!(
+            hits[0].title_english.as_deref(),
+            Some("Frieren: Beyond Journey's End")
+        );
         assert_eq!(hits[0].episodes, Some(28));
-        assert_eq!(hits[0].cover_url.as_deref(), Some("https://media.kitsu.app/x/large.jpeg"));
+        assert_eq!(
+            hits[0].cover_url.as_deref(),
+            Some("https://media.kitsu.app/x/large.jpeg")
+        );
         assert_eq!(hits[1].title_english, None);
         assert_eq!(hits[1].cover_url, None);
     }
@@ -136,14 +165,26 @@ mod tests {
     #[tokio::test]
     async fn a_missing_entry_is_none_not_an_error() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).respond_with(ResponseTemplate::new(404)).mount(&server).await;
-        assert!(Kitsu::with_endpoint(server.uri()).by_id(1).await.unwrap().is_none());
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        assert!(
+            Kitsu::with_endpoint(server.uri())
+                .by_id(1)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn http_error_is_a_network_error() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).respond_with(ResponseTemplate::new(503)).mount(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
         let r = Kitsu::with_endpoint(server.uri()).search("x").await;
         assert!(matches!(r, Err(AppError::Network(_))), "{r:?}");
     }

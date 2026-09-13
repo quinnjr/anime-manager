@@ -4,8 +4,8 @@ pub mod db;
 pub mod dlna;
 pub mod error;
 pub mod kitsu;
-pub mod metadata;
 pub mod llm;
+pub mod metadata;
 pub mod models;
 pub mod parser;
 pub mod player;
@@ -38,7 +38,9 @@ fn apply_dmabuf_workaround() {
 /// Everything this app stores lives under one directory, so the database and the cover cache
 /// cannot drift apart (the Tauri asset-protocol scope is written against this base).
 pub fn data_dir() -> std::path::PathBuf {
-    dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from(".")).join("anime-manager")
+    dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("anime-manager")
 }
 
 fn db_path() -> std::path::PathBuf {
@@ -64,16 +66,43 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .manage(commands::AppState { db, player: Arc::new(player::Player::new()), providers: Arc::new(metadata::Providers::new()), matching: Arc::new(llm::AssistQueue::default()), assist: Arc::new(llm::AssistQueue::default()), dlna: commands::DlnaState::default() })
+        .manage(commands::AppState {
+            db,
+            player: Arc::new(player::Player::new()),
+            providers: Arc::new(metadata::Providers::new()),
+            matching: Arc::new(llm::AssistQueue::default()),
+            assist: Arc::new(llm::AssistQueue::default()),
+            dlna: commands::DlnaState::default(),
+        })
         .invoke_handler(tauri::generate_handler![
-            commands::add_root, commands::remove_root, commands::list_roots, commands::scan,
-            commands::list_shows, commands::get_show, commands::set_status,
-            commands::get_settings, commands::set_setting, commands::purge_missing,
-            commands::play, commands::search_metadata, commands::rematch,
-            commands::preview_rename, commands::apply_rename, commands::undo_rename,
-            commands::inspect_show, commands::llm_test, commands::llm_models, commands::assist_progress, commands::clear_ai_decisions, commands::set_show_title,
-            commands::match_library, commands::library_status, commands::merge_duplicates,
-            commands::dlna_status, commands::dlna_set_enabled, commands::dlna_set_options,
+            commands::add_root,
+            commands::remove_root,
+            commands::list_roots,
+            commands::scan,
+            commands::list_shows,
+            commands::get_show,
+            commands::set_status,
+            commands::get_settings,
+            commands::set_setting,
+            commands::purge_missing,
+            commands::play,
+            commands::search_metadata,
+            commands::rematch,
+            commands::preview_rename,
+            commands::apply_rename,
+            commands::undo_rename,
+            commands::inspect_show,
+            commands::llm_test,
+            commands::llm_models,
+            commands::assist_progress,
+            commands::clear_ai_decisions,
+            commands::set_show_title,
+            commands::match_library,
+            commands::library_status,
+            commands::merge_duplicates,
+            commands::dlna_status,
+            commands::dlna_set_enabled,
+            commands::dlna_set_options,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
