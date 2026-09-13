@@ -93,7 +93,8 @@ commands.
 - Prefilter rule: a torrent whose translated save_path sits under none
   of the library roots skips its detail fetch entirely — pure prefix
   check before any HTTP, so a large server (live-verified 2234
-  torrents) lists fast.
+  torrents) lists fast. An empty roots list matches nothing (fail-closed);
+  only a roots-read error proceeds without prefilter (fail-open).
 
 ## Data model (schema v6 → v7)
 

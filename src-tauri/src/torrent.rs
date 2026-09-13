@@ -435,10 +435,12 @@ impl TorrentClient {
             .flatten()
             .and_then(|raw| parse_path_map(&raw).ok())
             .unwrap_or_default();
-        let roots: Vec<String> = db
-            .list_roots()
-            .map(|rs| rs.into_iter().map(|r| r.path).collect())
-            .unwrap_or_default();
+        let roots: Option<Vec<String>> = db.list_roots().ok().map(|rs| {
+            rs.into_iter().map(|r| r.path).collect()
+        });
+        // Fail-open on read ERROR (None): proceed without prefilter, the old
+        // behavior. Only Ok(empty) (Some([])) fails closed — with no roots
+        // nothing can match, so every unpinned torrent skips its detail fetch.
         let mut out = Vec::with_capacity(torrents.len());
         for info in torrents {
             let linked = match db.torrent_link(&info.info_hash) {
@@ -447,7 +449,7 @@ impl TorrentClient {
                     season: link.season,
                     number: link.number,
                 }),
-                _ => self.backfill(db, &info, &mut index, &map, &roots).await,
+                _ => self.backfill(db, &info, &mut index, &map, roots.as_deref()).await,
             };
             out.push(LinkedTorrent { info, linked });
         }
@@ -466,12 +468,17 @@ impl TorrentClient {
         info: &TorrentInfo,
         index: &mut Option<Vec<(i64, String)>>,
         map: &[(String, String)],
-        roots: &[String],
+        roots: Option<&[String]>,
     ) -> Option<LinkedTo> {
-        // Detail-fetch prefilter (perf: live-verified 2234-torrent server):
-        // a torrent whose translated save_path sits under none of the
-        // library roots can match nothing, so skip the HTTP entirely.
-        if !path_under_roots(&map_to_local(&info.save_path, map), roots) {
+        // Detail-fetch prefilter (perf: live-verified 2234-torrent server),
+        // two-stage because the list-time and detail-time save_paths can
+        // disagree: (i) a non-empty list save_path under no root skips the
+        // HTTP entirely; (ii) an empty list path still fetches detail, and a
+        // non-empty detail save_path under no root skips the join. Empty
+        // means unknown, never evidence of outside — otherwise ghosts and
+        // detail errors could never backfill. roots=None (roots unreadable)
+        // disables both stages: fail-open, the pre-prefilter behavior.
+        if save_path_excluded(&map_to_local(&info.save_path, map), roots) {
             return None;
         }
         if index.is_none() {
@@ -493,6 +500,11 @@ impl TorrentClient {
         // Server truth translated to local form before the join: without
         // this a NAS-backed server never backfills.
         let local_save = map_to_local(&detail.info.save_path, map);
+        // Stage (ii): the detail-time save_path wins over the list-time one
+        // for the join, so re-check it here — without joining — when non-empty.
+        if save_path_excluded(&local_save, roots) {
+            return None;
+        }
         let hit = candidates
             .iter()
             .find(|(_, path)| episode_in_torrent(&local_save, &detail.files, path))?;
@@ -686,8 +698,27 @@ pub fn map_to_local(server: &str, map: &[(String, String)]) -> String {
 /// True when `path` sits under one of `roots` (exact match or `root/`
 /// prefix after trimming trailing slashes). Pure so the detail-fetch
 /// prefilter and the subscribe placement check share it unit-testably.
+/// Edge semantics: `/` is the filesystem root and matches every absolute
+/// path; a blank (`""`/whitespace-only) root matches nothing — without the
+/// filter it would normalize to `/` and match everything. An empty `roots`
+/// slice therefore matches nothing (fail-closed).
 pub fn path_under_roots(path: &str, roots: &[String]) -> bool {
-    roots.iter().any(|r| boundary_match(path, normalize_prefix(r)))
+    roots
+        .iter()
+        .filter(|r| !r.trim().is_empty())
+        .any(|r| boundary_match(path, normalize_prefix(r.trim())))
+}
+
+/// True when a translated `save_path` is evidence the torrent sits outside
+/// the library: non-empty AND under no root. Empty means unknown (a ghost
+/// entry, an older server omitting the field), never evidence — so it never
+/// excludes. `None` roots (roots unreadable) never excludes either:
+/// fail-open, the pre-prefilter behavior.
+fn save_path_excluded(local_save: &str, roots: Option<&[String]>) -> bool {
+    match roots {
+        None => false,
+        Some(roots) => !local_save.trim().is_empty() && !path_under_roots(local_save, roots),
+    }
 }
 
 /// Backoff before retry `attempt` (1-based): 200ms, then 800ms, plus
@@ -1285,13 +1316,21 @@ mod tests {
     async fn attribute_prefers_links_then_backfills() {
         let s = MockServer::start().await;
         login_mock("jwt123").mount(&s).await;
-        // Only the unpinned torrent's detail is ever fetched.
+        // The unpinned torrent backfills; the ghost's empty list save_path
+        // must still attempt detail (empty is unknown, not outside), and the
+        // detail failure resolves to None without failing the list.
         Mock::given(method("GET"))
             .and(path("/api/torrents/unpinned"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "info_hash": "unpinned", "name": "Owned", "save_path": "/r1",
                 "files": [{"index": 0, "path": "Owned/01.mkv", "size": 11}],
             })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/torrents/ghost"))
+            .respond_with(ResponseTemplate::new(404))
             .expect(1)
             .mount(&s)
             .await;
@@ -1484,6 +1523,93 @@ mod tests {
         let map = parse_path_map("/downloads=/mnt/nas/Downloads").unwrap();
         let translated = map_to_local("/downloads/Anime/Frieren/01.mkv", &map);
         assert!(path_under_roots(&translated, &roots));
+    }
+
+    #[test]
+    fn root_slash_matches_every_absolute_path() {
+        let roots = vec!["/".to_string()];
+        assert!(path_under_roots("/anything/at/all.mkv", &roots));
+        assert!(path_under_roots("/", &roots));
+        assert!(!path_under_roots("", &roots), "empty path is not absolute");
+        assert!(!path_under_roots("relative/path", &roots));
+    }
+
+    #[test]
+    fn blank_roots_match_nothing() {
+        let roots = vec!["".to_string(), "   ".to_string()];
+        assert!(!path_under_roots("/r1/x.mkv", &roots));
+        assert!(!path_under_roots("/", &roots));
+        // A blank entry never rescues a real one into matching, nor breaks it.
+        let mixed = vec!["".to_string(), "/r1".to_string()];
+        assert!(path_under_roots("/r1/x.mkv", &mixed));
+        assert!(!path_under_roots("/other/x.mkv", &mixed));
+        // No roots at all matches nothing: fail-closed.
+        let empty: Vec<String> = vec![];
+        assert!(!path_under_roots("/r1/x.mkv", &empty));
+    }
+
+    #[test]
+    fn save_path_excluded_treats_empty_as_unknown() {
+        let roots = vec!["/r1".to_string()];
+        let some = Some(roots.as_slice());
+        assert!(!save_path_excluded("", some), "empty is unknown, not outside");
+        assert!(!save_path_excluded("   ", some));
+        assert!(!save_path_excluded("/r1/x", some));
+        assert!(save_path_excluded("/elsewhere/x", some));
+        assert!(!save_path_excluded("/elsewhere/x", None), "roots error fails open");
+        assert!(!save_path_excluded("", None));
+    }
+
+    #[tokio::test]
+    async fn attribute_with_empty_roots_fails_closed() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        // No detail fetch may happen: empty roots match nothing, so the
+        // non-empty list save_path excludes before any HTTP.
+        Mock::given(method("GET"))
+            .and(path("/api/torrents/stray"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "info_hash": "stray", "name": "Stray", "save_path": "/r1",
+                "files": [{"index": 0, "path": "Stray/01.mkv", "size": 11}],
+            })))
+            .expect(0)
+            .mount(&s)
+            .await;
+        // A Db with no roots: Ok(empty) fails closed, unlike a roots-read
+        // error which fails open.
+        let db = Db::open_memory().unwrap();
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        let mut stray = torrent_info("stray");
+        stray.save_path = "/r1".into();
+        let out = c.attribute(&db, vec![stray]).await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].linked, None);
+    }
+
+    #[tokio::test]
+    async fn attribute_detail_save_path_outside_roots_skips_join() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        // List-time path is under a root (passes stage i) but detail-time
+        // truth moved outside: stage ii skips the join without failing.
+        Mock::given(method("GET"))
+            .and(path("/api/torrents/moved"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "info_hash": "moved", "name": "Moved", "save_path": "/elsewhere",
+                "files": [{"index": 0, "path": "Owned/01.mkv", "size": 11}],
+            })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let db = Db::open_memory().unwrap();
+        db.add_root("/r1").unwrap();
+        db.upsert_episode(&pn("Owned", 1), &rf("/r1/Owned/01.mkv", 11)).unwrap();
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        let mut moved = torrent_info("moved");
+        moved.save_path = "/r1".into();
+        let out = c.attribute(&db, vec![moved]).await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].linked, None);
     }
 
     #[tokio::test]
