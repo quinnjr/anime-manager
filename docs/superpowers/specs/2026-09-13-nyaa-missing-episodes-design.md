@@ -25,7 +25,7 @@ null hunt gaps only — never guess unaired numbers.
 
 ## Owned-release preferences
 
-Derived per show from episodes on disk (missing-status rows excluded):
+Derived per show from episodes on disk (season-0 specials and missing-status rows excluded — they neither vote nor baseline):
 
 - **Subgroup**: the modal `release_group` across owned episodes. Episodes with no
   group do not vote. Ties break toward the earliest owned episode.
@@ -40,11 +40,14 @@ No preference UI: strict means derived. A future "loosen" toggle is parked.
 
 ## Nyaa search (`nyaa.rs`)
 
-- `search(query) -> Vec<NyaaHit { title, page_url, torrent_url, size_bytes, seeders }>`
+- `search(query) -> Vec<NyaaHit { title, page_url, size_bytes, seeders }>`
   over Nyaa's RSS (`?page=rss&q=…&c=1_2&f=0`, anime category).
+  `page_url` prefers the feed's `<guid>` view page, falling back to `<link>`.
 - Query text per wanted episode: `"<display title> <number>"`
-  (e.g. `Sousou no Frieren 6`). One request per wanted episode, sequential —
-  on-demand clicks only, no background traffic, so no throttle cache.
+  (e.g. `Sousou no Frieren 6`). One request per distinct query string, sequential —
+  on-demand clicks only, no background traffic, so no throttle cache. Known limitation:
+  the query names the episode number only, so identical queries across seasons share
+  filtered hits and the filter is episode-scoped; the linked view page disambiguates.
 - New dependency: `quick-xml` for the RSS (small, no build scripts). Recorded here
   for the supply-chain trail; no other new deps.
 
@@ -57,7 +60,8 @@ A hit survives only when all hold:
 3. Title carries the preferred resolution token when one is preferred
    (`1080p` matches `1080p`, not `720p` or untagged).
 4. Title is a single episode: drop ranges (`01-12`, `6-7`), `Batch`,
-   `Complete`, `Collection`, multi-episode packs.
+   `Complete`, `Collection`, multi-episode packs. Volumes (`Vol.`) and movies
+   (`Movie`/`Movies`) are likewise rejected as non-episodes — word-boundaried, so `backpack` survives.
 
 Best (highest seeders) strict hit per wanted episode is the row's link; size and
 seeders displayed beside it. Episodes with no strict hit render a "no strict
@@ -65,8 +69,8 @@ match" row — never silently dropped.
 
 ## Command
 
-`find_missing(show_id) -> FindMissingReport { wanted: Vec<WantedEpisode { season, number, hits: Vec<NyaaHit> }> }`.
-Pure query: writes nothing, emits no events. Errors (network, non-200, RSS parse)
+`find_missing(show_id) -> Vec<WantedEpisode { season, number, hits: Vec<WantedHit> }>`.
+Pure query: writes nothing, emits nothing. Errors (network, non-200, RSS parse)
 return `Err` — on-demand means loud, surfaced as a toast with the reason.
 
 ## Frontend (show page)

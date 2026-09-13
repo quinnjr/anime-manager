@@ -744,11 +744,9 @@ pub async fn inspect_show(
 /// Pure query: writes nothing, emits nothing.
 #[tauri::command]
 pub async fn find_missing(
-    app: AppHandle,
     state: State<'_, AppState>,
     show_id: i64,
 ) -> Result<Vec<WantedEpisode>> {
-    let _ = &app;
     nyaa::find_missing(&state.db, &Nyaa::with(nyaa::NYAA_BASE.into()), show_id).await
 }
 

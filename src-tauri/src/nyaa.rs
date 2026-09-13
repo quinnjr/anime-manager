@@ -1,6 +1,5 @@
-//! Nyaa torrent provider: title classifier, size parser, and RSS search client.
-//!
-//! Later tasks add DB matching, the Tauri command, and UI.
+//! Nyaa torrent provider: title classifier, size parser, RSS search client,
+//! and the missing-episode hunt (`find_missing`) with strict release matching.
 
 use std::sync::OnceLock;
 
@@ -17,7 +16,6 @@ use serde::Serialize;
 pub struct NyaaHit {
     pub title: String,
     pub page_url: String,
-    pub torrent_url: String,
     pub size_bytes: u64,
     pub seeders: u32,
 }
@@ -37,7 +35,9 @@ fn range_re() -> &'static Regex {
 fn reject_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"(?i)batch|complete|collection|pack|vol\.|movie").expect("valid reject regex")
+        // Word-boundaried so `backpack` survives; `vol.` carries its own dot.
+        Regex::new(r"(?i)\b(batch|complete|collection|packs?|movies?)\b|vol\.")
+            .expect("valid reject regex")
     })
 }
 
@@ -68,6 +68,13 @@ fn size_re() -> &'static Regex {
 fn version_tag_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?i)(?:^|[^a-z0-9])(?:v|ver)\s*$").expect("valid version regex"))
+}
+
+/// A version suffix glued onto an episode number (`06v2`, `06ver2`): the run
+/// before it is still the episode, the `v2` a release revision, not a number.
+fn glued_version_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)^(?:v\d+|ver\d+)").expect("valid glued version regex"))
 }
 
 /// Strip a trailing file extension (`...mkv`) so rules run on the stem.
@@ -132,17 +139,20 @@ pub fn classify_title(title: &str) -> Option<SingleEpisode> {
             continue;
         }
         // Standalone: bounded by non-alphanumerics on both sides, so
-        // `ABC123` and `1080p` never count even unbracketed.
+        // `ABC123` and `1080p` never count even unbracketed — except a run
+        // glued to a version suffix (`06v2`), whose `v2` is a revision tag.
         let before_ok = stem[..m.start()]
             .chars()
             .next_back()
             .map(|c| !c.is_alphanumeric())
             .unwrap_or(true);
-        let after_ok = stem[m.end()..]
+        let after = &stem[m.end()..];
+        let after_ok = after
             .chars()
             .next()
             .map(|c| !c.is_alphanumeric())
-            .unwrap_or(true);
+            .unwrap_or(true)
+            || glued_version_re().is_match(after);
         if !before_ok || !after_ok {
             continue;
         }
@@ -198,7 +208,7 @@ impl Nyaa {
             return Err(AppError::Network(format!("nyaa returned {status}")));
         }
         let body = resp.text().await?;
-        parse_rss(&body, &self.base_url)
+        parse_rss(&body)
     }
 }
 
@@ -226,16 +236,29 @@ fn encode(q: &str) -> String {
 struct RawItem {
     title: String,
     link: String,
-    info_hash: String,
+    guid: String,
     size: String,
     seeders: String,
 }
 
+/// Push one decoded text node onto the in-progress item's field.
+fn push_field(item: &mut RawItem, field: &[u8], text: &str) {
+    match field {
+        b"title" => item.title.push_str(text),
+        b"link" => item.link.push_str(text),
+        b"guid" => item.guid.push_str(text),
+        b"size" => item.size.push_str(text),
+        b"seeders" => item.seeders.push_str(text),
+        _ => {}
+    }
+}
+
 /// Parse an RSS feed, matching element local names so namespace prefixes
-/// (`nyaa:size`, ...) don't matter. Items without a `link` are skipped:
-/// Nyaa view ids are numeric, so no fallback URL can be built from an
-/// infoHash.
-fn parse_rss(body: &str, base_url: &str) -> Result<Vec<NyaaHit>> {
+/// (`nyaa:size`, ...) don't matter. The live feed carries the `.torrent` file
+/// in `<link>` and the view page in `<guid>`; the UI links the view page and
+/// falls back to `<link>` when a feed omits `<guid>`. Items with neither are
+/// skipped.
+fn parse_rss(body: &str) -> Result<Vec<NyaaHit>> {
     let mut reader = Reader::from_str(body);
     let mut buf = Vec::new();
     let mut hits = Vec::new();
@@ -258,34 +281,37 @@ fn parse_rss(body: &str, base_url: &str) -> Result<Vec<NyaaHit>> {
                     let text = t
                         .decode()
                         .map_err(|e| AppError::Parse(e.to_string()))?;
-                    let text = text.trim();
-                    match f.as_slice() {
-                        b"title" => item.title.push_str(text),
-                        b"link" => item.link.push_str(text),
-                        b"infoHash" => item.info_hash.push_str(text),
-                        b"size" => item.size.push_str(text),
-                        b"seeders" => item.seeders.push_str(text),
-                        _ => {}
-                    }
+                    push_field(item, f, text.trim());
+                }
+            }
+            Ok(Event::CData(ref t)) => {
+                if let (Some(item), Some(f)) = (current.as_mut(), field.as_ref()) {
+                    let text = t
+                        .decode()
+                        .map_err(|e| AppError::Parse(e.to_string()))?;
+                    push_field(item, f, text.trim());
                 }
             }
             Ok(Event::End(ref e)) => {
                 let local = e.name().local_name();
                 if local.as_ref() == b"item" {
-                    if let Some(item) = current.take()
-                        && !item.link.is_empty()
-                    {
-                        hits.push(NyaaHit {
-                            title: item.title,
-                            page_url: item.link,
-                            torrent_url: if item.info_hash.is_empty() {
-                                String::new()
-                            } else {
-                                format!("{base_url}/download/{}.torrent", item.info_hash)
-                            },
-                            size_bytes: parse_size(&item.size),
-                            seeders: item.seeders.parse().unwrap_or(0),
-                        });
+                    if let Some(item) = current.take() {
+                        // Live shape: `<link>` is the `.torrent` file, `<guid>`
+                        // the view page. Prefer the view page; feeds without a
+                        // guid fall back to the link.
+                        let page_url = if item.guid.is_empty() {
+                            item.link
+                        } else {
+                            item.guid
+                        };
+                        if !page_url.is_empty() {
+                            hits.push(NyaaHit {
+                                title: item.title,
+                                page_url,
+                                size_bytes: parse_size(&item.size),
+                                seeders: item.seeders.parse().unwrap_or(0),
+                            });
+                        }
                     }
                     field = None;
                 } else {
@@ -470,45 +496,59 @@ pub async fn find_missing(db: &Db, nyaa: &Nyaa, show_id: i64) -> Result<Vec<Want
     };
     let pref_group = modal_group(&owned);
     let pref_res = modal_resolution(&owned);
-    // Computed to pin the spec rule; deliberately unused — size never filters.
+    // Spec pin: the design fixes the band at median ±30% as displayed context
+    // only. Computed (and unit-tested below) so a future edit that turns size
+    // into a filter must update the spec first; deliberately unused here.
     let _size_band = size_band(&owned.iter().map(|o| o.size).collect::<Vec<_>>());
 
+    // One request per distinct query string: the query names the episode
+    // number only, so (1,2) and (2,2) ask Nyaa the same thing, and the strict
+    // filter is episode-scoped too — filtered hits are shared. The linked
+    // view page disambiguates cross-season lookalikes.
+    let mut seen: std::collections::HashMap<String, Vec<WantedHit>> =
+        std::collections::HashMap::new();
     let mut wanted = Vec::new();
     for (season, number) in wanted_numbers(&per_season, total) {
         let query = format!("{} {number}", show.display_title);
-        let mut kept: Vec<WantedHit> = nyaa
-            .search(&query)
-            .await?
-            .into_iter()
-            .filter_map(|h| {
-                // `Some` already guarantees a single episode (no batch/range).
-                let s = classify_title(&h.title)?;
-                if s.episode != number {
-                    return None;
-                }
-                if let Some(ref g) = pref_group
-                    && s.group.as_deref() != Some(g.as_str())
-                {
-                    return None;
-                }
-                if let Some(ref r) = pref_res
-                    && s.resolution.as_deref() != Some(r.as_str())
-                {
-                    return None;
-                }
-                Some(WantedHit {
-                    title: h.title,
-                    page_url: h.page_url,
-                    size_bytes: h.size_bytes,
-                    seeders: h.seeders,
+        let hits = if let Some(cached) = seen.get(&query) {
+            cached.clone()
+        } else {
+            let mut kept: Vec<WantedHit> = nyaa
+                .search(&query)
+                .await?
+                .into_iter()
+                .filter_map(|h| {
+                    // `Some` already guarantees a single episode (no batch/range).
+                    let s = classify_title(&h.title)?;
+                    if s.episode != number {
+                        return None;
+                    }
+                    if let Some(ref g) = pref_group
+                        && s.group.as_deref() != Some(g.as_str())
+                    {
+                        return None;
+                    }
+                    if let Some(ref r) = pref_res
+                        && s.resolution.as_deref() != Some(r.as_str())
+                    {
+                        return None;
+                    }
+                    Some(WantedHit {
+                        title: h.title,
+                        page_url: h.page_url,
+                        size_bytes: h.size_bytes,
+                        seeders: h.seeders,
+                    })
                 })
-            })
-            .collect();
-        kept.sort_by_key(|b| std::cmp::Reverse(b.seeders));
+                .collect();
+            kept.sort_by_key(|b| std::cmp::Reverse(b.seeders));
+            seen.insert(query, kept.clone());
+            kept
+        };
         wanted.push(WantedEpisode {
             season,
             number,
-            hits: kept,
+            hits,
         });
     }
     Ok(wanted)
@@ -523,7 +563,8 @@ mod tests {
     #[tokio::test]
     async fn rss_items_parse_with_namespaced_fields() {
         let server = MockServer::start().await;
-        let rss = r#"<?xml version="1.0"?><rss version="2.0" xmlns:nyaa="https://nyaa.si/xmlns/nyaa"><channel><item><title>[G] Show - 06 [1080p]</title><link>https://nyaa.si/view/12345</link><guid>https://nyaa.si/view/12345</guid><nyaa:infoHash>abcdef0123456789abcdef0123456789abcdef01</nyaa:infoHash><nyaa:size>1.4 GiB</nyaa:size><nyaa:seeders>42</nyaa:seeders></item><item><title>[G] Show Batch [1080p]</title><link>https://nyaa.si/view/9</link><nyaa:size>8.0 GiB</nyaa:size></item></channel></rss>"#;
+        // Live shape: `<link>` is the `.torrent` file, `<guid>` the view page.
+        let rss = r#"<?xml version="1.0"?><rss version="2.0" xmlns:nyaa="https://nyaa.si/xmlns/nyaa"><channel><item><title>[G] Show - 06 [1080p]</title><link>https://nyaa.si/download/12345.torrent</link><guid>https://nyaa.si/view/12345</guid><nyaa:infoHash>abcdef0123456789abcdef0123456789abcdef01</nyaa:infoHash><nyaa:size>1.4 GiB</nyaa:size><nyaa:seeders>42</nyaa:seeders></item><item><title>[G] Show Batch [1080p]</title><link>https://nyaa.si/download/9.torrent</link><nyaa:size>8.0 GiB</nyaa:size></item><item><title><![CDATA[[G] Show - 07 [1080p]]]></title><link>https://nyaa.si/download/77.torrent</link><guid>https://nyaa.si/view/77</guid><nyaa:size>1.4 GiB</nyaa:size><nyaa:seeders>3</nyaa:seeders></item></channel></rss>"#;
         Mock::given(method("GET"))
             .and(query_param("page", "rss"))
             .respond_with(ResponseTemplate::new(200).set_body_string(rss))
@@ -531,12 +572,23 @@ mod tests {
             .mount(&server)
             .await;
         let hits = Nyaa::with(server.uri()).search("Show 6").await.unwrap();
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].page_url, "https://nyaa.si/view/12345");
+        assert_eq!(hits.len(), 3);
+        assert_eq!(
+            hits[0].page_url, "https://nyaa.si/view/12345",
+            "guid view page wins over the download link"
+        );
         assert_eq!(hits[0].seeders, 42);
         assert_eq!(hits[0].size_bytes, 1_503_238_553);
-        assert!(hits[0].torrent_url.ends_with(".torrent"));
+        assert_eq!(
+            hits[1].page_url, "https://nyaa.si/download/9.torrent",
+            "link fallback when the feed omits guid"
+        );
         assert_eq!(hits[1].size_bytes, 8_589_934_592);
+        assert_eq!(
+            hits[2].title, "[G] Show - 07 [1080p]",
+            "CDATA titles decode like text"
+        );
+        assert_eq!(hits[2].page_url, "https://nyaa.si/view/77");
     }
 
     #[test]
@@ -553,6 +605,26 @@ mod tests {
         assert!(classify_title("[SubGroup] Sousou no Frieren 01-13 [1080p]").is_none(), "ranges reject");
         assert!(classify_title("[SubGroup] Sousou no Frieren Batch [1080p]").is_none(), "batch rejects");
         assert!(classify_title("[SubGroup] Sousou no Frieren Movie [1080p]").is_none(), "movie rejects");
+        assert!(classify_title("[G] Show - Vol.2 [1080p]").is_none(), "volumes reject");
+        assert!(
+            classify_title("[G] Backpack Adventures - 03 [1080p]").is_some_and(|s| s.episode == 3),
+            "backpack is not a pack"
+        );
+        assert_eq!(
+            classify_title("[SubGroup] Show - 06v2 [1080p]").map(|s| s.episode),
+            Some(6),
+            "glued version suffix keeps the episode"
+        );
+        assert_eq!(
+            classify_title("[SubGroup] Show - 06ver2 [1080p]").map(|s| s.episode),
+            Some(6),
+            "glued ver suffix keeps the episode"
+        );
+        assert_eq!(
+            classify_title("[SubGroup] Show - 06 [1080p] v2").map(|s| s.episode),
+            Some(6),
+            "spaced version suffix still works"
+        );
         assert_eq!(parse_size("1.4 GiB"), 1_503_238_553);
         assert_eq!(parse_size("700 MiB"), 734_003_200);
         assert_eq!(parse_size("n/a"), 0);
@@ -587,7 +659,7 @@ mod tests {
     }
 
     fn item_xml(title: &str, id: u32, seeders: u32) -> String {
-        format!("<item><title>{title}</title><link>https://nyaa.si/view/{id}</link><nyaa:size>1.4 GiB</nyaa:size><nyaa:seeders>{seeders}</nyaa:seeders></item>")
+        format!("<item><title>{title}</title><link>https://nyaa.si/download/{id}.torrent</link><guid>https://nyaa.si/view/{id}</guid><nyaa:size>1.4 GiB</nyaa:size><nyaa:seeders>{seeders}</nyaa:seeders></item>")
     }
 
     fn rss_wrap(items: &str) -> String {
@@ -666,6 +738,7 @@ mod tests {
         assert_eq!(nums, vec![(1, 3), (1, 5), (1, 6), (2, 2)]);
         assert_eq!(wanted[0].hits.len(), 1, "group/res/range rejects leave one E3 hit");
         assert_eq!(wanted[0].hits[0].seeders, 5);
+        assert_eq!(wanted[0].hits[0].page_url, "https://nyaa.si/view/101");
         assert!(
             wanted[1].hits.is_empty(),
             "untagged resolution must not match a 1080p preference"
@@ -709,6 +782,41 @@ mod tests {
         assert_eq!(wanted.len(), 1, "gaps only, nothing past max without a total");
         assert_eq!((wanted[0].season, wanted[0].number), (1, 2));
         assert_eq!(wanted[0].hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn identical_queries_share_one_request() {
+        let db = Db::open_memory().unwrap();
+        for (s, e, p) in [
+            (1u32, 1u32, "/lib/D/S1/01.mkv"),
+            (1, 3, "/lib/D/S1/03.mkv"),
+            (2, 1, "/lib/D/S2/01.mkv"),
+            (2, 3, "/lib/D/S2/03.mkv"),
+        ] {
+            db.upsert_episode(&pn("D", s, e, Some("G"), Some("1080p")), &rf(p))
+                .unwrap();
+        }
+        let show_id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+
+        let server = MockServer::start().await;
+        // (1,2) and (2,2) ask the same `D 2`: exactly one HTTP request.
+        Mock::given(method("GET"))
+            .and(query_param("page", "rss"))
+            .and(query_param("q", "D 2"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(rss_wrap(
+                &item_xml("[G] D - 02 [1080p]", 301, 4),
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let wanted = find_missing(&db, &Nyaa::with(server.uri()), show_id)
+            .await
+            .unwrap();
+        let nums: Vec<(u32, u32)> = wanted.iter().map(|w| (w.season, w.number)).collect();
+        assert_eq!(nums, vec![(1, 2), (2, 2)]);
+        assert_eq!(wanted[0].hits, wanted[1].hits, "shared filtered hits");
+        assert_eq!(wanted[0].hits[0].page_url, "https://nyaa.si/view/301");
     }
 
     #[test]
