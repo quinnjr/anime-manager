@@ -14,12 +14,17 @@ pub struct Providers {
 }
 
 impl Default for Providers {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Providers {
     pub fn new() -> Self {
-        Self { anilist: AniList::new(), kitsu: Kitsu::new() }
+        Self {
+            anilist: AniList::new(),
+            kitsu: Kitsu::new(),
+        }
     }
 
     /// Hits from every provider that answered, AniList first. A provider that errors is
@@ -50,7 +55,9 @@ impl Providers {
         match source {
             crate::anilist::SOURCE => self.anilist.by_id(id).await,
             crate::kitsu::SOURCE => self.kitsu.by_id(id).await,
-            other => Err(crate::error::AppError::Network(format!("unknown metadata source {other:?}"))),
+            other => Err(crate::error::AppError::Network(format!(
+                "unknown metadata source {other:?}"
+            ))),
         }
     }
 
@@ -124,9 +131,15 @@ mod tests {
     /// AniList down (403, as it actually was), Kitsu healthy.
     async fn one_provider_down() -> (MockServer, MockServer) {
         let dead = MockServer::start().await;
-        Mock::given(method("POST")).respond_with(ResponseTemplate::new(403)).mount(&dead).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&dead)
+            .await;
         let live = MockServer::start().await;
-        Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_json(kitsu_body())).mount(&live).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(kitsu_body()))
+            .mount(&live)
+            .await;
         (dead, live)
     }
 
@@ -134,7 +147,8 @@ mod tests {
     async fn a_dead_provider_does_not_block_the_other() {
         let (dead, live) = one_provider_down().await;
         let p = Providers {
-            anilist: AniList::with_endpoint(dead.uri()).with_retry_base(std::time::Duration::from_millis(1)),
+            anilist: AniList::with_endpoint(dead.uri())
+                .with_retry_base(std::time::Duration::from_millis(1)),
             kitsu: Kitsu::with_endpoint(live.uri()),
         };
         let (hits, errors) = p.search("Frieren").await;
@@ -143,18 +157,28 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert!(errors[0].starts_with("anilist:"), "{errors:?}");
 
-        let best = p.best("Frieren").await.expect("matched through the surviving provider");
+        let best = p
+            .best("Frieren")
+            .await
+            .expect("matched through the surviving provider");
         assert_eq!((best.source.as_str(), best.id), ("kitsu", 46474));
     }
 
     #[tokio::test]
     async fn both_down_yields_no_match_rather_than_a_wrong_one() {
         let dead = MockServer::start().await;
-        Mock::given(method("POST")).respond_with(ResponseTemplate::new(403)).mount(&dead).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&dead)
+            .await;
         let dead2 = MockServer::start().await;
-        Mock::given(method("GET")).respond_with(ResponseTemplate::new(503)).mount(&dead2).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&dead2)
+            .await;
         let p = Providers {
-            anilist: AniList::with_endpoint(dead.uri()).with_retry_base(std::time::Duration::from_millis(1)),
+            anilist: AniList::with_endpoint(dead.uri())
+                .with_retry_base(std::time::Duration::from_millis(1)),
             kitsu: Kitsu::with_endpoint(dead2.uri()),
         };
         let (hits, errors) = p.search("Frieren").await;
@@ -170,11 +194,29 @@ mod tests {
         let (dead, live) = one_provider_down().await;
         let db = std::sync::Arc::new(crate::db::Db::open_memory().unwrap());
         for t in ["Sousou no Frieren", "Definitely Not A Real Anime XYZQ"] {
-            let pn = ParsedName { title: t.into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
-            db.upsert_episode(&pn, &RawFile { path: format!("/a/{t}.mkv").into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] }).unwrap();
+            let pn = ParsedName {
+                title: t.into(),
+                season: 1,
+                episode: 1,
+                release_group: None,
+                resolution: None,
+                crc: None,
+            };
+            db.upsert_episode(
+                &pn,
+                &RawFile {
+                    path: format!("/a/{t}.mkv").into(),
+                    size: 1,
+                    mtime: 1,
+                    stem: "".into(),
+                    dirs: vec![],
+                },
+            )
+            .unwrap();
         }
         let p = std::sync::Arc::new(Providers {
-            anilist: AniList::with_endpoint(dead.uri()).with_retry_base(std::time::Duration::from_millis(1)),
+            anilist: AniList::with_endpoint(dead.uri())
+                .with_retry_base(std::time::Duration::from_millis(1)),
             kitsu: Kitsu::with_endpoint(live.uri()),
         });
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -186,7 +228,11 @@ mod tests {
         assert_eq!((seen[0].done, seen[0].total), (1, 2));
         assert_eq!(seen[1].done, 2);
         assert_eq!(seen.iter().filter(|p| p.changed.is_some()).count(), 1);
-        assert_eq!(db.shows_needing_match().unwrap().len(), 1, "the unmatched one stays pending");
+        assert_eq!(
+            db.shows_needing_match().unwrap().len(),
+            1,
+            "the unmatched one stays pending"
+        );
         assert!(seen.iter().all(|p| p.running && p.phase == "matching"));
     }
 
@@ -199,21 +245,60 @@ mod tests {
         let (dead, live) = one_provider_down().await;
         let db = std::sync::Arc::new(crate::db::Db::open_memory().unwrap());
         // Two folder names for the same series, exactly as the real library had them.
-        for (t, f) in [("Sousou no Frieren", "/a/1.mkv"), ("Frieren Beyond Journey's End", "/b/1.mkv")] {
-            let pn = ParsedName { title: t.into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
-            db.upsert_episode(&pn, &RawFile { path: f.into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] }).unwrap();
+        for (t, f) in [
+            ("Sousou no Frieren", "/a/1.mkv"),
+            ("Frieren Beyond Journey's End", "/b/1.mkv"),
+        ] {
+            let pn = ParsedName {
+                title: t.into(),
+                season: 1,
+                episode: 1,
+                release_group: None,
+                resolution: None,
+                crc: None,
+            };
+            db.upsert_episode(
+                &pn,
+                &RawFile {
+                    path: f.into(),
+                    size: 1,
+                    mtime: 1,
+                    stem: "".into(),
+                    dirs: vec![],
+                },
+            )
+            .unwrap();
         }
-        assert_eq!(db.list_shows("", crate::models::ShowSort::Title).unwrap().len(), 2);
+        assert_eq!(
+            db.list_shows("", crate::models::ShowSort::Title)
+                .unwrap()
+                .len(),
+            2
+        );
         let p = std::sync::Arc::new(Providers {
-            anilist: AniList::with_endpoint(dead.uri()).with_retry_base(std::time::Duration::from_millis(1)),
+            anilist: AniList::with_endpoint(dead.uri())
+                .with_retry_base(std::time::Duration::from_millis(1)),
             kitsu: Kitsu::with_endpoint(live.uri()),
         });
         auto_match_all(db.clone(), p, |_| {}).await;
 
-        assert_eq!(db.library_status().unwrap().duplicates, 0, "nothing is left duplicated");
-        assert_eq!(db.list_shows("", crate::models::ShowSort::Title).unwrap().len(), 1,
-            "matching both to one provider entry folded them without a second pass");
-        assert_eq!(db.library_status().unwrap().episodes, 2, "and kept both files");
+        assert_eq!(
+            db.library_status().unwrap().duplicates,
+            0,
+            "nothing is left duplicated"
+        );
+        assert_eq!(
+            db.list_shows("", crate::models::ShowSort::Title)
+                .unwrap()
+                .len(),
+            1,
+            "matching both to one provider entry folded them without a second pass"
+        );
+        assert_eq!(
+            db.library_status().unwrap().episodes,
+            2,
+            "and kept both files"
+        );
     }
 
     #[tokio::test]
@@ -228,9 +313,13 @@ mod tests {
     async fn an_unconvincing_hit_is_still_rejected_across_providers() {
         let (dead, live) = one_provider_down().await;
         let p = Providers {
-            anilist: AniList::with_endpoint(dead.uri()).with_retry_base(std::time::Duration::from_millis(1)),
+            anilist: AniList::with_endpoint(dead.uri())
+                .with_retry_base(std::time::Duration::from_millis(1)),
             kitsu: Kitsu::with_endpoint(live.uri()),
         };
-        assert!(p.best("Bagel Girl").await.is_none(), "a bad hit must not be applied unattended");
+        assert!(
+            p.best("Bagel Girl").await.is_none(),
+            "a bad hit must not be applied unattended"
+        );
     }
 }

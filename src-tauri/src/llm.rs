@@ -6,9 +6,12 @@
 //! since free model ids rotate.
 use crate::db::Db;
 use crate::error::{AppError, Result};
-use crate::models::{AssistProgress, InspectChange, InspectReport, ParseOverride, KIND_EPISODE, KIND_IGNORE, KIND_MOVIE, KIND_SPECIAL};
+use crate::models::{
+    AssistProgress, InspectChange, InspectReport, KIND_EPISODE, KIND_IGNORE, KIND_MOVIE,
+    KIND_SPECIAL, ParseOverride,
+};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -58,11 +61,21 @@ pub struct FileGuess {
 /// Accept whatever shape the model emits for a number: an integer, a float (11.5 is a standard
 /// recap/special convention), a numeric string, or null. Anything else yields None for that
 /// field rather than failing the whole folder's decisions.
-fn lenient_u32<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<u32>, D::Error> {
+fn lenient_u32<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<u32>, D::Error> {
     let v = Option::<Value>::deserialize(d)?;
     Ok(match v {
-        Some(Value::Number(n)) => n.as_f64().filter(|f| f.is_finite() && *f >= 0.0).map(|f| f.trunc() as u32),
-        Some(Value::String(s)) => s.trim().parse::<f64>().ok().filter(|f| f.is_finite() && *f >= 0.0).map(|f| f.trunc() as u32),
+        Some(Value::Number(n)) => n
+            .as_f64()
+            .filter(|f| f.is_finite() && *f >= 0.0)
+            .map(|f| f.trunc() as u32),
+        Some(Value::String(s)) => s
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite() && *f >= 0.0)
+            .map(|f| f.trunc() as u32),
         _ => None,
     })
 }
@@ -133,20 +146,38 @@ impl Llm {
     /// Build from the settings table: `llm_api_key`, `llm_model`, `llm_base_url`, `llm_delay_ms`.
     pub fn from_db(db: &Db) -> Result<Self> {
         let key = db.get_setting("llm_api_key")?;
-        let model = db.get_setting("llm_model")?.filter(|m| !m.trim().is_empty()).unwrap_or_else(|| DEFAULT_MODEL.into());
-        let base = db.get_setting("llm_base_url")?.filter(|b| !b.trim().is_empty()).unwrap_or_else(|| DEFAULT_BASE_URL.into());
-        let delay = db.get_setting("llm_delay_ms")?.and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_DELAY_MS);
-        Ok(Self::with(base, key, model).with_timing(Duration::from_secs(1), Duration::from_millis(delay)))
+        let model = db
+            .get_setting("llm_model")?
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_MODEL.into());
+        let base = db
+            .get_setting("llm_base_url")?
+            .filter(|b| !b.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_BASE_URL.into());
+        let delay = db
+            .get_setting("llm_delay_ms")?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_DELAY_MS);
+        Ok(Self::with(base, key, model)
+            .with_timing(Duration::from_secs(1), Duration::from_millis(delay)))
     }
 
-    pub fn configured(&self) -> bool { self.api_key.is_some() }
+    pub fn configured(&self) -> bool {
+        self.api_key.is_some()
+    }
 
-    pub fn model(&self) -> &str { &self.model }
+    pub fn model(&self) -> &str {
+        &self.model
+    }
 
     pub async fn chat(&self, system: &str, user: &str) -> Result<String> {
-        let key = self.api_key.as_ref().ok_or_else(|| AppError::Network("LLM not configured: set an API key in Settings".into()))?;
+        let key = self.api_key.as_ref().ok_or_else(|| {
+            AppError::Network("LLM not configured: set an API key in Settings".into())
+        })?;
         if self.model.trim().is_empty() {
-            return Err(AppError::Network("No model chosen: pick one in Settings (press List)".into()));
+            return Err(AppError::Network(
+                "No model chosen: pick one in Settings (press List)".into(),
+            ));
         }
         let body = json!({
             "model": self.model,
@@ -159,21 +190,40 @@ impl Llm {
         let mut attempt = 0u32;
         let text = loop {
             attempt += 1;
-            let sent = self.client.post(format!("{}/chat/completions", self.base_url)).bearer_auth(key).json(&body).send().await;
+            let sent = self
+                .client
+                .post(format!("{}/chat/completions", self.base_url))
+                .bearer_auth(key)
+                .json(&body)
+                .send()
+                .await;
             // Transient failures (429, 5xx, transport errors) back off and retry; anything else is final.
             let (retryable, wait, err) = match sent {
                 Ok(resp) => {
                     let status = resp.status();
-                    let retry_after = resp.headers().get("retry-after").and_then(|h| h.to_str().ok()).and_then(|v| v.parse::<u64>().ok()).map(Duration::from_secs);
+                    let retry_after = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|h| h.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .map(Duration::from_secs);
                     let text = resp.text().await?;
-                    if status.is_success() { break text; }
+                    if status.is_success() {
+                        break text;
+                    }
                     let snippet: String = text.chars().take(300).collect();
                     let e = AppError::Network(format!("LLM returned {status}: {snippet}"));
-                    (status.as_u16() == 429 || status.is_server_error(), retry_after, e)
+                    (
+                        status.as_u16() == 429 || status.is_server_error(),
+                        retry_after,
+                        e,
+                    )
                 }
                 Err(e) => (true, None, AppError::Network(e.to_string())),
             };
-            if !retryable || attempt >= MAX_ATTEMPTS { return Err(err); }
+            if !retryable || attempt >= MAX_ATTEMPTS {
+                return Err(err);
+            }
             let backoff = self.retry_base * 2u32.pow(attempt - 1);
             let asked = wait.unwrap_or(backoff).max(backoff);
             // A daily-quota 429 answers Retry-After in hours. Honouring that would hold the
@@ -182,13 +232,19 @@ impl Llm {
             if asked > MAX_RETRY_AFTER {
                 return Err(AppError::Network(format!(
                     "{} asked to wait {} minutes before retrying, which usually means the free quota is spent; try again later",
-                    self.model, asked.as_secs() / 60)));
+                    self.model,
+                    asked.as_secs() / 60
+                )));
             }
             tokio::time::sleep(asked).await;
         };
         let v: Value = serde_json::from_str(&text)?;
-        let content = v.pointer("/choices/0/message/content").and_then(|c| c.as_str())
-            .ok_or_else(|| AppError::Parse("LLM response had no choices[0].message.content".into()))?;
+        let content = v
+            .pointer("/choices/0/message/content")
+            .and_then(|c| c.as_str())
+            .ok_or_else(|| {
+                AppError::Parse("LLM response had no choices[0].message.content".into())
+            })?;
         Ok(content.to_string())
     }
 
@@ -199,18 +255,29 @@ impl Llm {
         let key = self.api_key.as_ref().ok_or_else(|| {
             AppError::Network("LLM not configured: set an API key in Settings".into())
         })?;
-        let resp = self.client.get(format!("{}/models", self.base_url)).bearer_auth(key).send().await?;
+        let resp = self
+            .client
+            .get(format!("{}/models", self.base_url))
+            .bearer_auth(key)
+            .send()
+            .await?;
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
             let snippet: String = text.chars().take(200).collect();
-            return Err(AppError::Network(format!("provider returned {status}: {snippet}")));
+            return Err(AppError::Network(format!(
+                "provider returned {status}: {snippet}"
+            )));
         }
         let v: Value = serde_json::from_str(&text)?;
         let mut ids: Vec<String> = v
             .get("data")
             .and_then(|d| d.as_array())
-            .map(|a| a.iter().filter_map(|m| m.get("id")?.as_str().map(str::to_string)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m.get("id")?.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default();
         ids.sort();
         ids.dedup();
@@ -224,7 +291,11 @@ impl Llm {
     }
 
     /// Judge a whole show's season breakdown in one request.
-    pub async fn inspect_show_breakdown(&self, title: &str, files: &[FileGuess]) -> Result<FolderInspection> {
+    pub async fn inspect_show_breakdown(
+        &self,
+        title: &str,
+        files: &[FileGuess],
+    ) -> Result<FolderInspection> {
         let mut user = format!(
             "Show: {title}\n\nEvery file currently filed under it ({}), with where it sits now:\n",
             files.len()
@@ -235,7 +306,10 @@ impl Llm {
         if files.len() > MAX_FILES_PER_FOLDER {
             // Naming a count without inviting guesses: a decision for a file the model never saw
             // can still land, because an invented name may collide with a real one.
-            user.push_str(&format!("({} further files are not listed; do not judge them.)\n", files.len() - MAX_FILES_PER_FOLDER));
+            user.push_str(&format!(
+                "({} further files are not listed; do not judge them.)\n",
+                files.len() - MAX_FILES_PER_FOLDER
+            ));
         }
         user.push_str(
             "\nCheck the season and episode of every file and correct anything filed wrongly. \
@@ -264,12 +338,18 @@ impl Llm {
             }
             user.push('\n');
         }
-        user.push_str(&format!("Folder (relative to the library root): {rel_folder}\n\nFiles ({}):\n", files.len()));
+        user.push_str(&format!(
+            "Folder (relative to the library root): {rel_folder}\n\nFiles ({}):\n",
+            files.len()
+        ));
         for f in files.iter().take(MAX_FILES_PER_FOLDER) {
             user.push_str(&format!("- {}\n    parser guess: {}\n", f.name, f.guess));
         }
         if files.len() > MAX_FILES_PER_FOLDER {
-            user.push_str(&format!("... and {} more files not shown; decide them by the same pattern.\n", files.len() - MAX_FILES_PER_FOLDER));
+            user.push_str(&format!(
+                "... and {} more files not shown; decide them by the same pattern.\n",
+                files.len() - MAX_FILES_PER_FOLDER
+            ));
         }
         let reply = self.chat(SYSTEM_PROMPT, &user).await?;
         parse_inspection(&reply)
@@ -279,27 +359,48 @@ impl Llm {
 /// Parse the model's reply, tolerating ```json fences and leading/trailing prose.
 pub fn parse_inspection(reply: &str) -> Result<FolderInspection> {
     let t = reply.trim();
-    let t = t.strip_prefix("```json").or_else(|| t.strip_prefix("```")).unwrap_or(t);
+    let t = t
+        .strip_prefix("```json")
+        .or_else(|| t.strip_prefix("```"))
+        .unwrap_or(t);
     let t = t.strip_suffix("```").unwrap_or(t).trim();
-    let start = t.find('{').ok_or_else(|| AppError::Parse("LLM reply contained no JSON object".into()))?;
-    let end = t.rfind('}').ok_or_else(|| AppError::Parse("LLM reply contained no JSON object".into()))?;
-    if end < start { return Err(AppError::Parse("LLM reply contained no JSON object".into())); }
+    let start = t
+        .find('{')
+        .ok_or_else(|| AppError::Parse("LLM reply contained no JSON object".into()))?;
+    let end = t
+        .rfind('}')
+        .ok_or_else(|| AppError::Parse("LLM reply contained no JSON object".into()))?;
+    if end < start {
+        return Err(AppError::Parse("LLM reply contained no JSON object".into()));
+    }
     let v: FolderInspection = serde_json::from_str(&t[start..=end])?;
-    if v.title.trim().is_empty() { return Err(AppError::Parse("LLM reply had an empty title".into())); }
+    if v.title.trim().is_empty() {
+        return Err(AppError::Parse("LLM reply had an empty title".into()));
+    }
     Ok(v)
 }
 
 /// Shorten a folder to its path relative to the library root that contains it. Matching is on a
 /// path boundary, so root `/lib` does not claim `/library/Anime/X`.
 fn rel_to_roots(roots: &[String], folder: &str) -> String {
-    let best = roots.iter()
+    let best = roots
+        .iter()
         .map(|r| r.trim_end_matches('/'))
-        .filter(|r| folder == *r || folder.strip_prefix(*r).is_some_and(|rest| rest.starts_with('/')))
+        .filter(|r| {
+            folder == *r
+                || folder
+                    .strip_prefix(*r)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
         .max_by_key(|r| r.len());
     match best {
         Some(r) => {
             let rest = folder[r.len()..].trim_start_matches('/');
-            if rest.is_empty() { folder.to_string() } else { rest.to_string() }
+            if rest.is_empty() {
+                folder.to_string()
+            } else {
+                rest.to_string()
+            }
         }
         None => folder.to_string(),
     }
@@ -307,46 +408,130 @@ fn rel_to_roots(roots: &[String], folder: &str) -> String {
 
 /// Inspect one folder and apply the model's decisions as parse overrides.
 /// Returns Ok(false) when the folder held no known episodes.
-async fn inspect_one(db: &Db, llm: &Llm, roots: &[String], folder: &str, report: &mut InspectReport) -> Result<bool> {
+async fn inspect_one(
+    db: &Db,
+    llm: &Llm,
+    roots: &[String],
+    folder: &str,
+    report: &mut InspectReport,
+) -> Result<bool> {
     let rows = db.episodes_in_folder(folder)?;
-    if rows.is_empty() { return Ok(false); }
-    let files: Vec<FileGuess> = rows.iter().map(|(path, title, season, number)| FileGuess {
-        name: Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or(path).to_string(),
-        guess: format!("{title} S{season}E{number}"),
-    }).collect();
+    if rows.is_empty() {
+        return Ok(false);
+    }
+    let files: Vec<FileGuess> = rows
+        .iter()
+        .map(|(path, title, season, number)| FileGuess {
+            name: Path::new(path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(path)
+                .to_string(),
+            guess: format!("{title} S{season}E{number}"),
+        })
+        .collect();
     let rel = rel_to_roots(roots, folder);
     // Losing this list silently reverts to the behaviour that coins a synonym for a show the
     // library already holds, so say so rather than let the run look normal.
     let known = match db.known_titles() {
         Ok(k) => k,
-        Err(e) => { report.notes.push(format!("could not read the library's titles, so this folder was judged without them: {e}")); Vec::new() }
+        Err(e) => {
+            report.notes.push(format!(
+                "could not read the library's titles, so this folder was judged without them: {e}"
+            ));
+            Vec::new()
+        }
     };
     let inspection = match llm.inspect_folder_with(&rel, &files, &known).await {
         Ok(i) => i,
-        Err(e) => { report.notes.push(format!("{rel}: {e}")); return Ok(true); }
+        Err(e) => {
+            report.notes.push(format!("{rel}: {e}"));
+            return Ok(true);
+        }
     };
     report.folders += 1;
-    if !inspection.notes.trim().is_empty() { report.notes.push(format!("{rel}: {}", inspection.notes.trim())); }
-    let by_name: BTreeMap<&str, &(String, String, u32, u32)> = rows.iter().map(|r| (Path::new(&r.0).file_name().and_then(|s| s.to_str()).unwrap_or(&r.0), r)).collect();
+    if !inspection.notes.trim().is_empty() {
+        report
+            .notes
+            .push(format!("{rel}: {}", inspection.notes.trim()));
+    }
+    let by_name: BTreeMap<&str, &(String, String, u32, u32)> = rows
+        .iter()
+        .map(|r| {
+            (
+                Path::new(&r.0)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&r.0),
+                r,
+            )
+        })
+        .collect();
     for d in &inspection.files {
-        let Some((path, cur_title, cur_season, cur_number)) = by_name.get(d.name.as_str()).map(|r| (&r.0, &r.1, r.2, r.3)) else { continue };
+        let Some((path, cur_title, cur_season, cur_number)) =
+            by_name.get(d.name.as_str()).map(|r| (&r.0, &r.1, r.2, r.3))
+        else {
+            continue;
+        };
         let from = format!("{cur_title} S{cur_season}E{cur_number}");
         if d.kind == KIND_IGNORE {
-            db.set_override(&ParseOverride { path: path.clone(), title: String::new(), season: 0, number: 0, kind: KIND_IGNORE.into(), source: OVERRIDE_SOURCE.into() })?;
+            db.set_override(&ParseOverride {
+                path: path.clone(),
+                title: String::new(),
+                season: 0,
+                number: 0,
+                kind: KIND_IGNORE.into(),
+                source: OVERRIDE_SOURCE.into(),
+            })?;
             db.delete_episode_by_path(path)?;
             report.ignored += 1;
-            report.changes.push(InspectChange { path: path.clone(), from, to: "ignored".into() });
+            report.changes.push(InspectChange {
+                path: path.clone(),
+                from,
+                to: "ignored".into(),
+            });
             continue;
         }
         let kind = normalize_kind(&d.kind);
-        let title = d.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| inspection.title.clone()).trim().to_string();
-        let season = if kind == KIND_SPECIAL { 0 } else { d.season.or(inspection.season).unwrap_or(1) };
-        let number = d.episode.unwrap_or(if kind == KIND_MOVIE { 1 } else { cur_number });
-        let season_title = if season == 0 { None } else { d.season_title.clone().or_else(|| inspection.season_title.clone()) };
-        db.set_override(&ParseOverride { path: path.clone(), title: title.clone(), season, number, kind, source: OVERRIDE_SOURCE.into() })?;
+        let title = d
+            .title
+            .clone()
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| inspection.title.clone())
+            .trim()
+            .to_string();
+        let season = if kind == KIND_SPECIAL {
+            0
+        } else {
+            d.season.or(inspection.season).unwrap_or(1)
+        };
+        let number = d
+            .episode
+            .unwrap_or(if kind == KIND_MOVIE { 1 } else { cur_number });
+        let season_title = if season == 0 {
+            None
+        } else {
+            d.season_title
+                .clone()
+                .or_else(|| inspection.season_title.clone())
+        };
+        db.set_override(&ParseOverride {
+            path: path.clone(),
+            title: title.clone(),
+            season,
+            number,
+            kind,
+            source: OVERRIDE_SOURCE.into(),
+        })?;
         db.reassign_episode(path, &title, season, number, season_title.as_deref())?;
         let to = format!("{title} S{season}E{number}");
-        if to != from { report.changes.push(InspectChange { path: path.clone(), from, to }); }
+        if to != from {
+            report.changes.push(InspectChange {
+                path: path.clone(),
+                from,
+                to,
+            });
+        }
     }
     db.prune_empty()?;
     Ok(true)
@@ -375,7 +560,10 @@ impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
         let mut s = self.0.lock();
         s.running = false;
-        if s.pending.is_empty() { s.done = 0; s.total = 0; }
+        if s.pending.is_empty() {
+            s.done = 0;
+            s.total = 0;
+        }
     }
 }
 
@@ -389,26 +577,40 @@ impl AssistQueue {
         let mut s = self.lock();
         let mut added = 0;
         for f in folders {
-            if !s.pending.contains(&f) { s.pending.push_back(f); added += 1; }
+            if !s.pending.contains(&f) {
+                s.pending.push_back(f);
+                added += 1;
+            }
         }
         s.total += added;
         added
     }
 
-    pub fn is_running(&self) -> bool { self.lock().running }
+    pub fn is_running(&self) -> bool {
+        self.lock().running
+    }
 
-    pub fn has_pending(&self) -> bool { !self.lock().pending.is_empty() }
+    pub fn has_pending(&self) -> bool {
+        !self.lock().pending.is_empty()
+    }
 
     pub fn progress(&self) -> AssistProgress {
         let s = self.lock();
-        AssistProgress { done: s.done, total: s.total, folder: String::new(), running: s.running }
+        AssistProgress {
+            done: s.done,
+            total: s.total,
+            folder: String::new(),
+            running: s.running,
+        }
     }
 
     /// Try to become the worker. `None` if one is already draining the queue. Hold the returned
     /// guard for the whole run.
     pub fn try_start(&self) -> Option<RunGuard<'_>> {
         let mut s = self.lock();
-        if s.running { return None; }
+        if s.running {
+            return None;
+        }
         s.running = true;
         drop(s);
         Some(RunGuard(self))
@@ -419,7 +621,9 @@ impl AssistQueue {
     /// that now succeeds — it can never be stranded with no worker.
     fn next_or_finish(&self) -> Option<String> {
         let mut s = self.lock();
-        if let Some(f) = s.pending.pop_front() { return Some(f); }
+        if let Some(f) = s.pending.pop_front() {
+            return Some(f);
+        }
         s.done = 0;
         s.total = 0;
         s.running = false;
@@ -427,12 +631,24 @@ impl AssistQueue {
     }
 
     /// Drain the queue one folder at a time, reporting progress after each.
-    pub async fn run(&self, db: Arc<Db>, llm: Arc<Llm>, on_progress: &(dyn Fn(AssistProgress) + Send + Sync)) -> InspectReport {
+    pub async fn run(
+        &self,
+        db: Arc<Db>,
+        llm: Arc<Llm>,
+        on_progress: &(dyn Fn(AssistProgress) + Send + Sync),
+    ) -> InspectReport {
         let mut report = InspectReport::default();
-        let roots: Vec<String> = db.list_roots().unwrap_or_default().into_iter().map(|r| r.path).collect();
+        let roots: Vec<String> = db
+            .list_roots()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
         let mut first = true;
         while let Some(folder) = self.next_or_finish() {
-            if !first { tokio::time::sleep(llm.delay_between_folders).await; }
+            if !first {
+                tokio::time::sleep(llm.delay_between_folders).await;
+            }
             first = false;
             if let Err(e) = inspect_one(&db, &llm, &roots, &folder, &mut report).await {
                 report.notes.push(format!("{folder}: {e}"));
@@ -442,7 +658,12 @@ impl AssistQueue {
                 s.done += 1;
                 (s.done, s.total)
             };
-            on_progress(AssistProgress { done, total, folder, running: true });
+            on_progress(AssistProgress {
+                done,
+                total,
+                folder,
+                running: true,
+            });
         }
         report
     }
@@ -455,9 +676,16 @@ impl AssistQueue {
 /// sends every file of the show with the season and episode it is currently filed under and asks
 /// for the breakdown as a whole, which is the only way a model can move an episode between
 /// seasons or say two files are the same episode.
-pub async fn inspect_show(db: Arc<Db>, llm: Arc<Llm>, queue: Arc<AssistQueue>, show_id: i64) -> Result<InspectReport> {
+pub async fn inspect_show(
+    db: Arc<Db>,
+    llm: Arc<Llm>,
+    queue: Arc<AssistQueue>,
+    show_id: i64,
+) -> Result<InspectReport> {
     let Some(_guard) = queue.try_start() else {
-        return Err(AppError::Network("AI assist is already running; try again when it finishes".into()));
+        return Err(AppError::Network(
+            "AI assist is already running; try again when it finishes".into(),
+        ));
     };
     let episodes = db.episodes_of_show(show_id)?;
     if episodes.is_empty() {
@@ -471,7 +699,12 @@ pub async fn inspect_show(db: Arc<Db>, llm: Arc<Llm>, queue: Arc<AssistQueue>, s
     // survives a rescan and the new row carries no provider id for the merge pass to fold.
     let show = db.get_show(show_id)?;
     let (parsed, display) = (show.parsed_title, show.display_title);
-    let roots: Vec<String> = db.list_roots().unwrap_or_default().into_iter().map(|r| r.path).collect();
+    let roots: Vec<String> = db
+        .list_roots()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| r.path)
+        .collect();
 
     // Identify a file by its path below the library root, not its basename. Every rip names its
     // first episode "- 01.mkv", so a basename is ambiguous exactly where this feature is aimed -
@@ -482,7 +715,10 @@ pub async fn inspect_show(db: Arc<Db>, llm: Arc<Llm>, queue: Arc<AssistQueue>, s
         .collect();
     let files: Vec<FileGuess> = named
         .iter()
-        .map(|(name, _, season, number)| FileGuess { name: name.clone(), guess: format!("currently S{season}E{number}") })
+        .map(|(name, _, season, number)| FileGuess {
+            name: name.clone(),
+            guess: format!("currently S{season}E{number}"),
+        })
         .collect();
 
     let mut report = InspectReport::default();
@@ -498,14 +734,22 @@ pub async fn inspect_show(db: Arc<Db>, llm: Arc<Llm>, queue: Arc<AssistQueue>, s
             files.len()
         ));
     }
-    let by_name: BTreeMap<&str, (&String, u32, u32)> =
-        named.iter().map(|(name, path, s, n)| (name.as_str(), (*path, *s, *n))).collect();
+    let by_name: BTreeMap<&str, (&String, u32, u32)> = named
+        .iter()
+        .map(|(name, path, s, n)| (name.as_str(), (*path, *s, *n)))
+        .collect();
     // A model that answers with the bare file name is still understood, but only where that name
     // belongs to exactly one file; where it repeats, there is no way to tell which was meant.
     let mut by_base: BTreeMap<&str, Option<&str>> = BTreeMap::new();
     for (name, _, _, _) in &named {
-        let base = Path::new(name.as_str()).file_name().and_then(|s| s.to_str()).unwrap_or(name);
-        by_base.entry(base).and_modify(|e| *e = None).or_insert(Some(name.as_str()));
+        let base = Path::new(name.as_str())
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(name);
+        by_base
+            .entry(base)
+            .and_modify(|e| *e = None)
+            .or_insert(Some(name.as_str()));
     }
 
     for d in &inspection.files {
@@ -514,15 +758,34 @@ pub async fn inspect_show(db: Arc<Db>, llm: Arc<Llm>, queue: Arc<AssistQueue>, s
         // branches, which is what the per-file note below reports.
         let Some((key, path, cur_season, cur_number)) = by_name
             .get_key_value(d.name.as_str())
-            .or_else(|| by_base.get(d.name.as_str()).copied().flatten().and_then(|n| by_name.get_key_value(n)))
+            .or_else(|| {
+                by_base
+                    .get(d.name.as_str())
+                    .copied()
+                    .flatten()
+                    .and_then(|n| by_name.get_key_value(n))
+            })
             .map(|(k, v)| (*k, v.0, v.1, v.2))
-        else { continue };
+        else {
+            continue;
+        };
         let from = format!("{display} S{cur_season}E{cur_number}");
 
         // One file failing must not abandon the rest, nor throw away the record of what already
         // moved: the writes above it are committed and the report is the only account of them.
         let fallback = inspection.season_title.as_deref();
-        if let Err(e) = apply_decision(&db, d, path, &parsed, &display, fallback, cur_season, cur_number, from, &mut report) {
+        if let Err(e) = apply_decision(
+            &db,
+            d,
+            path,
+            &parsed,
+            &display,
+            fallback,
+            cur_season,
+            cur_number,
+            from,
+            &mut report,
+        ) {
             report.notes.push(format!("{key}: {e}"));
         }
     }
@@ -554,30 +817,71 @@ fn apply_decision(
     report: &mut InspectReport,
 ) -> Result<()> {
     if d.kind == KIND_IGNORE {
-        db.set_override(&ParseOverride { path: path.clone(), title: String::new(), season: 0, number: 0, kind: KIND_IGNORE.into(), source: OVERRIDE_SOURCE.into() })?;
+        db.set_override(&ParseOverride {
+            path: path.clone(),
+            title: String::new(),
+            season: 0,
+            number: 0,
+            kind: KIND_IGNORE.into(),
+            source: OVERRIDE_SOURCE.into(),
+        })?;
         db.delete_episode_by_path(path)?;
         report.ignored += 1;
-        report.changes.push(InspectChange { path: path.clone(), from, to: "ignored".into() });
+        report.changes.push(InspectChange {
+            path: path.clone(),
+            from,
+            to: "ignored".into(),
+        });
         return Ok(());
     }
     let kind = normalize_kind(&d.kind);
-    let answered = d.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_default().trim().to_string();
+    let answered = d
+        .title
+        .clone()
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     // The model was shown the display title, so answering with it means "the same show" - which is
     // the parsed title as far as every write is concerned.
-    let new_title = if answered.is_empty() || answered.eq_ignore_ascii_case(display) || answered.eq_ignore_ascii_case(parsed) {
+    let new_title = if answered.is_empty()
+        || answered.eq_ignore_ascii_case(display)
+        || answered.eq_ignore_ascii_case(parsed)
+    {
         parsed.to_string()
     } else {
         answered
     };
     // No show-level fallback here: `inspection.season` is one number for a whole multi-season
     // show, so using it for a file the model left blank would collapse every season into one.
-    let season = if kind == KIND_SPECIAL { 0 } else { d.season.unwrap_or(cur_season) };
+    let season = if kind == KIND_SPECIAL {
+        0
+    } else {
+        d.season.unwrap_or(cur_season)
+    };
     let number = d.episode.unwrap_or(cur_number);
-    if new_title == parsed && season == cur_season && number == cur_number { return Ok(()); }
-    db.set_override(&ParseOverride { path: path.clone(), title: new_title.clone(), season, number, kind, source: OVERRIDE_SOURCE.into() })?;
-    let season_title = if season == 0 { None } else { d.season_title.as_deref().or(fallback_season_title) };
+    if new_title == parsed && season == cur_season && number == cur_number {
+        return Ok(());
+    }
+    db.set_override(&ParseOverride {
+        path: path.clone(),
+        title: new_title.clone(),
+        season,
+        number,
+        kind,
+        source: OVERRIDE_SOURCE.into(),
+    })?;
+    let season_title = if season == 0 {
+        None
+    } else {
+        d.season_title.as_deref().or(fallback_season_title)
+    };
     db.reassign_episode(path, &new_title, season, number, season_title)?;
-    report.changes.push(InspectChange { path: path.clone(), from, to: format!("{new_title} S{season}E{number}") });
+    report.changes.push(InspectChange {
+        path: path.clone(),
+        from,
+        to: format!("{new_title} S{season}E{number}"),
+    });
     Ok(())
 }
 
@@ -618,16 +922,25 @@ mod tests {
     #[tokio::test]
     async fn models_lists_what_the_provider_offers() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/models"))
+        Mock::given(method("GET"))
+            .and(path("/models"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [
                 {"id": "zeta"}, {"id": "alpha"}, {"id": "alpha"}, {"no_id": true}
             ]})))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
         let llm = Llm::with(server.uri(), Some("k".into()), "m".into());
-        assert_eq!(llm.models().await.unwrap(), vec!["alpha", "zeta"], "sorted and de-duplicated");
+        assert_eq!(
+            llm.models().await.unwrap(),
+            vec!["alpha", "zeta"],
+            "sorted and de-duplicated"
+        );
 
         let bad = MockServer::start().await;
-        Mock::given(method("GET")).respond_with(ResponseTemplate::new(401).set_body_string("nope")).mount(&bad).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("nope"))
+            .mount(&bad)
+            .await;
         let llm = Llm::with(bad.uri(), Some("k".into()), "m".into());
         assert!(matches!(llm.models().await, Err(AppError::Network(_))));
 
@@ -646,11 +959,18 @@ mod tests {
             .and(body_string_contains("Bloom Into You"))
             .respond_with(ResponseTemplate::new(200).set_body_json(reply(content)))
             .expect(1)
-            .mount(&server).await;
+            .mount(&server)
+            .await;
         let llm = Llm::with(server.uri(), Some("k".into()), "m".into());
-        let files = vec![FileGuess { name: "01.mkv".into(), guess: "Yagate S1E1".into() }];
+        let files = vec![FileGuess {
+            name: "01.mkv".into(),
+            guess: "Yagate S1E1".into(),
+        }];
         let known = vec!["Bloom Into You".to_string(), "Frieren".to_string()];
-        let got = llm.inspect_folder_with("Yagate Kimi ni Naru", &files, &known).await.unwrap();
+        let got = llm
+            .inspect_folder_with("Yagate Kimi ni Naru", &files, &known)
+            .await
+            .unwrap();
         // Answering with an existing title is what makes the episodes join that show.
         assert_eq!(got.title, "Bloom Into You");
     }
@@ -663,8 +983,14 @@ mod tests {
         assert_eq!(i.files[0].episode, Some(1));
         let fenced = format!("Sure! Here you go:\n```json\n{plain}\n```\nLet me know.");
         assert_eq!(parse_inspection(&fenced).unwrap(), i);
-        assert!(matches!(parse_inspection("no json here"), Err(AppError::Parse(_))));
-        assert!(matches!(parse_inspection(r#"{"title":"","files":[]}"#), Err(AppError::Parse(_))));
+        assert!(matches!(
+            parse_inspection("no json here"),
+            Err(AppError::Parse(_))
+        ));
+        assert!(matches!(
+            parse_inspection(r#"{"title":"","files":[]}"#),
+            Err(AppError::Parse(_))
+        ));
     }
 
     #[test]
@@ -676,23 +1002,38 @@ mod tests {
         let l = Llm::from_db(&db).unwrap();
         assert!(!l.configured());
         assert_eq!(l.model(), DEFAULT_MODEL);
-        db.set_setting("llm_model", "nemotron-3.5-lightning-free").unwrap();
-        assert_eq!(Llm::from_db(&db).unwrap().model(), "nemotron-3.5-lightning-free");
+        db.set_setting("llm_model", "nemotron-3.5-lightning-free")
+            .unwrap();
+        assert_eq!(
+            Llm::from_db(&db).unwrap().model(),
+            "nemotron-3.5-lightning-free"
+        );
     }
 
     #[tokio::test]
     async fn chat_sends_bearer_and_model_and_maps_errors() {
         let server = MockServer::start().await;
-        Mock::given(method("POST")).and(path("/chat/completions")).and(header("authorization", "Bearer sk-test"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(reply("ok"))).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer sk-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply("ok")))
+            .mount(&server)
+            .await;
         let llm = Llm::with(server.uri(), Some("sk-test".into()), "test-model".into());
         assert_eq!(llm.test().await.unwrap(), "test-model replied: ok");
         let none = Llm::with(server.uri(), None, "test-model".into());
         assert!(matches!(none.test().await, Err(AppError::Network(_))));
         let bad = MockServer::start().await;
-        Mock::given(method("POST")).respond_with(ResponseTemplate::new(429).set_body_string("rate limited")).mount(&bad).await;
-        let llm = Llm::with(bad.uri(), Some("k".into()), "m".into()).with_timing(Duration::from_millis(1), Duration::ZERO);
-        match llm.test().await { Err(AppError::Network(m)) => assert!(m.contains("429") && m.contains("rate limited")), o => panic!("{o:?}") }
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+            .mount(&bad)
+            .await;
+        let llm = Llm::with(bad.uri(), Some("k".into()), "m".into())
+            .with_timing(Duration::from_millis(1), Duration::ZERO);
+        match llm.test().await {
+            Err(AppError::Network(m)) => assert!(m.contains("429") && m.contains("rate limited")),
+            o => panic!("{o:?}"),
+        }
     }
 
     #[tokio::test]
@@ -709,27 +1050,70 @@ mod tests {
         ],"notes":"second season split out"}"#;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(reply(content)))
-            .expect(1)  // one request for the whole show, not one per folder
-            .mount(&server).await;
+            .expect(1) // one request for the whole show, not one per folder
+            .mount(&server)
+            .await;
         let db = Arc::new(Db::open_memory().unwrap());
         db.add_root("/lib").unwrap();
-        let pn = |t: &str, s: u32, e: u32| ParsedName { title: t.into(), season: s, episode: e, release_group: None, resolution: None, crc: None };
-        let rf = |p: &str| RawFile { path: p.into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
-        for (n, e) in [("01.mkv", 1u32), ("s2-01.mkv", 2), ("s2-02.mkv", 3), ("OVA.mkv", 4), ("sample.mkv", 5)] {
-            db.upsert_episode(&pn("Sekirei", 1, e), &rf(&format!("/lib/Sekirei/{n}"))).unwrap();
+        let pn = |t: &str, s: u32, e: u32| ParsedName {
+            title: t.into(),
+            season: s,
+            episode: e,
+            release_group: None,
+            resolution: None,
+            crc: None,
+        };
+        let rf = |p: &str| RawFile {
+            path: p.into(),
+            size: 1,
+            mtime: 1,
+            stem: "".into(),
+            dirs: vec![],
+        };
+        for (n, e) in [
+            ("01.mkv", 1u32),
+            ("s2-01.mkv", 2),
+            ("s2-02.mkv", 3),
+            ("OVA.mkv", 4),
+            ("sample.mkv", 5),
+        ] {
+            db.upsert_episode(&pn("Sekirei", 1, e), &rf(&format!("/lib/Sekirei/{n}")))
+                .unwrap();
         }
         let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
         let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()));
-        let r = inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), id).await.unwrap();
+        let r = inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), id)
+            .await
+            .unwrap();
 
         assert_eq!(r.ignored, 1, "the sample is dropped");
         let d = db.get_show(id).unwrap();
-        let shape: Vec<(u32, usize)> = d.seasons.iter().map(|s| (s.number, s.episodes.len())).collect();
-        assert_eq!(shape, vec![(0, 1), (1, 1), (2, 2)], "specials, season 1, and a season 2 the parser never saw");
+        let shape: Vec<(u32, usize)> = d
+            .seasons
+            .iter()
+            .map(|s| (s.number, s.episodes.len()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![(0, 1), (1, 1), (2, 2)],
+            "specials, season 1, and a season 2 the parser never saw"
+        );
         assert_eq!(r.notes, vec!["second season split out"]);
         // The decisions persist, so a rescan does not undo them.
-        assert_eq!(db.get_override("/lib/Sekirei/s2-01.mkv").unwrap().unwrap().season, 2);
-        assert_eq!(db.get_override("/lib/Sekirei/sample.mkv").unwrap().unwrap().kind, "ignore");
+        assert_eq!(
+            db.get_override("/lib/Sekirei/s2-01.mkv")
+                .unwrap()
+                .unwrap()
+                .season,
+            2
+        );
+        assert_eq!(
+            db.get_override("/lib/Sekirei/sample.mkv")
+                .unwrap()
+                .unwrap()
+                .kind,
+            "ignore"
+        );
     }
 
     #[tokio::test]
@@ -744,29 +1128,73 @@ mod tests {
         ],"notes":""}"#;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(reply(content)))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
         let db = Arc::new(Db::open_memory().unwrap());
         db.add_root("/lib").unwrap();
-        let pn = |t: &str, s: u32, e: u32| ParsedName { title: t.into(), season: s, episode: e, release_group: None, resolution: None, crc: None };
-        let rf = |p: &str| RawFile { path: p.into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
-        db.upsert_episode(&pn("Frieren BD", 1, 1), &rf("/lib/Frieren BD/01.mkv")).unwrap();
-        db.upsert_episode(&pn("Frieren BD", 1, 2), &rf("/lib/Frieren BD/02.mkv")).unwrap();
+        let pn = |t: &str, s: u32, e: u32| ParsedName {
+            title: t.into(),
+            season: s,
+            episode: e,
+            release_group: None,
+            resolution: None,
+            crc: None,
+        };
+        let rf = |p: &str| RawFile {
+            path: p.into(),
+            size: 1,
+            mtime: 1,
+            stem: "".into(),
+            dirs: vec![],
+        };
+        db.upsert_episode(&pn("Frieren BD", 1, 1), &rf("/lib/Frieren BD/01.mkv"))
+            .unwrap();
+        db.upsert_episode(&pn("Frieren BD", 1, 2), &rf("/lib/Frieren BD/02.mkv"))
+            .unwrap();
         let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
         // Matching gives it a canonical title, so display_title != parsed_title from here on.
-        db.set_anilist(id, &MetadataHit { id: 52991, source: "anilist".into(),
-            title_romaji: "Sousou no Frieren".into(), title_english: None, cover_url: None, episodes: None }).unwrap();
+        db.set_anilist(
+            id,
+            &MetadataHit {
+                id: 52991,
+                source: "anilist".into(),
+                title_romaji: "Sousou no Frieren".into(),
+                title_english: None,
+                cover_url: None,
+                episodes: None,
+            },
+        )
+        .unwrap();
         assert_eq!(db.display_title(id).unwrap(), "Sousou no Frieren");
 
         let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()));
-        inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), id).await.unwrap();
+        inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), id)
+            .await
+            .unwrap();
 
         let shows = db.list_shows("", ShowSort::Title).unwrap();
-        assert_eq!(shows.len(), 1, "still one show, not a canonical-titled twin");
+        assert_eq!(
+            shows.len(),
+            1,
+            "still one show, not a canonical-titled twin"
+        );
         assert_eq!(shows[0].id, id);
         let d = db.get_show(id).unwrap();
-        assert_eq!(d.seasons.iter().map(|s| (s.number, s.episodes.len())).collect::<Vec<_>>(), vec![(1, 1), (2, 1)]);
+        assert_eq!(
+            d.seasons
+                .iter()
+                .map(|s| (s.number, s.episodes.len()))
+                .collect::<Vec<_>>(),
+            vec![(1, 1), (2, 1)]
+        );
         // The override that persists the move must carry the identity a scan keys on.
-        assert_eq!(db.get_override("/lib/Frieren BD/02.mkv").unwrap().unwrap().title, "Frieren BD");
+        assert_eq!(
+            db.get_override("/lib/Frieren BD/02.mkv")
+                .unwrap()
+                .unwrap()
+                .title,
+            "Frieren BD"
+        );
     }
 
     #[tokio::test]
@@ -779,26 +1207,53 @@ mod tests {
         ],"notes":""}"#;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(reply(content)))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
         let db = Arc::new(Db::open_memory().unwrap());
         db.add_root("/lib").unwrap();
-        let pn = |t: &str, s: u32, e: u32| ParsedName { title: t.into(), season: s, episode: e, release_group: None, resolution: None, crc: None };
-        let rf = |p: &str| RawFile { path: p.into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
-        db.upsert_episode(&pn("Sekirei", 1, 1), &rf("/lib/Sekirei/S1/01.mkv")).unwrap();
-        db.upsert_episode(&pn("Sekirei", 1, 2), &rf("/lib/Sekirei/S2/01.mkv")).unwrap();
+        let pn = |t: &str, s: u32, e: u32| ParsedName {
+            title: t.into(),
+            season: s,
+            episode: e,
+            release_group: None,
+            resolution: None,
+            crc: None,
+        };
+        let rf = |p: &str| RawFile {
+            path: p.into(),
+            size: 1,
+            mtime: 1,
+            stem: "".into(),
+            dirs: vec![],
+        };
+        db.upsert_episode(&pn("Sekirei", 1, 1), &rf("/lib/Sekirei/S1/01.mkv"))
+            .unwrap();
+        db.upsert_episode(&pn("Sekirei", 1, 2), &rf("/lib/Sekirei/S2/01.mkv"))
+            .unwrap();
         let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
         let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()));
-        inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), id).await.unwrap();
+        inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), id)
+            .await
+            .unwrap();
 
         let d = db.get_show(id).unwrap();
-        let placed: Vec<(u32, String)> = d.seasons.iter()
+        let placed: Vec<(u32, String)> = d
+            .seasons
+            .iter()
             .flat_map(|s| s.episodes.iter().map(move |e| (s.number, e.path.clone())))
             .collect();
-        assert_eq!(placed, vec![
-            (1, "/lib/Sekirei/S1/01.mkv".to_string()),
-            (2, "/lib/Sekirei/S2/01.mkv".to_string()),
-        ], "the season 1 namesake stayed put");
-        assert!(db.get_override("/lib/Sekirei/S1/01.mkv").unwrap().is_none(), "and was never written");
+        assert_eq!(
+            placed,
+            vec![
+                (1, "/lib/Sekirei/S1/01.mkv".to_string()),
+                (2, "/lib/Sekirei/S2/01.mkv".to_string()),
+            ],
+            "the season 1 namesake stayed put"
+        );
+        assert!(
+            db.get_override("/lib/Sekirei/S1/01.mkv").unwrap().is_none(),
+            "and was never written"
+        );
     }
 
     #[tokio::test]
@@ -811,39 +1266,96 @@ mod tests {
         ],"notes":""}"#;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(reply(content)))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
         let db = Arc::new(Db::open_memory().unwrap());
         db.add_root("/lib").unwrap();
-        let pn = |t: &str, s: u32, e: u32| ParsedName { title: t.into(), season: s, episode: e, release_group: None, resolution: None, crc: None };
-        let rf = |p: &str| RawFile { path: p.into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
-        db.upsert_episode(&pn("Sekirei", 2, 5), &rf("/lib/Sekirei/S2/05.mkv")).unwrap();
+        let pn = |t: &str, s: u32, e: u32| ParsedName {
+            title: t.into(),
+            season: s,
+            episode: e,
+            release_group: None,
+            resolution: None,
+            crc: None,
+        };
+        let rf = |p: &str| RawFile {
+            path: p.into(),
+            size: 1,
+            mtime: 1,
+            stem: "".into(),
+            dirs: vec![],
+        };
+        db.upsert_episode(&pn("Sekirei", 2, 5), &rf("/lib/Sekirei/S2/05.mkv"))
+            .unwrap();
         let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
         let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()));
-        let r = inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), id).await.unwrap();
+        let r = inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), id)
+            .await
+            .unwrap();
 
         assert!(r.changes.is_empty(), "nothing was said, so nothing moved");
-        assert_eq!(db.get_show(id).unwrap().seasons.iter().map(|s| s.number).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(
+            db.get_show(id)
+                .unwrap()
+                .seasons
+                .iter()
+                .map(|s| s.number)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
     }
 
     #[tokio::test]
     async fn a_reply_that_is_not_json_changes_nothing_and_frees_the_assist() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(reply("I'm afraid I can't help with that.")))
-            .mount(&server).await;
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(reply("I'm afraid I can't help with that.")),
+            )
+            .mount(&server)
+            .await;
         let db = Arc::new(Db::open_memory().unwrap());
         db.add_root("/lib").unwrap();
-        let pn = |t: &str, s: u32, e: u32| ParsedName { title: t.into(), season: s, episode: e, release_group: None, resolution: None, crc: None };
-        let rf = |p: &str| RawFile { path: p.into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
-        db.upsert_episode(&pn("Sekirei", 1, 1), &rf("/lib/Sekirei/01.mkv")).unwrap();
+        let pn = |t: &str, s: u32, e: u32| ParsedName {
+            title: t.into(),
+            season: s,
+            episode: e,
+            release_group: None,
+            resolution: None,
+            crc: None,
+        };
+        let rf = |p: &str| RawFile {
+            path: p.into(),
+            size: 1,
+            mtime: 1,
+            stem: "".into(),
+            dirs: vec![],
+        };
+        db.upsert_episode(&pn("Sekirei", 1, 1), &rf("/lib/Sekirei/01.mkv"))
+            .unwrap();
         let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
         let queue = Arc::new(AssistQueue::default());
         let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()));
 
-        assert!(inspect_show(db.clone(), llm, queue.clone(), id).await.is_err());
-        assert!(db.get_override("/lib/Sekirei/01.mkv").unwrap().is_none(), "no decision was written");
-        assert_eq!(db.get_show(id).unwrap().seasons[0].episodes.len(), 1, "the episode is still there");
-        assert!(queue.try_start().is_some(), "the failure released the assist lock");
+        assert!(
+            inspect_show(db.clone(), llm, queue.clone(), id)
+                .await
+                .is_err()
+        );
+        assert!(
+            db.get_override("/lib/Sekirei/01.mkv").unwrap().is_none(),
+            "no decision was written"
+        );
+        assert_eq!(
+            db.get_show(id).unwrap().seasons[0].episodes.len(),
+            1,
+            "the episode is still there"
+        );
+        assert!(
+            queue.try_start().is_some(),
+            "the failure released the assist lock"
+        );
     }
 
     #[tokio::test]
@@ -856,22 +1368,50 @@ mod tests {
         ],"notes":""}"#;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(reply(content)))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
         let db = Arc::new(Db::open_memory().unwrap());
         db.add_root("/lib").unwrap();
-        let pn = |t: &str, s: u32, e: u32| ParsedName { title: t.into(), season: s, episode: e, release_group: None, resolution: None, crc: None };
-        let rf = |p: &str| RawFile { path: p.into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
-        db.upsert_episode(&pn("Sekirei", 1, 1), &rf("/lib/Sekirei/01.mkv")).unwrap();
-        db.upsert_episode(&pn("Sekirei", 1, 2), &rf("/lib/Sekirei/02.mkv")).unwrap();
+        let pn = |t: &str, s: u32, e: u32| ParsedName {
+            title: t.into(),
+            season: s,
+            episode: e,
+            release_group: None,
+            resolution: None,
+            crc: None,
+        };
+        let rf = |p: &str| RawFile {
+            path: p.into(),
+            size: 1,
+            mtime: 1,
+            stem: "".into(),
+            dirs: vec![],
+        };
+        db.upsert_episode(&pn("Sekirei", 1, 1), &rf("/lib/Sekirei/01.mkv"))
+            .unwrap();
+        db.upsert_episode(&pn("Sekirei", 1, 2), &rf("/lib/Sekirei/02.mkv"))
+            .unwrap();
         let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
         let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()));
-        let r = inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), id).await.unwrap();
+        let r = inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), id)
+            .await
+            .unwrap();
 
         assert_eq!(r.ignored, 0, "a name that matches no file drops nothing");
         assert_eq!(r.changes.len(), 1);
-        assert!(db.get_override("/lib/Sekirei/01.mkv").unwrap().is_none(), "the unmentioned file is untouched");
-        assert_eq!(db.get_show(id).unwrap().seasons.iter().map(|s| (s.number, s.episodes.len())).collect::<Vec<_>>(),
-            vec![(1, 1), (2, 1)]);
+        assert!(
+            db.get_override("/lib/Sekirei/01.mkv").unwrap().is_none(),
+            "the unmentioned file is untouched"
+        );
+        assert_eq!(
+            db.get_show(id)
+                .unwrap()
+                .seasons
+                .iter()
+                .map(|s| (s.number, s.episodes.len()))
+                .collect::<Vec<_>>(),
+            vec![(1, 1), (2, 1)]
+        );
     }
 
     #[tokio::test]
@@ -889,21 +1429,49 @@ mod tests {
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_json(reply(content)))
             .expect(1)
-            .mount(&server).await;
+            .mount(&server)
+            .await;
         let db = Arc::new(Db::open_memory().unwrap());
         db.add_root("/lib").unwrap();
-        let pn = |t: &str, s: u32, e: u32| ParsedName { title: t.into(), season: s, episode: e, release_group: None, resolution: None, crc: None };
-        let rf = |p: &str| RawFile { path: p.into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
-        for (n, e) in [("01.mkv", 1u32), ("repeat-01.mkv", 2), ("repeat-02.mkv", 3), ("OVA.mkv", 4)] {
-            db.upsert_episode(&pn("Non Non Biyori", 1, e), &rf(&format!("/lib/Non Non Biyori/{n}"))).unwrap();
+        let pn = |t: &str, s: u32, e: u32| ParsedName {
+            title: t.into(),
+            season: s,
+            episode: e,
+            release_group: None,
+            resolution: None,
+            crc: None,
+        };
+        let rf = |p: &str| RawFile {
+            path: p.into(),
+            size: 1,
+            mtime: 1,
+            stem: "".into(),
+            dirs: vec![],
+        };
+        for (n, e) in [
+            ("01.mkv", 1u32),
+            ("repeat-01.mkv", 2),
+            ("repeat-02.mkv", 3),
+            ("OVA.mkv", 4),
+        ] {
+            db.upsert_episode(
+                &pn("Non Non Biyori", 1, e),
+                &rf(&format!("/lib/Non Non Biyori/{n}")),
+            )
+            .unwrap();
         }
         let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
         let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()));
-        inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), id).await.unwrap();
+        inspect_show(db.clone(), llm, Arc::new(AssistQueue::default()), id)
+            .await
+            .unwrap();
 
         let d = db.get_show(id).unwrap();
-        let shape: Vec<(u32, Option<String>, usize)> =
-            d.seasons.iter().map(|s| (s.number, s.title.clone(), s.episodes.len())).collect();
+        let shape: Vec<(u32, Option<String>, usize)> = d
+            .seasons
+            .iter()
+            .map(|s| (s.number, s.title.clone(), s.episodes.len()))
+            .collect();
         assert_eq!(
             shape,
             vec![
@@ -918,47 +1486,102 @@ mod tests {
     #[tokio::test]
     async fn retries_on_429_then_succeeds_and_gives_up_after_max_attempts() {
         let server = MockServer::start().await;
-        Mock::given(method("POST")).respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0")).up_to_n_times(2).mount(&server).await;
-        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(reply("ok"))).mount(&server).await;
-        let llm = Llm::with(server.uri(), Some("k".into()), "m".into()).with_timing(Duration::from_millis(1), Duration::ZERO);
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply("ok")))
+            .mount(&server)
+            .await;
+        let llm = Llm::with(server.uri(), Some("k".into()), "m".into())
+            .with_timing(Duration::from_millis(1), Duration::ZERO);
         assert_eq!(llm.test().await.unwrap(), "m replied: ok");
         assert_eq!(server.received_requests().await.unwrap().len(), 3);
 
         let always = MockServer::start().await;
-        Mock::given(method("POST")).respond_with(ResponseTemplate::new(503)).mount(&always).await;
-        let llm = Llm::with(always.uri(), Some("k".into()), "m".into()).with_timing(Duration::from_millis(1), Duration::ZERO);
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&always)
+            .await;
+        let llm = Llm::with(always.uri(), Some("k".into()), "m".into())
+            .with_timing(Duration::from_millis(1), Duration::ZERO);
         assert!(matches!(llm.test().await, Err(AppError::Network(_))));
-        assert_eq!(always.received_requests().await.unwrap().len(), MAX_ATTEMPTS as usize);
+        assert_eq!(
+            always.received_requests().await.unwrap().len(),
+            MAX_ATTEMPTS as usize
+        );
 
         let auth = MockServer::start().await;
-        Mock::given(method("POST")).respond_with(ResponseTemplate::new(401)).mount(&auth).await;
-        let llm = Llm::with(auth.uri(), Some("k".into()), "m".into()).with_timing(Duration::from_millis(1), Duration::ZERO);
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&auth)
+            .await;
+        let llm = Llm::with(auth.uri(), Some("k".into()), "m".into())
+            .with_timing(Duration::from_millis(1), Duration::ZERO);
         assert!(llm.test().await.is_err());
-        assert_eq!(auth.received_requests().await.unwrap().len(), 1, "401 must not be retried");
+        assert_eq!(
+            auth.received_requests().await.unwrap().len(),
+            1,
+            "401 must not be retried"
+        );
     }
 
     #[tokio::test]
     async fn queue_drains_everything_dedupes_and_reports_progress() {
         let server = MockServer::start().await;
         let content = r#"{"title":"T","season":1,"files":[{"name":"01.mkv","kind":"episode","season":1,"episode":1,"title":null}],"notes":""}"#;
-        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(reply(content))).mount(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply(content)))
+            .mount(&server)
+            .await;
         let db = Arc::new(Db::open_memory().unwrap());
-        let pn = |t: &str| ParsedName { title: t.into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
+        let pn = |t: &str| ParsedName {
+            title: t.into(),
+            season: 1,
+            episode: 1,
+            release_group: None,
+            resolution: None,
+            crc: None,
+        };
         let n = 40;
         for i in 0..n {
-            db.upsert_episode(&pn(&format!("Show{i}")), &RawFile { path: format!("/lib/Show{i}/01.mkv").into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] }).unwrap();
+            db.upsert_episode(
+                &pn(&format!("Show{i}")),
+                &RawFile {
+                    path: format!("/lib/Show{i}/01.mkv").into(),
+                    size: 1,
+                    mtime: 1,
+                    stem: "".into(),
+                    dirs: vec![],
+                },
+            )
+            .unwrap();
         }
         let q = Arc::new(AssistQueue::default());
         let folders: Vec<String> = (0..n).map(|i| format!("/lib/Show{i}")).collect();
         assert_eq!(q.enqueue(folders.clone()), n);
-        assert_eq!(q.enqueue(folders.clone()), 0, "duplicates are not re-queued");
+        assert_eq!(
+            q.enqueue(folders.clone()),
+            0,
+            "duplicates are not re-queued"
+        );
         assert_eq!(q.enqueue(vec!["/lib/nothing-here".to_string()]), 1);
         let guard = q.try_start().expect("first worker starts");
-        assert!(q.try_start().is_none(), "second worker refused while running");
+        assert!(
+            q.try_start().is_none(),
+            "second worker refused while running"
+        );
         let seen = Arc::new(Mutex::new(Vec::new()));
         let s2 = seen.clone();
-        let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()).with_timing(Duration::from_millis(1), Duration::ZERO));
-        let report = q.run(db.clone(), llm, &move |p| s2.lock().unwrap().push(p)).await;
+        let llm = Arc::new(
+            Llm::with(server.uri(), Some("k".into()), "m".into())
+                .with_timing(Duration::from_millis(1), Duration::ZERO),
+        );
+        let report = q
+            .run(db.clone(), llm, &move |p| s2.lock().unwrap().push(p))
+            .await;
         drop(guard);
         assert_eq!(report.folders, n, "every folder inspected, none capped");
         assert_eq!(report.changes.len(), n);
@@ -968,16 +1591,44 @@ mod tests {
         assert_eq!((seen[n].done, seen[n].total), (n + 1, n + 1));
         assert!(!q.is_running());
         assert_eq!(q.progress().total, 0);
-        assert_eq!(db.list_shows("", crate::models::ShowSort::Title).unwrap().len(), 1, "all merged into T");
+        assert_eq!(
+            db.list_shows("", crate::models::ShowSort::Title)
+                .unwrap()
+                .len(),
+            1,
+            "all merged into T"
+        );
     }
 
     #[tokio::test]
     async fn folder_failure_is_noted_not_fatal() {
         let server = MockServer::start().await;
-        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(reply("I cannot help with that."))).mount(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(reply("I cannot help with that.")),
+            )
+            .mount(&server)
+            .await;
         let db = Arc::new(Db::open_memory().unwrap());
-        let pn = ParsedName { title: "X".into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
-        db.upsert_episode(&pn, &RawFile { path: "/lib/X/01.mkv".into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] }).unwrap();
+        let pn = ParsedName {
+            title: "X".into(),
+            season: 1,
+            episode: 1,
+            release_group: None,
+            resolution: None,
+            crc: None,
+        };
+        db.upsert_episode(
+            &pn,
+            &RawFile {
+                path: "/lib/X/01.mkv".into(),
+                size: 1,
+                mtime: 1,
+                stem: "".into(),
+                dirs: vec![],
+            },
+        )
+        .unwrap();
         let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()));
         let q = AssistQueue::default();
         q.enqueue(vec!["/lib/X".to_string()]);
@@ -985,7 +1636,10 @@ mod tests {
         assert_eq!(r.folders, 0);
         assert_eq!(r.notes.len(), 1);
         assert!(r.notes[0].contains("parse"));
-        assert_eq!(db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].display_title, "X");
+        assert_eq!(
+            db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].display_title,
+            "X"
+        );
     }
 
     #[test]
@@ -1000,36 +1654,56 @@ mod tests {
         assert_eq!(i.files.len(), 3);
         assert_eq!(i.files[0].episode, Some(11));
         assert_eq!((i.files[1].season, i.files[1].episode), (Some(0), Some(11)));
-        assert_eq!(i.files[2].episode, None, "a negative number is dropped, not fatal");
+        assert_eq!(
+            i.files[2].episode, None,
+            "a negative number is dropped, not fatal"
+        );
     }
 
     #[test]
     fn rel_to_roots_matches_on_a_path_boundary() {
         let roots = vec!["/lib".to_string()];
         assert_eq!(rel_to_roots(&roots, "/lib/Anime/X"), "Anime/X");
-        assert_eq!(rel_to_roots(&roots, "/library/Anime/X"), "/library/Anime/X", "a sibling root must not be truncated");
+        assert_eq!(
+            rel_to_roots(&roots, "/library/Anime/X"),
+            "/library/Anime/X",
+            "a sibling root must not be truncated"
+        );
         assert_eq!(rel_to_roots(&roots, "/lib"), "/lib");
         let roots = vec!["/lib".to_string(), "/lib/Anime".to_string()];
-        assert_eq!(rel_to_roots(&roots, "/lib/Anime/X"), "X", "the longest matching root wins");
+        assert_eq!(
+            rel_to_roots(&roots, "/lib/Anime/X"),
+            "X",
+            "the longest matching root wins"
+        );
     }
 
     #[tokio::test]
     async fn folders_enqueued_as_the_worker_exits_are_never_stranded() {
         let server = MockServer::start().await;
         let content = r#"{"title":"T","season":1,"files":[],"notes":""}"#;
-        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(reply(content))).mount(&server).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply(content)))
+            .mount(&server)
+            .await;
         let db = Arc::new(Db::open_memory().unwrap());
         let q = Arc::new(AssistQueue::default());
         q.enqueue(vec!["/lib/A".to_string()]);
         let guard = q.try_start().expect("worker starts");
-        let llm = Arc::new(Llm::with(server.uri(), Some("k".into()), "m".into()).with_timing(Duration::from_millis(1), Duration::ZERO));
+        let llm = Arc::new(
+            Llm::with(server.uri(), Some("k".into()), "m".into())
+                .with_timing(Duration::from_millis(1), Duration::ZERO),
+        );
         q.run(db.clone(), llm, &|_| {}).await;
         // run() cleared `running` under the same lock that enqueue takes, so a scan landing now
         // must be able to start a fresh worker rather than adding folders no one will drain.
         assert!(!q.is_running());
         q.enqueue(vec!["/lib/B".to_string()]);
         assert!(q.has_pending());
-        assert!(q.try_start().is_some(), "a later scan must be able to drain the leftovers");
+        assert!(
+            q.try_start().is_some(),
+            "a later scan must be able to drain the leftovers"
+        );
         drop(guard);
     }
 

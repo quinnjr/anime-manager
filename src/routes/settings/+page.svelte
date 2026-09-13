@@ -4,7 +4,7 @@
   import { emit } from '@tauri-apps/api/event';
   import {
     api, onEvent, LLM_PROVIDERS,
-    type Root, type ScanProgress, type ScanSummary, type LibraryStatus
+    type Root, type ScanProgress, type ScanSummary, type LibraryStatus, type DlnaStatus
   } from '$lib/api';
   import { toasts } from '$lib/stores/toasts.svelte';
   import { matching } from '$lib/stores/matching.svelte';
@@ -29,6 +29,13 @@
   let models = $state<string[]>([]);
   let testing = $state(false);
   let loadingModels = $state(false);
+
+  let dlnaRunning = $state(false);
+  let dlnaPort = $state(0);
+  let dlnaName = $state('');
+  let dlnaPortField = $state('28987');
+  let dlnaSaving = $state(false);
+  let dlnaToggling = $state(false);
 
   /** "3 minutes ago", so a scan time reads at a glance. */
   function ago(secs: number): string {
@@ -59,6 +66,13 @@
       autoScanMins = s.auto_scan_interval_mins ?? String(DEFAULT_AUTO_SCAN_MINS);
       llmDelay = s.llm_delay_ms ?? '500';
       provider = LLM_PROVIDERS.find((p) => p.baseUrl === llmBaseUrl)?.id ?? 'custom';
+      dlnaName = s.dlna_name ?? '';
+      dlnaPortField = s.dlna_port ?? '28987';
+      try {
+        const d = await api.dlnaStatus();
+        dlnaRunning = d.running;
+        dlnaPort = d.port;
+      } catch (e) { toasts.error(e); }
     } catch (e) { toasts.error(e); }
   }
 
@@ -70,7 +84,8 @@
       // A background pass also emits scan-progress; without a manual scan to clear it
       // the bar would freeze at its last value, so any finished pass resets it here.
       onEvent('library-changed', () => { if (!scanning) scanProgress = null; loadLibrary(); }),
-      onEvent('show-updated', loadLibrary)
+      onEvent('show-updated', loadLibrary),
+      onEvent<DlnaStatus>('dlna-changed', (d) => { dlnaRunning = d.running; dlnaPort = d.port; })
     ];
     return () => us.forEach((p) => p.then((u) => u()));
   });
@@ -174,6 +189,45 @@
       toasts.push('success', await api.llmTest());
     } catch (e) { toasts.error(e); }
     finally { testing = false; }
+  }
+
+  async function toggleDlna(next: boolean) {
+    if (dlnaToggling) return;
+    dlnaToggling = true;
+    try {
+      await api.dlnaSetEnabled(next);
+      const d = await api.dlnaStatus();
+      dlnaRunning = d.running;
+      dlnaPort = d.port;
+    } catch (e) {
+      toasts.error(e);
+      try {
+        const d = await api.dlnaStatus();
+        dlnaRunning = d.running;
+        dlnaPort = d.port;
+      } catch { /* error already reported; keep last known state */ }
+    }
+    finally { dlnaToggling = false; }
+  }
+
+  async function saveDlna() {
+    const port = Number(dlnaPortField);
+    if (!dlnaName.trim()) { toasts.push('error', 'DLNA name cannot be blank'); return; }
+    if (!Number.isInteger(port) || port < 1 || port > 65535) { toasts.push('error', 'DLNA port must be 1–65535'); return; }
+    dlnaSaving = true;
+    try {
+      await api.dlnaSetOptions(dlnaName.trim(), port);
+      if (dlnaRunning) {
+        // The server bumps upward through port..=port+20 when taken; show the
+        // bound port rather than the requested one.
+        const d = await api.dlnaStatus();
+        dlnaRunning = d.running;
+        dlnaPort = d.port;
+        dlnaPortField = String(d.port);
+      }
+      toasts.push('success', dlnaRunning ? 'DLNA options saved — server restarted' : 'DLNA options saved');
+    } catch (e) { toasts.error(e); }
+    finally { dlnaSaving = false; }
   }
 
   async function undo() {
@@ -290,6 +344,35 @@
         <input bind:value={threshold} class="field mt-1 w-full" />
         <span class="tag mt-1 block">a fraction, so 0.9 means ninety percent</span>
       </label>
+    </div>
+  </section>
+
+  <!-- TV & renderers (DLNA) -->
+  <section class="mb-10">
+    <h2 class="eyebrow mb-3">TV &amp; renderers</h2>
+    <p class="mb-3 max-w-prose text-sm text-muted">
+      Share the library over the local network so a TV, console or phone can browse and play
+      it. Switched off until you enable it; the app keeps the port while it runs.
+    </p>
+    <div class="grid gap-3 sm:grid-cols-2">
+      <label class="block text-sm">
+        <span class="text-muted">Server name</span>
+        <input bind:value={dlnaName} class="field mt-1 w-full" placeholder="Living room Anime" />
+        <span class="tag mt-1 block">what renderers show in their source list</span>
+      </label>
+      <label class="block text-sm">
+        <span class="text-muted">Port</span>
+        <input bind:value={dlnaPortField} inputmode="numeric" class="field mt-1 w-full" />
+        <span class="tag mt-1 block">moves up on its own if the port is taken</span>
+      </label>
+    </div>
+    <div class="mt-3 flex flex-wrap items-center gap-3">
+      <label class="flex items-center gap-2 text-sm">
+        <input type="checkbox" checked={dlnaRunning} disabled={dlnaToggling} onchange={(e) => toggleDlna((e.target as HTMLInputElement).checked)} />
+        <span class="text-muted">Share over DLNA</span>
+      </label>
+      <button class="btn" disabled={dlnaSaving} onclick={saveDlna}>{dlnaSaving ? 'Saving…' : 'Save DLNA options'}</button>
+      <span class="tag">{dlnaRunning ? `on · port ${dlnaPort}` : 'off'}</span>
     </div>
   </section>
 

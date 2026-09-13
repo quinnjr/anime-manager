@@ -136,16 +136,21 @@ impl ShowSort {
     /// The ORDER BY body for this option. Every option falls back to title so the grid never
     /// reshuffles arbitrarily between two shows that tie.
     pub(crate) fn order_by(self, dt: &str) -> String {
-        let episodes_of = "FROM episodes e JOIN seasons se ON e.season_id = se.id WHERE se.show_id = s.id";
+        let episodes_of =
+            "FROM episodes e JOIN seasons se ON e.season_id = se.id WHERE se.show_id = s.id";
         match self {
             Self::Title => format!("{dt} COLLATE NOCASE ASC"),
             Self::Unwatched => format!(
-                "(SELECT COUNT(*) {episodes_of} AND e.status IN ('unplayed','playing')) DESC, {dt} COLLATE NOCASE ASC"),
+                "(SELECT COUNT(*) {episodes_of} AND e.status IN ('unplayed','playing')) DESC, {dt} COLLATE NOCASE ASC"
+            ),
             // NULL sorts lowest in SQLite, so never-played shows land at the end under DESC.
             Self::LastPlayed => format!(
-                "(SELECT MAX(e.last_played_at) {episodes_of}) DESC, {dt} COLLATE NOCASE ASC"),
+                "(SELECT MAX(e.last_played_at) {episodes_of}) DESC, {dt} COLLATE NOCASE ASC"
+            ),
             Self::RecentlyAdded => format!("s.created_at DESC, {dt} COLLATE NOCASE ASC"),
-            Self::RecentlyUpdated => format!("(SELECT MAX(e.mtime) {episodes_of}) DESC, {dt} COLLATE NOCASE ASC"),
+            Self::RecentlyUpdated => {
+                format!("(SELECT MAX(e.mtime) {episodes_of}) DESC, {dt} COLLATE NOCASE ASC")
+            }
         }
     }
 }
@@ -288,4 +293,18 @@ pub struct AssistProgress {
     pub total: usize,
     pub folder: String,
     pub running: bool,
+}
+
+/// What the Settings page shows for the DLNA/UPnP direct-play server, and the
+/// payload of the `dlna-changed` event. Off until the user enables it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DlnaStatus {
+    pub running: bool,
+    pub port: u16,
+    pub clients_seen: u64,
+    /// Degraded-mode note (SSDP discovery down, loopback LOCATION…);
+    /// `None` means healthy. `#[serde(default)]` keeps older payloads
+    /// decoding.
+    #[serde(default)]
+    pub dlna_warning: Option<String>,
 }
