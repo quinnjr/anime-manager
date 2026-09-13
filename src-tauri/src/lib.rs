@@ -64,7 +64,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .manage(commands::AppState { db, player: Arc::new(player::Player::new()), providers: Arc::new(metadata::Providers::new()), matching: Arc::new(llm::AssistQueue::default()), assist: Arc::new(llm::AssistQueue::default()) })
+        .manage(commands::AppState { db, player: Arc::new(player::Player::new()), providers: Arc::new(metadata::Providers::new()), matching: Arc::new(llm::AssistQueue::default()), assist: Arc::new(llm::AssistQueue::default()), dlna: commands::DlnaState::default() })
         .invoke_handler(tauri::generate_handler![
             commands::add_root, commands::remove_root, commands::list_roots, commands::scan,
             commands::list_shows, commands::get_show, commands::set_status,
@@ -73,6 +73,7 @@ pub fn run() {
             commands::preview_rename, commands::apply_rename, commands::undo_rename,
             commands::inspect_show, commands::llm_test, commands::llm_models, commands::assist_progress, commands::clear_ai_decisions, commands::set_show_title,
             commands::match_library, commands::library_status, commands::merge_duplicates,
+            commands::dlna_status, commands::dlna_set_enabled, commands::dlna_set_options,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

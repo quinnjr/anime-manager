@@ -7,6 +7,7 @@ use crate::models::*;
 use crate::player::{self, Player};
 use crate::rename;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
@@ -17,6 +18,156 @@ pub struct AppState {
     /// Guards the background match-and-cover pass so repeated scans cannot stack it.
     pub matching: Arc<AssistQueue>,
     pub assist: Arc<AssistQueue>,
+    /// DLNA/UPnP direct-play server. Off until the user enables it in Settings;
+    /// the single app instance owns the port while running.
+    pub dlna: DlnaState,
+}
+
+/// DLNA/UPnP direct-play server state: atomics so `dlna_status` never blocks.
+#[derive(Default)]
+pub struct DlnaState {
+    pub running: AtomicBool,
+    pub port: AtomicU16,
+    pub clients_seen: AtomicU64,
+    pub stop_tx: tokio::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+}
+
+/// Default DLNA port; enabling bumps upward through port..=port+20.
+pub const DLNA_DEFAULT_PORT: u16 = 28987;
+const DLNA_PORT_TRIES: u16 = 20;
+pub const SETTING_DLNA_NAME: &str = "dlna_name";
+pub const SETTING_DLNA_PORT: &str = "dlna_port";
+pub const SETTING_DLNA_UUID: &str = "dlna_uuid";
+
+/// Best-effort machine name without a new crate: $HOSTNAME, else /etc/hostname.
+fn hostname() -> Option<String> {
+    std::env::var("HOSTNAME")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+        })
+}
+
+pub fn default_dlna_name() -> String {
+    hostname().map(|h| format!("{h} Anime")).unwrap_or_else(|| "Anime".into())
+}
+
+fn dlna_port_setting(db: &Db) -> Result<u16> {
+    Ok(db
+        .get_setting(SETTING_DLNA_PORT)?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DLNA_DEFAULT_PORT))
+}
+
+/// Persistent device id (the UDN renderers remember). Minted once as a v4
+/// uuid and kept, so a restart does not look like a new server.
+fn dlna_uuid(db: &Db) -> Result<String> {
+    if let Some(u) = db.get_setting(SETTING_DLNA_UUID)?
+        && !u.trim().is_empty()
+    {
+        return Ok(u);
+    }
+    let u = format!("uuid:{}", uuid::Uuid::new_v4());
+    db.set_setting(SETTING_DLNA_UUID, &u)?;
+    Ok(u)
+}
+
+fn dlna_snapshot(dlna: &DlnaState) -> DlnaStatus {
+    DlnaStatus {
+        running: dlna.running.load(Ordering::SeqCst),
+        port: dlna.port.load(Ordering::SeqCst),
+        clients_seen: dlna.clients_seen.load(Ordering::SeqCst),
+    }
+}
+
+#[tauri::command]
+pub async fn dlna_status(state: State<'_, AppState>) -> Result<DlnaStatus> {
+    Ok(dlna_snapshot(&state.dlna))
+}
+
+#[tauri::command]
+pub async fn dlna_set_enabled(app: AppHandle, state: State<'_, AppState>, enabled: bool) -> Result<()> {
+    if enabled {
+        start_dlna(&app, &state).await?;
+    } else {
+        stop_dlna(&app, &state).await;
+    }
+    Ok(())
+}
+
+/// Bind the first free port in port..=port+20 and serve until stopped. The
+/// listener is bound here (rather than in `DlnaServer::run`) so the chosen
+/// port is known before the server starts; the server runs on it via `run_on`.
+async fn start_dlna(app: &AppHandle, state: &AppState) -> Result<()> {
+    // The lock serialises concurrent enables so two callers cannot bind two ports.
+    let mut guard = state.dlna.stop_tx.lock().await;
+    if state.dlna.running.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let db = state.db.clone();
+    let name = db
+        .get_setting(SETTING_DLNA_NAME)?
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(default_dlna_name);
+    let want = dlna_port_setting(&db)?;
+    let uuid = dlna_uuid(&db)?;
+    let end = (want as u32 + DLNA_PORT_TRIES as u32).min(u16::MAX as u32) as u16;
+    let mut bound = None;
+    for p in want..=end {
+        match tokio::net::TcpListener::bind(std::net::SocketAddr::from(([0, 0, 0, 0], p))).await {
+            Ok(l) => {
+                bound = Some((l, p));
+                break;
+            }
+            Err(_) => continue,
+        }
+    }
+    let Some((listener, port)) = bound else {
+        return Err(crate::error::AppError::Io(format!("no free DLNA port in {want}..={end}")));
+    };
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    *guard = Some(tx);
+    drop(guard);
+    let server = crate::dlna::DlnaServer { port, name, uuid };
+    state.dlna.port.store(port, Ordering::SeqCst);
+    state.dlna.running.store(true, Ordering::SeqCst);
+    tauri::async_runtime::spawn(async move {
+        let _ = server.run_on(listener, db, rx).await;
+    });
+    let _ = app.emit("dlna-changed", dlna_snapshot(&state.dlna));
+    Ok(())
+}
+
+async fn stop_dlna(app: &AppHandle, state: &AppState) {
+    let tx = state.dlna.stop_tx.lock().await.take();
+    if let Some(tx) = tx {
+        // The server sends the ssdp:byebye itself as its run loop breaks down.
+        let _ = tx.send(true);
+    }
+    state.dlna.running.store(false, Ordering::SeqCst);
+    let _ = app.emit("dlna-changed", dlna_snapshot(&state.dlna));
+}
+
+#[tauri::command]
+pub async fn dlna_set_options(app: AppHandle, state: State<'_, AppState>, name: String, port: u16) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(crate::error::AppError::Parse("DLNA name cannot be blank".into()));
+    }
+    if port == 0 {
+        return Err(crate::error::AppError::Parse("DLNA port must be 1-65535".into()));
+    }
+    state.db.set_setting(SETTING_DLNA_NAME, name.trim())?;
+    state.db.set_setting(SETTING_DLNA_PORT, &port.to_string())?;
+    if state.dlna.running.load(Ordering::SeqCst) {
+        stop_dlna(&app, &state).await;
+        start_dlna(&app, &state).await?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -156,6 +307,8 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String
     m.insert("llm_assist_on_scan".into(), state.db.get_setting("llm_assist_on_scan")?.unwrap_or_else(|| "true".into()));
     if let Some(v) = state.db.get_setting(SETTING_AUTO_SCAN_MINS)? { m.insert(SETTING_AUTO_SCAN_MINS.into(), v); }
     m.insert("llm_delay_ms".into(), state.db.get_setting("llm_delay_ms")?.unwrap_or_else(|| llm::DEFAULT_DELAY_MS.to_string()));
+    m.insert(SETTING_DLNA_NAME.into(), state.db.get_setting(SETTING_DLNA_NAME)?.unwrap_or_else(default_dlna_name));
+    m.insert(SETTING_DLNA_PORT.into(), state.db.get_setting(SETTING_DLNA_PORT)?.unwrap_or_else(|| DLNA_DEFAULT_PORT.to_string()));
     Ok(apply_settings_defaults(m))
 }
 
@@ -287,8 +440,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_scan_default_applies_when_unset_and_keeps_stored_value() {
-        let empty = apply_settings_defaults(HashMap::new());
+    fn auto_scan_default_applies_when_unset_and_keeps_stored_value() {        let empty = apply_settings_defaults(HashMap::new());
         assert_eq!(empty.get(SETTING_AUTO_SCAN_MINS).map(String::as_str), Some(DEFAULT_AUTO_SCAN_MINS));
         let mut stored = HashMap::new();
         stored.insert(SETTING_AUTO_SCAN_MINS.into(), "0".into());
@@ -296,5 +448,34 @@ mod tests {
         let out = apply_settings_defaults(stored);
         assert_eq!(out.get(SETTING_AUTO_SCAN_MINS).map(String::as_str), Some("0"));
         assert_eq!(out.get("mpv_path").map(String::as_str), Some("custom"));
+    }
+
+    #[test]
+    fn dlna_status_defaults_to_stopped() {
+        let s = DlnaStatus::default();
+        assert!(!s.running);
+        assert_eq!(s.port, 0);
+        assert_eq!(s.clients_seen, 0);
+        // A fresh state snapshots to exactly that default: off, nothing bound.
+        let st = DlnaState::default();
+        assert_eq!(dlna_snapshot(&st), DlnaStatus::default());
+    }
+
+    #[test]
+    fn dlna_port_falls_back_to_default() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(dlna_port_setting(&db).unwrap(), DLNA_DEFAULT_PORT);
+        db.set_setting(SETTING_DLNA_PORT, "1234").unwrap();
+        assert_eq!(dlna_port_setting(&db).unwrap(), 1234);
+        db.set_setting(SETTING_DLNA_PORT, "junk").unwrap();
+        assert_eq!(dlna_port_setting(&db).unwrap(), DLNA_DEFAULT_PORT);
+    }
+
+    #[test]
+    fn dlna_uuid_is_minted_once_and_kept() {
+        let db = Db::open_memory().unwrap();
+        let first = dlna_uuid(&db).unwrap();
+        assert!(first.starts_with("uuid:"));
+        assert_eq!(dlna_uuid(&db).unwrap(), first);
     }
 }

@@ -289,3 +289,12 @@ pub struct AssistProgress {
     pub folder: String,
     pub running: bool,
 }
+
+/// What the Settings page shows for the DLNA/UPnP direct-play server, and the
+/// payload of the `dlna-changed` event. Off until the user enables it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DlnaStatus {
+    pub running: bool,
+    pub port: u16,
+    pub clients_seen: u64,
+}
