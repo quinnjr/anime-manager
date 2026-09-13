@@ -94,6 +94,7 @@ pub fn run() {
             commands::inspect_show,
             commands::llm_test,
             commands::llm_models,
+            commands::llm_models_for,
             commands::assist_progress,
             commands::clear_ai_decisions,
             commands::set_show_title,

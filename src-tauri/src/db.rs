@@ -302,6 +302,13 @@ impl Db {
         })
     }
 
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+            Ok(())
+        })
+    }
+
     pub fn played_threshold(&self) -> Result<f64> {
         Ok(self
             .get_setting("played_threshold")?
@@ -1187,6 +1194,14 @@ mod tests {
         db.set_setting("played_threshold", "0.8").unwrap();
         assert_eq!(db.played_threshold().unwrap(), 0.8);
         assert_eq!(db.get_setting("mpv_path").unwrap(), None);
+    }
+
+    #[test]
+    fn deleting_a_setting_really_removes_it() {
+        let db = Db::open_memory().unwrap();
+        db.set_setting("scratch_key", "1").unwrap();
+        db.delete_setting("scratch_key").unwrap();
+        assert!(db.get_setting("scratch_key").unwrap().is_none());
     }
 
     #[test]
