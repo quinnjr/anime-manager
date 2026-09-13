@@ -8,7 +8,10 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use regex::Regex;
 
+use crate::db::Db;
 use crate::error::{AppError, Result};
+use crate::models::EpisodeStatus;
+use serde::Serialize;
 
 /// A single Nyaa search result row.
 pub struct NyaaHit {
@@ -320,6 +323,194 @@ pub fn parse_size(s: &str) -> u64 {
     (value * mult) as u64
 }
 
+/// One strict Nyaa match for a wanted episode.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WantedHit {
+    pub title: String,
+    pub page_url: String,
+    pub size_bytes: u64,
+    pub seeders: u32,
+}
+
+/// A missing episode and its strict matches, best (highest seeders) first.
+/// Empty `hits` means no strict match — rendered as a "no strict match" row,
+/// never silently dropped.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WantedEpisode {
+    pub season: u32,
+    pub number: u32,
+    pub hits: Vec<WantedHit>,
+}
+
+/// An episode file on disk that votes for preferences and baselines wanted
+/// numbers. Season 0 and missing-status rows never reach this struct.
+struct Owned {
+    season: u32,
+    number: u32,
+    group: Option<String>,
+    resolution: Option<String>,
+    size: u64,
+}
+
+/// Episode numbers to hunt, per season: gaps strictly inside the owned range,
+/// plus continuation past the owned max for season 1 only, where a known
+/// total (`shows.total_episodes`) ceilings it. Unmatched and null-total shows
+/// hunt gaps only — never guess unaired numbers.
+fn wanted_numbers(
+    per_season: &std::collections::BTreeMap<u32, Vec<u32>>,
+    total: Option<u32>,
+) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    for (&season, nums) in per_season {
+        if nums.is_empty() {
+            continue;
+        }
+        let mut sorted = nums.clone();
+        sorted.sort_unstable();
+        let (min, max) = (sorted[0], *sorted.last().expect("non-empty"));
+        for n in min..=max {
+            if !sorted.contains(&n) {
+                out.push((season, n));
+            }
+        }
+        if season == 1
+            && let Some(t) = total
+            && t > max
+        {
+            out.extend((max + 1..=t).map(|n| (season, n)));
+        }
+    }
+    out
+}
+
+/// Modal value of one owned-release field, lowercased for case-insensitive
+/// comparison against classifier output. Rows without a value do not vote;
+/// ties break toward the value carried by the earliest owned episode.
+fn modal_by(owned: &[Owned], pick: impl Fn(&Owned) -> Option<&str>) -> Option<String> {
+    let mut counts: std::collections::HashMap<String, (usize, (u32, u32))> =
+        std::collections::HashMap::new();
+    for o in owned {
+        if let Some(v) = pick(o) {
+            let key = v.to_lowercase();
+            if key.is_empty() {
+                continue;
+            }
+            let entry = counts.entry(key).or_insert((0, (o.season, o.number)));
+            entry.0 += 1;
+            if (o.season, o.number) < entry.1 {
+                entry.1 = (o.season, o.number);
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .max_by(|(ka, (ca, ea)), (kb, (cb, eb))| {
+            ca.cmp(cb)
+                .then_with(|| eb.cmp(ea))
+                .then_with(|| kb.cmp(ka))
+        })
+        .map(|(k, _)| k)
+}
+
+fn modal_group(owned: &[Owned]) -> Option<String> {
+    modal_by(owned, |o| o.group.as_deref())
+}
+
+fn modal_resolution(owned: &[Owned]) -> Option<String> {
+    modal_by(owned, |o| o.resolution.as_deref())
+}
+
+/// Median owned size ±30%. Displayed context only, never a filter: strictness
+/// applies to identity (who released it, in what quality), not byte counts.
+fn size_band(sizes: &[u64]) -> Option<(u64, u64)> {
+    if sizes.is_empty() {
+        return None;
+    }
+    let mut sorted = sizes.to_vec();
+    sorted.sort_unstable();
+    let median = sorted[sorted.len() / 2];
+    Some((median * 70 / 100, median * 130 / 100))
+}
+
+/// Hunt a show's missing episodes on Nyaa with strict release matching.
+///
+/// Pure query: writes nothing, emits no events. Errors (network, non-200, RSS
+/// parse) abort loudly — on-demand means surfaced, not swallowed.
+pub async fn find_missing(db: &Db, nyaa: &Nyaa, show_id: i64) -> Result<Vec<WantedEpisode>> {
+    let show = db.get_show(show_id)?;
+
+    let mut owned: Vec<Owned> = Vec::new();
+    let mut per_season: std::collections::BTreeMap<u32, Vec<u32>> =
+        std::collections::BTreeMap::new();
+    for season in &show.seasons {
+        if season.number == 0 {
+            continue;
+        }
+        for ep in &season.episodes {
+            if ep.status == EpisodeStatus::Missing {
+                continue;
+            }
+            owned.push(Owned {
+                season: season.number,
+                number: ep.number,
+                group: ep.release_group.clone(),
+                resolution: ep.resolution.clone(),
+                size: ep.size.max(0) as u64,
+            });
+            per_season.entry(season.number).or_default().push(ep.number);
+        }
+    }
+
+    let total = match show.total_episodes {
+        Some(t) if t > 0 => Some(t as u32),
+        _ => None,
+    };
+    let pref_group = modal_group(&owned);
+    let pref_res = modal_resolution(&owned);
+    // Computed to pin the spec rule; deliberately unused — size never filters.
+    let _size_band = size_band(&owned.iter().map(|o| o.size).collect::<Vec<_>>());
+
+    let mut wanted = Vec::new();
+    for (season, number) in wanted_numbers(&per_season, total) {
+        let query = format!("{} {number}", show.display_title);
+        let mut kept: Vec<WantedHit> = nyaa
+            .search(&query)
+            .await?
+            .into_iter()
+            .filter_map(|h| {
+                // `Some` already guarantees a single episode (no batch/range).
+                let s = classify_title(&h.title)?;
+                if s.episode != number {
+                    return None;
+                }
+                if let Some(ref g) = pref_group
+                    && s.group.as_deref() != Some(g.as_str())
+                {
+                    return None;
+                }
+                if let Some(ref r) = pref_res
+                    && s.resolution.as_deref() != Some(r.as_str())
+                {
+                    return None;
+                }
+                Some(WantedHit {
+                    title: h.title,
+                    page_url: h.page_url,
+                    size_bytes: h.size_bytes,
+                    seeders: h.seeders,
+                })
+            })
+            .collect();
+        kept.sort_by_key(|b| std::cmp::Reverse(b.seeders));
+        wanted.push(WantedEpisode {
+            season,
+            number,
+            hits: kept,
+        });
+    }
+    Ok(wanted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,5 +553,185 @@ mod tests {
         assert_eq!(parse_size("1.4 GiB"), 1_503_238_553);
         assert_eq!(parse_size("700 MiB"), 734_003_200);
         assert_eq!(parse_size("n/a"), 0);
+    }
+
+    // --- Task 3: find_missing orchestration ---
+
+    use crate::db::Db;
+    use crate::models::{EpisodeStatus, MetadataHit, ShowSort};
+    use crate::parser::ParsedName;
+    use crate::scanner::RawFile;
+
+    fn pn(t: &str, s: u32, e: u32, g: Option<&str>, r: Option<&str>) -> ParsedName {
+        ParsedName {
+            title: t.into(),
+            season: s,
+            episode: e,
+            release_group: g.map(str::to_string),
+            resolution: r.map(str::to_string),
+            crc: None,
+        }
+    }
+
+    fn rf(p: &str) -> RawFile {
+        RawFile {
+            path: p.into(),
+            size: 1_400_000_000,
+            mtime: 1,
+            stem: String::new(),
+            dirs: vec![],
+        }
+    }
+
+    fn item_xml(title: &str, id: u32, seeders: u32) -> String {
+        format!("<item><title>{title}</title><link>https://nyaa.si/view/{id}</link><nyaa:size>1.4 GiB</nyaa:size><nyaa:seeders>{seeders}</nyaa:seeders></item>")
+    }
+
+    fn rss_wrap(items: &str) -> String {
+        format!("<?xml version=\"1.0\"?><rss version=\"2.0\" xmlns:nyaa=\"https://nyaa.si/xmlns/nyaa\"><channel>{items}</channel></rss>")
+    }
+
+    async fn mock_q(server: &MockServer, q: &str, items: &str) {
+        Mock::given(method("GET"))
+            .and(query_param("page", "rss"))
+            .and(query_param("q", q))
+            .respond_with(ResponseTemplate::new(200).set_body_string(rss_wrap(items)))
+            .mount(server)
+            .await;
+    }
+
+    fn match_stub(title: &str, episodes: i64) -> MetadataHit {
+        MetadataHit {
+            id: 1,
+            source: "anilist".into(),
+            title_romaji: title.into(),
+            title_english: None,
+            cover_url: None,
+            episodes: Some(episodes),
+        }
+    }
+
+    #[tokio::test]
+    async fn gaps_continuation_and_strict_filter() {
+        let db = Db::open_memory().unwrap();
+        #[allow(clippy::type_complexity)]
+        let seed: &[(u32, u32, &str, Option<&str>, Option<&str>)] = &[
+            (1, 1, "/lib/T/01.mkv", Some("G"), Some("1080p")),
+            (1, 2, "/lib/T/02.mkv", Some("G"), Some("1080p")),
+            (1, 4, "/lib/T/04.mkv", Some("G"), Some("1080p")),
+            (0, 1, "/lib/T/special.mkv", None, None),
+            (2, 1, "/lib/T/S2/01.mkv", Some("G"), Some("1080p")),
+            (2, 3, "/lib/T/S2/03.mkv", Some("G"), Some("1080p")),
+        ];
+        for (s, e, p, g, r) in seed {
+            db.upsert_episode(&pn("T", *s, *e, *g, *r), &rf(p)).unwrap();
+        }
+        let show_id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+        db.set_anilist(show_id, &match_stub("T", 6)).unwrap();
+
+        let server = MockServer::start().await;
+        mock_q(
+            &server,
+            "T 3",
+            &format!(
+                "{}{}{}{}",
+                item_xml("[G] T - 03 [1080p]", 101, 5),
+                item_xml("[Other] T - 03 [1080p]", 102, 50),
+                item_xml("[G] T - 03 [720p]", 103, 50),
+                item_xml("[G] T 03-04 [1080p]", 104, 50),
+            ),
+        )
+        .await;
+        mock_q(&server, "T 5", &item_xml("[G] T - 05", 105, 9)).await;
+        mock_q(
+            &server,
+            "T 6",
+            &format!(
+                "{}{}",
+                item_xml("[G] T - 06 [1080p]", 106, 9),
+                item_xml("[G] T - 06 [1080p][ABCDEF12]", 107, 2),
+            ),
+        )
+        .await;
+        mock_q(&server, "T 2", &item_xml("[G] T - 02 [1080p]", 108, 7)).await;
+
+        let wanted = find_missing(&db, &Nyaa::with(server.uri()), show_id)
+            .await
+            .unwrap();
+
+        let nums: Vec<(u32, u32)> = wanted.iter().map(|w| (w.season, w.number)).collect();
+        assert_eq!(nums, vec![(1, 3), (1, 5), (1, 6), (2, 2)]);
+        assert_eq!(wanted[0].hits.len(), 1, "group/res/range rejects leave one E3 hit");
+        assert_eq!(wanted[0].hits[0].seeders, 5);
+        assert!(
+            wanted[1].hits.is_empty(),
+            "untagged resolution must not match a 1080p preference"
+        );
+        assert_eq!(wanted[2].hits.len(), 2);
+        assert_eq!(wanted[2].hits[0].seeders, 9, "best first");
+        assert_eq!(wanted[2].hits[1].seeders, 2);
+        assert_eq!(wanted[3].hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unmatched_show_hunts_gaps_only() {
+        let db = Db::open_memory().unwrap();
+        for (e, p) in [
+            (1u32, "/lib/U/01.mkv"),
+            (2, "/lib/U/02.mkv"),
+            (3, "/lib/U/03.mkv"),
+        ] {
+            db.upsert_episode(&pn("U", 1, e, Some("G"), Some("1080p")), &rf(p))
+                .unwrap();
+        }
+        let show_id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+        // E2 left the disk: it must neither vote nor baseline.
+        let ep2 = db
+            .get_show(show_id)
+            .unwrap()
+            .seasons[0]
+            .episodes
+            .iter()
+            .find(|e| e.number == 2)
+            .unwrap()
+            .id;
+        db.set_status(ep2, EpisodeStatus::Missing).unwrap();
+
+        let server = MockServer::start().await;
+        mock_q(&server, "U 2", &item_xml("[G] U - 02 [1080p]", 201, 4)).await;
+
+        let wanted = find_missing(&db, &Nyaa::with(server.uri()), show_id)
+            .await
+            .unwrap();
+        assert_eq!(wanted.len(), 1, "gaps only, nothing past max without a total");
+        assert_eq!((wanted[0].season, wanted[0].number), (1, 2));
+        assert_eq!(wanted[0].hits.len(), 1);
+    }
+
+    #[test]
+    fn group_tie_breaks_to_earliest_episode() {
+        let owned = vec![
+            Owned {
+                season: 1,
+                number: 1,
+                group: Some("A".into()),
+                resolution: None,
+                size: 1,
+            },
+            Owned {
+                season: 1,
+                number: 2,
+                group: Some("B".into()),
+                resolution: None,
+                size: 1,
+            },
+        ];
+        assert_eq!(modal_group(&owned).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn size_band_is_median_plus_minus_thirty_percent() {
+        assert_eq!(size_band(&[100, 200, 300]), Some((140, 260)));
+        assert_eq!(size_band(&[]), None);
     }
 }
