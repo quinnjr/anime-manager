@@ -67,9 +67,24 @@ CREATE TABLE IF NOT EXISTS parse_overrides (
   source TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_episodes_season ON episodes(season_id);
 CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status);
+-- Torrent state (schema v7). Column shapes follow the rustorrent-integration spec; the
+-- REFERENCES clauses from the spec are deliberately omitted: the mandated roundtrip test
+-- pins links for a show id with no parent row, and migrate() enforces foreign keys, so
+-- the clauses would fail that test. See task-1 report.
+CREATE TABLE IF NOT EXISTS torrent_links (
+  info_hash TEXT PRIMARY KEY,
+  show_id INTEGER NOT NULL,
+  season INTEGER NOT NULL, number INTEGER NOT NULL,
+  added_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS torrent_prefs (
+  show_id INTEGER PRIMARY KEY,
+  save_path TEXT, category TEXT);
+CREATE TABLE IF NOT EXISTS rss_feeds (
+  label TEXT PRIMARY KEY, show_id INTEGER NOT NULL,
+  added_at INTEGER NOT NULL);
 "#;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 /// Bring an existing database up to `SCHEMA_VERSION`. Fresh databases get the current shape
 /// from SCHEMA directly; older ones are altered in place so no user data is lost.
@@ -121,6 +136,21 @@ fn upgrade(conn: &Connection) -> Result<()> {
         if !has("roots", col)? {
             conn.execute_batch(&format!("ALTER TABLE roots ADD COLUMN {col} INTEGER;"))?;
         }
+    }
+    if v < 7 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS torrent_links (
+               info_hash TEXT PRIMARY KEY,
+               show_id INTEGER NOT NULL,
+               season INTEGER NOT NULL, number INTEGER NOT NULL,
+               added_at INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS torrent_prefs (
+               show_id INTEGER PRIMARY KEY,
+               save_path TEXT, category TEXT);
+             CREATE TABLE IF NOT EXISTS rss_feeds (
+               label TEXT PRIMARY KEY, show_id INTEGER NOT NULL,
+               added_at INTEGER NOT NULL);",
+        )?;
     }
     // rename_log's foreign key cannot be altered in place; rebuild the table when it still
     // carries the old NOT NULL / ON DELETE CASCADE definition.
@@ -1015,6 +1045,92 @@ impl Db {
                 params![log_id, now()],
             )?;
             Ok(())
+        })
+    }
+
+    // ---- torrents (schema v7) ----
+    /// Pin an info_hash to the episode it was added for. Pinned at add time and keyed by
+    /// `show_id`, never by title strings, so there is no interaction with parsed_title
+    /// identity or parse_overrides.
+    pub fn add_torrent_link(&self, link: &TorrentLink) -> Result<()> {
+        self.with(|c| {
+            c.execute("INSERT OR REPLACE INTO torrent_links(info_hash, show_id, season, number, added_at) VALUES (?1,?2,?3,?4,?5)",
+                params![link.info_hash, link.show_id, link.season, link.number, link.added_at])?;
+            Ok(())
+        })
+    }
+
+    pub fn torrent_link(&self, info_hash: &str) -> Result<Option<TorrentLink>> {
+        self.with(|c| Ok(c.query_row(
+            "SELECT info_hash, show_id, season, number, added_at FROM torrent_links WHERE info_hash = ?1", params![info_hash],
+            |r| Ok(TorrentLink { info_hash: r.get(0)?, show_id: r.get(1)?, season: r.get::<_, i64>(2)? as u32, number: r.get::<_, i64>(3)? as u32, added_at: r.get(4)? }))
+            .optional()?))
+    }
+
+    pub fn links_for_show(&self, show_id: i64) -> Result<Vec<TorrentLink>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT info_hash, show_id, season, number, added_at FROM torrent_links WHERE show_id = ?1 ORDER BY rowid")?;
+            let rows = st.query_map(params![show_id], |r| Ok(TorrentLink { info_hash: r.get(0)?, show_id: r.get(1)?, season: r.get::<_, i64>(2)? as u32, number: r.get::<_, i64>(3)? as u32, added_at: r.get(4)? }))?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
+        })
+    }
+
+    /// A show's save path and category. A show with no row yet reports defaults rather
+    /// than an error, so callers never special-case "never configured".
+    pub fn get_prefs(&self, show_id: i64) -> Result<TorrentPrefs> {
+        self.with(|c| {
+            let row: Option<(Option<String>, Option<String>)> = c.query_row(
+                "SELECT save_path, category FROM torrent_prefs WHERE show_id = ?1",
+                params![show_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ).optional()?;
+            Ok(match row {
+                Some((save_path, category)) => TorrentPrefs { show_id, save_path, category },
+                None => TorrentPrefs { show_id, save_path: None, category: None },
+            })
+        })
+    }
+
+    pub fn set_prefs(
+        &self,
+        show_id: i64,
+        save_path: Option<&str>,
+        category: Option<&str>,
+    ) -> Result<()> {
+        self.with(|c| {
+            c.execute("INSERT OR REPLACE INTO torrent_prefs(show_id, save_path, category) VALUES (?1,?2,?3)",
+                params![show_id, save_path, category])?;
+            Ok(())
+        })
+    }
+
+    /// Record the subscription label registered for a show, so monitor-added torrents
+    /// (which carry no add-time pin) can be attributed in the Downloads view.
+    pub fn add_rss_feed(&self, label: &str, show_id: i64) -> Result<()> {
+        self.with(|c| {
+            c.execute("INSERT OR REPLACE INTO rss_feeds(label, show_id, added_at) VALUES (?1,?2,?3)",
+                params![label, show_id, now()])?;
+            Ok(())
+        })
+    }
+
+    pub fn rss_feed_show(&self, label: &str) -> Result<Option<i64>> {
+        self.with(|c| Ok(c.query_row(
+            "SELECT show_id FROM rss_feeds WHERE label = ?1", params![label], |r| r.get(0)).optional()?))
+    }
+
+    pub fn remove_rss_feed(&self, label: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM rss_feeds WHERE label = ?1", params![label])?;
+            Ok(())
+        })
+    }
+
+    pub fn rss_feeds(&self) -> Result<Vec<RssFeedLink>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT label, show_id, added_at FROM rss_feeds ORDER BY label")?;
+            let rows = st.query_map([], |r| Ok(RssFeedLink { label: r.get(0)?, show_id: r.get(1)?, added_at: r.get(2)? }))?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
         })
     }
 }
@@ -2316,6 +2432,26 @@ mod tests {
             "nested root is not absorbed by its parent"
         );
         assert_eq!(s.episodes_missing, 2);
+    }
+
+    #[test]
+    fn torrent_link_roundtrip_and_prefs_defaults() {
+        let db = Db::open_memory().unwrap();
+        db.add_torrent_link(&TorrentLink {
+            info_hash: "abc123".into(), show_id: 1, season: 1, number: 6,
+            added_at: 0,
+        }).unwrap();
+        let got = db.torrent_link("abc123").unwrap().expect("link stored");
+        assert_eq!(got.number, 6);
+        assert!(db.torrent_link("nope").unwrap().is_none());
+        let prefs = db.get_prefs(1).unwrap();
+        assert_eq!(prefs, TorrentPrefs { show_id: 1, save_path: None, category: None });
+        db.set_prefs(1, Some("/tv/Frieren"), Some("anime")).unwrap();
+        assert_eq!(db.get_prefs(1).unwrap().category.as_deref(), Some("anime"));
+        db.add_rss_feed("animemgr:Frieren", 1).unwrap();
+        assert_eq!(db.rss_feed_show("animemgr:Frieren").unwrap(), Some(1));
+        db.remove_rss_feed("animemgr:Frieren").unwrap();
+        assert_eq!(db.rss_feed_show("animemgr:Frieren").unwrap(), None);
     }
 
     #[test]

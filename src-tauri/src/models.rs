@@ -308,3 +308,17 @@ pub struct DlnaStatus {
     #[serde(default)]
     pub dlna_warning: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TorrentLink {
+    pub info_hash: String, pub show_id: i64,
+    pub season: u32, pub number: u32, pub added_at: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TorrentPrefs {
+    pub show_id: i64, pub save_path: Option<String>, pub category: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RssFeedLink {
+    pub label: String, pub show_id: i64, pub added_at: i64,
+}
