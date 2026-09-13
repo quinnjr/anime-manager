@@ -28,7 +28,8 @@ pub struct AppState {
 pub struct DlnaState {
     pub running: AtomicBool,
     pub port: AtomicU16,
-    pub clients_seen: AtomicU64,
+    /// Shared with the DlnaServer so renderer traffic is visible in Settings.
+    pub clients_seen: Arc<AtomicU64>,
     pub stop_tx: tokio::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>,
 }
 
@@ -100,6 +101,40 @@ pub async fn dlna_set_enabled(app: AppHandle, state: State<'_, AppState>, enable
     Ok(())
 }
 
+/// First free port in port..=port+20, so enabling and rebinding share one
+/// probe. Separated from spawning so `dlna_set_options` can bind the new
+/// port *before* tearing down the healthy server.
+async fn bind_free_dlna_port(want: u16) -> Result<(tokio::net::TcpListener, u16)> {
+    let end = (want as u32 + DLNA_PORT_TRIES as u32).min(u16::MAX as u32) as u16;
+    for p in want..=end {
+        match tokio::net::TcpListener::bind(std::net::SocketAddr::from(([0, 0, 0, 0], p))).await {
+            Ok(l) => return Ok((l, p)),
+            Err(_) => continue,
+        }
+    }
+    Err(crate::error::AppError::Io(format!(
+        "no free DLNA port in {want}..={end}"
+    )))
+}
+
+/// Serve on an already-bound listener and publish the running status: store
+/// the bound port, mark running, spawn the server task and emit `dlna-changed`.
+fn serve_dlna(
+    app: &AppHandle,
+    state: &AppState,
+    db: Arc<Db>,
+    listener: tokio::net::TcpListener,
+    server: crate::dlna::DlnaServer,
+    rx: tokio::sync::watch::Receiver<bool>,
+) {
+    state.dlna.port.store(server.port, Ordering::SeqCst);
+    state.dlna.running.store(true, Ordering::SeqCst);
+    tauri::async_runtime::spawn(async move {
+        let _ = server.run_on(listener, db, rx).await;
+    });
+    let _ = app.emit("dlna-changed", dlna_snapshot(&state.dlna));
+}
+
 /// Bind the first free port in port..=port+20 and serve until stopped. The
 /// listener is bound here (rather than in `DlnaServer::run`) so the chosen
 /// port is known before the server starts; the server runs on it via `run_on`.
@@ -116,30 +151,17 @@ async fn start_dlna(app: &AppHandle, state: &AppState) -> Result<()> {
         .unwrap_or_else(default_dlna_name);
     let want = dlna_port_setting(&db)?;
     let uuid = dlna_uuid(&db)?;
-    let end = (want as u32 + DLNA_PORT_TRIES as u32).min(u16::MAX as u32) as u16;
-    let mut bound = None;
-    for p in want..=end {
-        match tokio::net::TcpListener::bind(std::net::SocketAddr::from(([0, 0, 0, 0], p))).await {
-            Ok(l) => {
-                bound = Some((l, p));
-                break;
-            }
-            Err(_) => continue,
-        }
-    }
-    let Some((listener, port)) = bound else {
-        return Err(crate::error::AppError::Io(format!("no free DLNA port in {want}..={end}")));
-    };
+    let (listener, port) = bind_free_dlna_port(want).await?;
     let (tx, rx) = tokio::sync::watch::channel(false);
     *guard = Some(tx);
     drop(guard);
-    let server = crate::dlna::DlnaServer { port, name, uuid };
-    state.dlna.port.store(port, Ordering::SeqCst);
-    state.dlna.running.store(true, Ordering::SeqCst);
-    tauri::async_runtime::spawn(async move {
-        let _ = server.run_on(listener, db, rx).await;
-    });
-    let _ = app.emit("dlna-changed", dlna_snapshot(&state.dlna));
+    let server = crate::dlna::DlnaServer {
+        port,
+        name,
+        uuid,
+        clients_seen: state.dlna.clients_seen.clone(),
+    };
+    serve_dlna(app, state, db, listener, server, rx);
     Ok(())
 }
 
@@ -150,6 +172,7 @@ async fn stop_dlna(app: &AppHandle, state: &AppState) {
         let _ = tx.send(true);
     }
     state.dlna.running.store(false, Ordering::SeqCst);
+    state.dlna.port.store(0, Ordering::SeqCst);
     let _ = app.emit("dlna-changed", dlna_snapshot(&state.dlna));
 }
 
@@ -161,12 +184,39 @@ pub async fn dlna_set_options(app: AppHandle, state: State<'_, AppState>, name: 
     if port == 0 {
         return Err(crate::error::AppError::Parse("DLNA port must be 1-65535".into()));
     }
-    state.db.set_setting(SETTING_DLNA_NAME, name.trim())?;
-    state.db.set_setting(SETTING_DLNA_PORT, &port.to_string())?;
-    if state.dlna.running.load(Ordering::SeqCst) {
-        stop_dlna(&app, &state).await;
-        start_dlna(&app, &state).await?;
+    let name = name.trim().to_string();
+    if !state.dlna.running.load(Ordering::SeqCst) {
+        state.db.set_setting(SETTING_DLNA_NAME, &name)?;
+        state.db.set_setting(SETTING_DLNA_PORT, &port.to_string())?;
+        return Ok(());
     }
+    // Bind-first: the new port range is probed while the old server still
+    // runs, so a failed rebind cannot take down a healthy server. On failure
+    // the status is re-emitted unchanged and nothing is persisted or stopped.
+    let uuid = dlna_uuid(&state.db)?;
+    let (listener, bound) = match bind_free_dlna_port(port).await {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = app.emit("dlna-changed", dlna_snapshot(&state.dlna));
+            return Err(e);
+        }
+    };
+    state.db.set_setting(SETTING_DLNA_NAME, &name)?;
+    state.db.set_setting(SETTING_DLNA_PORT, &port.to_string())?;
+    let mut guard = state.dlna.stop_tx.lock().await;
+    if let Some(tx) = guard.take() {
+        let _ = tx.send(true);
+    }
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    *guard = Some(tx);
+    drop(guard);
+    let server = crate::dlna::DlnaServer {
+        port: bound,
+        name,
+        uuid,
+        clients_seen: state.dlna.clients_seen.clone(),
+    };
+    serve_dlna(&app, &state, state.db.clone(), listener, server, rx);
     Ok(())
 }
 
