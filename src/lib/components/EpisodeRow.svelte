@@ -2,6 +2,7 @@
   import { api, type Episode } from '$lib/api';
   import { playback } from '$lib/stores/playback.svelte';
   import { toasts } from '$lib/stores/toasts.svelte';
+  import { revealItemInDir } from '@tauri-apps/plugin-opener';
 
   let { episode, highlighted = false, onRename }: { episode: Episode; highlighted?: boolean; onRename: () => void } = $props();
 
@@ -17,6 +18,7 @@
   const mins = $derived(dur ? Math.round(dur / 60) : null);
 
   async function play() { try { await api.play(episode.id); } catch (e) { toasts.error(e); } }
+  async function reveal() { try { await revealItemInDir(episode.path); } catch (e) { toasts.error(e); } }
   async function toggle() {
     const next = status === 'played' ? 'unplayed' : 'played';
     try { await api.setStatus(episode.id, next); } catch (e) { toasts.error(e); }
@@ -59,6 +61,7 @@
   >
     {status === 'playing' ? 'Playing' : pct > 0 ? 'Resume' : 'Play'}
   </button>
+  <button class="btn whitespace-nowrap" disabled={status === 'missing'} onclick={reveal} title="Show this file in the file manager" aria-label="Show this file in the file manager">Folder</button>
   <button class="btn whitespace-nowrap" onclick={toggle}>
     {status === 'played' ? 'Mark unwatched' : 'Mark watched'}
   </button>
