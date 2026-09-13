@@ -1,6 +1,6 @@
 use crate::db::Db;
 use crate::error::{AppError, Result};
-use crate::models::{TorrentDetail, TorrentInfo};
+use crate::models::{TorrentDetail, TorrentFile, TorrentInfo};
 use serde::{Deserialize, Serialize};
 
 pub const BASE_URL_KEY: &str = "torrent_base_url";
@@ -344,6 +344,111 @@ pub fn feed_label(parsed_title: &str) -> String {
     format!("animemgr:{parsed_title}")
 }
 
+/// Browse for rustorrent servers over mDNS (`_rustorrent._tcp.local.`) and
+/// collect `http://ip:port` base URLs for `timeout_ms`. Any failure — no
+/// daemon, no network, no responders — yields an empty vec, never an Err,
+/// so a disconnected machine simply offers no prefill.
+pub fn discover(timeout_ms: u64) -> Vec<String> {
+    let daemon = match mdns_sd::ServiceDaemon::new() {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let receiver = match daemon.browse("_rustorrent._tcp.local.") {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let mut out = Vec::new();
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match receiver.recv_timeout(deadline - now) {
+            Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
+                let port = info.get_port();
+                for addr in info.get_addresses() {
+                    let host = match addr.to_ip_addr() {
+                        std::net::IpAddr::V4(v4) => v4.to_string(),
+                        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+                    };
+                    out.push(format!("http://{host}:{port}"));
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// True when `episode_path` is one of the torrent's files laid under
+/// `save_path`. Both sides are Strings, so no lossy fallback: an exact
+/// byte-compare after normalising separators and the join slash.
+pub fn episode_in_torrent(
+    save_path: &str,
+    files: &[TorrentFile],
+    episode_path: &str,
+) -> bool {
+    let base = save_path.trim_end_matches('/');
+    files.iter().any(|f| {
+        let rel = f.path.replace('\\', "/");
+        let rel = rel.trim_start_matches('/');
+        format!("{base}/{rel}") == episode_path
+    })
+}
+
+/// Where a new download for `show_id` should land: the first root (in
+/// `list_roots` order) that already holds one of the show's episodes, else
+/// the first readable root. A never-scanned root counts as readable — there
+/// is no evidence it is down — and with no usable root there is nothing
+/// sensible to return, so Err(Parse).
+pub fn default_save_path(db: &Db, show_id: i64) -> Result<String> {
+    let roots = db.list_roots()?;
+    let owned = db.episode_paths_for_show(show_id)?;
+    if let Some(root) = roots.iter().find(|r| {
+        let prefix = format!("{}/", r.path.trim_end_matches('/'));
+        owned.iter().any(|p| p.starts_with(&prefix))
+    }) {
+        return Ok(root.path.clone());
+    }
+    roots
+        .iter()
+        .find(|r| r.last_scan.as_ref().map(|s| s.readable).unwrap_or(true))
+        .map(|r| r.path.clone())
+        .ok_or_else(|| AppError::Parse("no library root to save into".into()))
+}
+
+/// A case-insensitive regex matching the title's words in order, narrowed by
+/// an optional `[Group]` prefix and resolution suffix:
+/// `(?i)\[GROUP\].*word1.*word2.*RES`. Every interpolated piece is
+/// `regex::escape`d, empty clauses are omitted, and the result is validated
+/// with `Regex::new` before return so callers always get a compilable pattern.
+pub fn build_search_regex(
+    title: &str,
+    group: Option<&str>,
+    resolution: Option<&str>,
+) -> Result<String> {
+    let mut re = String::from("(?i)");
+    if let Some(g) = group.filter(|g| !g.is_empty()) {
+        re.push_str(&format!("\\[{}\\].*", regex::escape(g)));
+    }
+    let words: Vec<String> = title
+        .split_whitespace()
+        .map(regex::escape)
+        .collect();
+    re.push_str(&words.join(".*"));
+    if let Some(r) = resolution.filter(|r| !r.is_empty()) {
+        re.push_str(".*");
+        re.push_str(&regex::escape(r));
+    }
+    regex::Regex::new(&re).map_err(|e| AppError::Parse(e.to_string()))?;
+    Ok(re)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,5 +690,92 @@ mod tests {
         assert!(invalidates_test("torrent_password"));
         assert!(!invalidates_test("torrent_delay_ms"));
         assert_eq!(feed_label("Sousou no Frieren"), "animemgr:Sousou no Frieren");
+    }
+
+    use crate::models::ShowSort;
+    use crate::parser::ParsedName;
+    use crate::scanner::RawFile;
+    use std::path::PathBuf;
+
+    #[test]
+    fn helpers() {
+        let files = vec![TorrentFile { index: 0, path: "Frieren/[Group] Frieren - 06 [1080p].mkv".into(), size: 1 }];
+        assert!(episode_in_torrent("/dl", &files, "/dl/Frieren/[Group] Frieren - 06 [1080p].mkv"));
+        assert!(!episode_in_torrent("/dl", &files, "/dl/Other/07.mkv"));
+        let re = build_search_regex("Sousou no Frieren", Some("Gumamish"), Some("1080p")).unwrap();
+        assert!(re.contains(r"\[Gumamish\]") && re.contains("1080p"));
+        let re2 = build_search_regex("A&B (2024)", None, None).unwrap();
+        assert!(!re2.contains('[')); // title metachars escaped, no group clause
+        regex::Regex::new(&re).unwrap(); // always valid
+    }
+
+    fn pn(title: &str, episode: u32) -> ParsedName {
+        ParsedName {
+            title: title.into(),
+            season: 1,
+            episode,
+            release_group: None,
+            resolution: None,
+            crc: None,
+        }
+    }
+
+    fn rf(path: &str, n: u64) -> RawFile {
+        RawFile {
+            path: PathBuf::from(path),
+            size: n,
+            mtime: n as i64,
+            stem: String::new(),
+            dirs: vec![],
+        }
+    }
+
+    fn show_id(db: &Db, title: &str) -> i64 {
+        db.list_shows("", ShowSort::Title)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.display_title == title)
+            .unwrap_or_else(|| panic!("no show {title}"))
+            .id
+    }
+
+    #[test]
+    fn default_save_path_prefers_first_root_holding_the_show() {
+        let db = Db::open_memory().unwrap();
+        db.add_root("/r1").unwrap();
+        db.add_root("/r2").unwrap();
+        // Episodes under both roots: list_roots order wins, so /r1.
+        db.upsert_episode(&pn("Owned", 1), &rf("/r2/Owned/01.mkv", 11)).unwrap();
+        db.upsert_episode(&pn("Owned", 2), &rf("/r1/Owned/02.mkv", 12)).unwrap();
+        assert_eq!(default_save_path(&db, show_id(&db, "Owned")).unwrap(), "/r1");
+        // A show with no episode under any root falls back to the first readable root.
+        db.upsert_episode(&pn("Stray", 1), &rf("/elsewhere/01.mkv", 13)).unwrap();
+        assert_eq!(default_save_path(&db, show_id(&db, "Stray")).unwrap(), "/r1");
+        // An unreadable root is skipped by the fallback.
+        let roots = db.list_roots().unwrap();
+        db.record_root_scan(
+            roots[0].id,
+            &crate::models::RootScan {
+                at: 0,
+                files_seen: 0,
+                added: 0,
+                updated: 0,
+                missing: 0,
+                errors: 1,
+                readable: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(default_save_path(&db, show_id(&db, "Stray")).unwrap(), "/r2");
+        // No roots at all is an error, not a guess.
+        let empty = Db::open_memory().unwrap();
+        assert!(default_save_path(&empty, 1).is_err());
+    }
+
+    #[test]
+    fn discover_never_fails_and_returns_urls_only() {
+        // No network assertions: a short browse just exercises the timeout path.
+        let found = discover(25);
+        assert!(found.iter().all(|u| u.starts_with("http://")));
     }
 }
