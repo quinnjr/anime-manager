@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { page } from '$app/state';
   import { goto } from '$app/navigation';
-  import { api, onEvent, type ShowDetail, type RenameTarget, type RssFeedView, type TorrentControlOp, type TorrentEntry, type TorrentPrefs, type WantedEpisode } from '$lib/api';
+  import { api, onEvent, type ShowDetail, type RenameTarget, type RssFeedView, type RssSubscribeResult, type TorrentControlOp, type TorrentEntry, type TorrentPrefs, type WantedEpisode, type WantedHit } from '$lib/api';
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { toasts } from '$lib/stores/toasts.svelte';
   import { playback } from '$lib/stores/playback.svelte';
@@ -14,10 +14,6 @@
   import { formatSize, summariseWanted } from '$lib/nyaaDisplay';
   import { sendButtonState, torrentBadge } from '$lib/torrentDisplay';
   import SeasonList from '$lib/components/SeasonList.svelte';
-
-  // The backend has carried torrent_url/info_hash on every WantedHit since the Nyaa
-  // handoff; api.ts types predate that, so the cast below recovers the runtime shape.
-  type Hit = { title: string; page_url: string; size_bytes: number; seeders: number; torrent_url?: string | null; info_hash?: string | null };
 
   const id = $derived(Number(page.params.id));
   let show = $state<ShowDetail | null>(null);
@@ -41,6 +37,9 @@
   let busyHash = $state<string | null>(null);
   let removeArmed = $state<string | null>(null);
   let followBusy = $state(false);
+  let followResult = $state<RssSubscribeResult | null>(null);
+  let torrentsError = $state<string | null>(null);
+  let feedsError = $state<string | null>(null);
   let rootPaths = $state<string[]>([]);
 
   // The feed this show was subscribed under, if any — the subscribed state of Follow.
@@ -64,11 +63,19 @@
     return torrents.find((t) => t.linked?.show_id === id && t.linked.season === season && t.linked.number === number);
   }
 
-  // Background refresh: silent while disarmed (list/rss refuse until the Test
-  // connection in Settings arms them), loud only for the actions below.
+  // Background refresh: failures render in the missing-episodes section (Settings
+  // link + retry) rather than failing silently; only user-initiated actions toast.
+  function errMessage(e: unknown): string {
+    return e && typeof e === 'object' && 'message' in e ? String((e as { message: unknown }).message) : String(e);
+  }
+  function isDisarmed(msg: string): boolean {
+    return msg.includes('not connected');
+  }
   async function loadTorrentState() {
-    try { torrents = await api.torrentList(); } catch { /* disarmed or offline: rows still offer Send */ }
-    try { feeds = await api.torrentRssList(); } catch { feeds = []; }
+    try { torrents = await api.torrentList(); torrentsError = null; }
+    catch (e) { torrentsError = errMessage(e); }
+    try { feeds = await api.torrentRssList(); feedsError = null; }
+    catch (e) { feeds = []; feedsError = errMessage(e); }
   }
 
   async function loadPrefs() {
@@ -92,7 +99,7 @@
     } catch (e) { toasts.error(e); } finally { prefsSaving = false; }
   }
 
-  async function send(season: number, number: number, hit: Hit) {
+  async function send(season: number, number: number, hit: WantedHit) {
     if (!show || !hit.torrent_url) return;
     const key = `${season}:${number}`;
     sendingKey = key;
@@ -121,6 +128,7 @@
     followBusy = true;
     try {
       const r = await api.torrentRssSubscribe(show.id);
+      followResult = r;
       toasts.push('success', `Registered ${r.label} — the rustorrent RSS monitor picks this up on its next poll (monitor must be running).`);
       await loadTorrentState();
     } catch (e) { toasts.error(e); } finally { followBusy = false; }
@@ -260,6 +268,9 @@
     torrents = [];
     prefs = null;
     removeArmed = null;
+    followResult = null;
+    torrentsError = null;
+    feedsError = null;
     searchGeneration++; // invalidate any in-flight search for the previous show
     load();
     loadPrefs();
@@ -358,6 +369,18 @@
         {#if outsideRoots}
           <p class="tag text-[var(--color-alarm)]">Save path is outside your library roots — completed files will not scan in until moved.</p>
         {/if}
+        {#if torrentsError || feedsError}
+          {@const listMsg = torrentsError ?? feedsError ?? ''}
+          <div class="flex flex-wrap items-center gap-2">
+            {#if isDisarmed(listMsg)}
+              <span class="tag">Torrents not connected — open Settings to set the base URL and run Test connection.</span>
+            {:else}
+              <span class="tag text-[var(--color-alarm)]">Torrent list failed: {listMsg}</span>
+            {/if}
+            <a class="btn shrink-0" href="/settings">Settings</a>
+            <button class="btn shrink-0" onclick={() => void loadTorrentState()}>Retry</button>
+          </div>
+        {/if}
         <div class="flex flex-wrap items-center gap-2">
           {#if subscribedFeed}
             <span class="tag-chip shrink-0">Following ✓</span>
@@ -372,13 +395,23 @@
             </button>
           {/if}
         </div>
+        {#if followResult && (followResult.resolved_path || followResult.outside_roots)}
+          <div class="flex flex-wrap items-center gap-2">
+            {#if followResult.resolved_path}
+              <span class="tag font-mono text-xs">Saves to {followResult.resolved_path}</span>
+            {/if}
+            {#if followResult.outside_roots}
+              <span class="tag text-[var(--color-alarm)]">That folder is outside your library roots — completed files will not scan in until moved.</span>
+            {/if}
+          </div>
+        {/if}
       </div>
       {#if wanted.length === 0}
         <p class="tag">No missing episodes — the owned range has no gaps.</p>
       {:else}
         <ul class="flex flex-col gap-2">
           {#each wanted as w (w.season + ':' + w.number)}
-            {@const best = w.hits[0] as Hit | undefined}
+            {@const best = w.hits[0] as WantedHit | undefined}
             {@const t = best ? torrentFor(w.season, w.number, best.info_hash) : undefined}
             {@const st = best ? sendButtonState({ torrent_url: best.torrent_url ?? null, linked: t?.linked ?? null, progress: t?.progress ?? null }) : 'unavailable'}
             {@const key = w.season + ':' + w.number}

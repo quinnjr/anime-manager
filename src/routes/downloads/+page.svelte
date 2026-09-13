@@ -8,15 +8,26 @@
   let torrents = $state<TorrentEntry[]>([]);
   let loading = $state(false);
   let loaded = $state(false);
+  let loadError = $state<string | null>(null);
   let busyHash = $state<string | null>(null);
   let removeArmed = $state<string | null>(null);
 
-  async function load() {
+  function errMessage(e: unknown): string {
+    return e && typeof e === 'object' && 'message' in e ? String((e as { message: unknown }).message) : String(e);
+  }
+
+  // Background loads render their failure (Settings link + retry) rather than
+  // failing silently; only a manual Refresh additionally toasts.
+  async function load(manual = false) {
     loading = true;
     try {
       torrents = await api.torrentList();
       loaded = true;
-    } catch (e) { toasts.error(e); } finally { loading = false; }
+      loadError = null;
+    } catch (e) {
+      loadError = errMessage(e);
+      if (manual) toasts.error(e);
+    } finally { loading = false; }
   }
 
   async function control(t: TorrentEntry, op: TorrentControlOp) {
@@ -24,7 +35,7 @@
     try {
       await api.torrentControl(t.info_hash, op);
       removeArmed = null;
-      await load();
+      await load(true);
     } catch (e) { toasts.error(e); } finally { if (busyHash === t.info_hash) busyHash = null; }
   }
 
@@ -49,20 +60,30 @@
     load();
     // Phase 1 has no timers: mount, manual refresh, and server-pushed change events.
     let unlisten: (() => void) | undefined;
-    onEvent('torrent-changed', load).then((u) => { unlisten = u; });
+    onEvent('torrent-changed', () => void load()).then((u) => { unlisten = u; });
     return () => unlisten?.();
   });
 </script>
 
 <div class="eyebrow mb-2">Downloads</div>
 <div class="mb-4 flex flex-wrap items-center gap-2">
-  <button class="btn" disabled={loading} onclick={load}>{loading ? 'Refreshing…' : 'Refresh'}</button>
+  <button class="btn" disabled={loading} onclick={() => void load(true)}>{loading ? 'Refreshing…' : 'Refresh'}</button>
   {#if loaded}
     <span class="tag">{torrents.length} torrent{torrents.length === 1 ? '' : 's'}</span>
   {/if}
 </div>
 
-{#if !loaded && !loading}
+{#if loadError && torrents.length === 0}
+  <div class="flex flex-wrap items-center gap-2">
+    {#if loadError.includes('not connected')}
+      <span class="tag">Torrents not connected — open Settings to set the base URL and run Test connection.</span>
+    {:else}
+      <span class="tag text-[var(--color-alarm)]">Torrent list failed: {loadError}</span>
+    {/if}
+    <a class="btn shrink-0" href="/settings">Settings</a>
+    <button class="btn shrink-0" disabled={loading} onclick={() => void load(true)}>Retry</button>
+  </div>
+{:else if !loaded && !loading}
   <p class="tag">Reading torrents…</p>
 {:else if torrents.length === 0 && loaded}
   <p class="tag">Nothing downloading — send a missing episode from its show page.</p>

@@ -381,6 +381,23 @@ impl TorrentClient {
         Self::check_ok(resp, "rss remove").await
     }
 
+    /// Server-truth download layout for subscribe placement (`GET /api/config`).
+    /// Failures are the caller's to tolerate: subscribe proceeds with no placement.
+    pub async fn server_config(&self) -> Result<ServerConfig> {
+        let url = format!("{}/api/config", self.base_url);
+        let resp = self.send_authed(|| self.http.get(&url)).await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = snippet(resp).await;
+            return Err(AppError::Network(format!(
+                "rustorrent config returned {status}: {body}"
+            )));
+        }
+        resp.json()
+            .await
+            .map_err(|e| AppError::Parse(e.to_string()))
+    }
+
     /// Resolve each torrent to the episode it belongs to, for the Downloads
     /// view. The add-time pin (`torrent_links`) wins; anything without a pin
     /// is backfilled by joining the torrent's `save_path` + `files[]`
@@ -469,6 +486,69 @@ impl TorrentClient {
         }
         Ok(bytes.to_vec())
     }
+}
+
+/// Minimal mirror of rustorrent's `AppConfig` for `GET /api/config`: only the
+/// keys subscribe-location needs. Everything else the server sends is ignored,
+/// and everything here defaults, so an older or newer server still parses.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ServerConfig {
+    #[serde(default)]
+    pub default_save_path: Option<String>,
+    #[serde(default)]
+    pub categories: Vec<ServerCategory>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ServerCategory {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub save_subpath: Option<String>,
+    #[serde(default)]
+    pub default_save_path: Option<String>,
+}
+
+/// Mirror of rustorrent's `category_save_path` (config/mod.rs): the category's
+/// `default_save_path` override wins; else the server root joined with the
+/// category's `save_subpath` (or its name); an unknown category joins the raw
+/// name; an empty category is the bare root. Pure so the mirror is unit-testable.
+pub fn resolve_category_path(cfg: &ServerConfig, category: &str) -> String {
+    let root = cfg
+        .default_save_path
+        .as_deref()
+        .unwrap_or("")
+        .trim_end_matches('/');
+    if category.trim().is_empty() {
+        return root.to_string();
+    }
+    if let Some(cat) = cfg.categories.iter().find(|c| c.name == category) {
+        if let Some(o) = cat
+            .default_save_path
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            return o.to_string();
+        }
+        let subdir = cat
+            .save_subpath
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&cat.name);
+        return join_root(root, subdir);
+    }
+    join_root(root, category)
+}
+
+fn join_root(root: &str, sub: &str) -> String {
+    let sub = sub.trim_start_matches('/');
+    if root.is_empty() {
+        return sub.to_string();
+    }
+    if sub.is_empty() {
+        return root.to_string();
+    }
+    format!("{root}/{sub}")
 }
 
 /// Backoff before retry `attempt` (1-based): 200ms, then 800ms, plus
@@ -1097,5 +1177,72 @@ mod tests {
         // No network assertions: a short browse just exercises the timeout path.
         let found = discover(25);
         assert!(found.iter().all(|u| u.starts_with("http://")));
+    }
+
+    #[test]
+    fn resolve_category_path_override_wins() {
+        let cfg = ServerConfig {
+            default_save_path: Some("/dl".into()),
+            categories: vec![ServerCategory {
+                name: "anime".into(),
+                save_subpath: Some("tv".into()),
+                default_save_path: Some("/mnt/anime".into()),
+            }],
+        };
+        assert_eq!(resolve_category_path(&cfg, "anime"), "/mnt/anime");
+    }
+
+    #[test]
+    fn resolve_category_path_subpath_joins_root() {
+        let cfg = ServerConfig {
+            default_save_path: Some("/dl/".into()),
+            categories: vec![ServerCategory {
+                name: "anime".into(),
+                save_subpath: Some("tv".into()),
+                default_save_path: None,
+            }],
+        };
+        assert_eq!(resolve_category_path(&cfg, "anime"), "/dl/tv");
+        // No custom subpath: the category name itself is the subdirectory.
+        let cfg = ServerConfig {
+            default_save_path: Some("/dl".into()),
+            categories: vec![ServerCategory {
+                name: "anime".into(),
+                save_subpath: None,
+                default_save_path: None,
+            }],
+        };
+        assert_eq!(resolve_category_path(&cfg, "anime"), "/dl/anime");
+    }
+
+    #[test]
+    fn resolve_category_path_bare_root_falls_back() {
+        let cfg = ServerConfig {
+            default_save_path: Some("/dl".into()),
+            categories: vec![],
+        };
+        assert_eq!(resolve_category_path(&cfg, "anime"), "/dl/anime");
+        assert_eq!(resolve_category_path(&cfg, ""), "/dl");
+    }
+
+    #[tokio::test]
+    async fn server_config_parses_minimal_shape() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/api/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "default_save_path": "/dl",
+                "categories": [{"name": "anime", "save_subpath": "tv"}],
+                "web_port": 8080,
+                "theme": "Dark",
+            })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        let cfg = c.server_config().await.unwrap();
+        assert_eq!(cfg.default_save_path.as_deref(), Some("/dl"));
+        assert_eq!(resolve_category_path(&cfg, "anime"), "/dl/tv");
     }
 }

@@ -981,11 +981,26 @@ pub fn torrent_prefs_set(
     state.db.get_prefs(show_id)
 }
 
-/// What `torrent_rss_subscribe` reports: the deterministic label and the feed URL.
+/// What `torrent_rss_subscribe` reports: the deterministic label, the feed URL,
+/// and where the server will actually put files (`resolved_path`, server truth
+/// via `GET /api/config`) plus whether that sits outside the library roots.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RssSubscribeResult {
     pub label: String,
     pub url: String,
+    pub resolved_path: Option<String>,
+    pub outside_roots: bool,
+}
+
+/// True when `path` sits under one of `roots` (exact match or `root/` prefix
+/// after trimming trailing slashes), so completions scan back in. Pure so the
+/// subscribe placement check is unit-testable without a database.
+fn path_inside_roots(path: &str, roots: &[String]) -> bool {
+    roots.iter().any(|r| {
+        let root = r.trim_end_matches('/');
+        let root = if root.is_empty() { "/" } else { root };
+        path == root || path.starts_with(&format!("{root}/"))
+    })
 }
 
 /// One-click subscribe: derive the feed URL and group/resolution preferences from the
@@ -1010,22 +1025,46 @@ pub async fn torrent_rss_subscribe(
         .category
         .filter(|c| !c.trim().is_empty())
         .unwrap_or_else(|| "anime".into());
-    let label = torrent::TorrentClient::from_db(&state.db)?
+    let client = torrent::TorrentClient::from_db(&state.db)?;
+    let label = client
         .rss_add(&RssFeedConfig {
             label: torrent::feed_label(&show.parsed_title),
             url: derivation.feed_url.clone(),
             search,
-            category,
+            category: category.clone(),
             enabled: true,
             exclude_batch: true,
         })
         .await?;
     state.db.add_rss_feed(&label, show_id)?;
+    // Server-truth placement: a config fetch failure never blocks the subscribe.
+    let (resolved_path, outside_roots) = match client.server_config().await {
+        Ok(cfg) => {
+            let path = torrent::resolve_category_path(&cfg, &category);
+            let outside = match state.db.list_roots() {
+                Ok(roots) => !path_inside_roots(
+                    &path,
+                    &roots.into_iter().map(|r| r.path).collect::<Vec<_>>(),
+                ),
+                Err(e) => {
+                    eprintln!("torrent_rss_subscribe: roots unreadable, no placement check: {e}");
+                    false
+                }
+            };
+            (Some(path), outside)
+        }
+        Err(e) => {
+            eprintln!("torrent_rss_subscribe: server config unreadable, no placement: {e}");
+            (None, false)
+        }
+    };
     let _ = app.emit("torrent-changed", ());
     let _ = app.emit("show-updated", show_id);
     Ok(RssSubscribeResult {
         label,
         url: derivation.feed_url,
+        resolved_path,
+        outside_roots,
     })
 }
 
@@ -1225,6 +1264,15 @@ mod tests {
         maybe_invalidate_test(&db, "llm_delay_ms", "700").unwrap();
         assert!(Llm::test_ok(&db), "non-identity key untouched");
         assert_eq!(db.get_setting("llm_delay_ms").unwrap(), None);
+    }
+
+    #[test]
+    fn path_inside_roots_matches_prefix_only() {
+        let roots = vec!["/r1".to_string(), "/media/anime/".to_string()];
+        assert!(path_inside_roots("/r1/Owned/01.mkv", &roots));
+        assert!(path_inside_roots("/media/anime/Frieren", &roots));
+        assert!(!path_inside_roots("/dl/anime/Frieren", &roots));
+        assert!(!path_inside_roots("/r10/lookalike", &roots));
     }
 
     #[test]

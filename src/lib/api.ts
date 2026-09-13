@@ -57,7 +57,7 @@ export interface MatchProgress { done: number; total: number; title: string; pha
 export interface AssistProgress { done: number; total: number; folder: string; running: boolean }
 export interface InspectReport { folders: number; ignored: number; changes: InspectChange[]; notes: string[]; show_id: number | null }
 export interface ScanProgress { done: number; total: number; current_path: string }
-export interface WantedHit { title: string; page_url: string; size_bytes: number; seeders: number }
+export interface WantedHit { title: string; page_url: string; size_bytes: number; seeders: number; torrent_url: string | null; info_hash: string | null }
 export interface WantedEpisode { season: number; number: number; hits: WantedHit[] }
 export interface DlnaStatus { running: boolean; port: number; clients_seen: number; dlna_warning?: string; }
 export interface PlaybackChanged { episode_id: number; status: EpisodeStatus; position_secs: number; duration_secs: number | null }
@@ -85,7 +85,7 @@ export interface TorrentPrefs { show_id: number; save_path: string | null; categ
 export interface RssFeedView {
   label: string; url: string; search: string; category: string; enabled: boolean; show_id: number | null;
 }
-export interface RssSubscribeResult { label: string; url: string }
+export interface RssSubscribeResult { label: string; url: string; resolved_path: string | null; outside_roots: boolean }
 /** Mirrors the Rust ControlOp enum: unit variants serialise as bare strings, so
  *  Remove keeps its snake_case payload field exactly as serde expects it. */
 export type TorrentControlOp = 'Start' | 'Pause' | 'Recheck' | { Remove: { delete_files: boolean } };
