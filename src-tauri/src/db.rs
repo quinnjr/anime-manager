@@ -67,20 +67,17 @@ CREATE TABLE IF NOT EXISTS parse_overrides (
   source TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_episodes_season ON episodes(season_id);
 CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status);
--- Torrent state (schema v7). Column shapes follow the rustorrent-integration spec; the
--- REFERENCES clauses from the spec are deliberately omitted: the mandated roundtrip test
--- pins links for a show id with no parent row, and migrate() enforces foreign keys, so
--- the clauses would fail that test. See task-1 report.
+-- Torrent state (schema v7).
 CREATE TABLE IF NOT EXISTS torrent_links (
   info_hash TEXT PRIMARY KEY,
-  show_id INTEGER NOT NULL,
+  show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
   season INTEGER NOT NULL, number INTEGER NOT NULL,
   added_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS torrent_prefs (
-  show_id INTEGER PRIMARY KEY,
+  show_id INTEGER PRIMARY KEY REFERENCES shows(id) ON DELETE CASCADE,
   save_path TEXT, category TEXT);
 CREATE TABLE IF NOT EXISTS rss_feeds (
-  label TEXT PRIMARY KEY, show_id INTEGER NOT NULL,
+  label TEXT PRIMARY KEY, show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
   added_at INTEGER NOT NULL);
 "#;
 
@@ -141,14 +138,14 @@ fn upgrade(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS torrent_links (
                info_hash TEXT PRIMARY KEY,
-               show_id INTEGER NOT NULL,
+               show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
                season INTEGER NOT NULL, number INTEGER NOT NULL,
                added_at INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS torrent_prefs (
-               show_id INTEGER PRIMARY KEY,
+               show_id INTEGER PRIMARY KEY REFERENCES shows(id) ON DELETE CASCADE,
                save_path TEXT, category TEXT);
              CREATE TABLE IF NOT EXISTS rss_feeds (
-               label TEXT PRIMARY KEY, show_id INTEGER NOT NULL,
+               label TEXT PRIMARY KEY, show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
                added_at INTEGER NOT NULL);",
         )?;
     }
@@ -2437,18 +2434,22 @@ mod tests {
     #[test]
     fn torrent_link_roundtrip_and_prefs_defaults() {
         let db = Db::open_memory().unwrap();
+        let show_id: i64 = db.with(|c| {
+            c.execute("INSERT INTO shows (parsed_title, created_at) VALUES ('t', 0)", [])?;
+            Ok(c.last_insert_rowid())
+        }).unwrap();
         db.add_torrent_link(&TorrentLink {
-            info_hash: "abc123".into(), show_id: 1, season: 1, number: 6,
+            info_hash: "abc123".into(), show_id, season: 1, number: 6,
             added_at: 0,
         }).unwrap();
         let got = db.torrent_link("abc123").unwrap().expect("link stored");
         assert_eq!(got.number, 6);
         assert!(db.torrent_link("nope").unwrap().is_none());
-        let prefs = db.get_prefs(1).unwrap();
+        let prefs = db.get_prefs(show_id).unwrap();
         assert_eq!(prefs, TorrentPrefs { show_id: 1, save_path: None, category: None });
-        db.set_prefs(1, Some("/tv/Frieren"), Some("anime")).unwrap();
+        db.set_prefs(show_id, Some("/tv/Frieren"), Some("anime")).unwrap();
         assert_eq!(db.get_prefs(1).unwrap().category.as_deref(), Some("anime"));
-        db.add_rss_feed("animemgr:Frieren", 1).unwrap();
+        db.add_rss_feed("animemgr:Frieren", show_id).unwrap();
         assert_eq!(db.rss_feed_show("animemgr:Frieren").unwrap(), Some(1));
         db.remove_rss_feed("animemgr:Frieren").unwrap();
         assert_eq!(db.rss_feed_show("animemgr:Frieren").unwrap(), None);
