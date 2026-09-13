@@ -7,6 +7,7 @@ pub mod kitsu;
 pub mod llm;
 pub mod metadata;
 pub mod models;
+pub mod nyaa;
 pub mod parser;
 pub mod player;
 pub mod rename;
@@ -92,6 +93,7 @@ pub fn run() {
             commands::apply_rename,
             commands::undo_rename,
             commands::inspect_show,
+            commands::find_missing,
             commands::llm_test,
             commands::llm_models,
             commands::llm_models_for,

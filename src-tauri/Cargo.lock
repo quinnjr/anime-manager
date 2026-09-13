@@ -51,6 +51,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
+ "serde-xml-fast",
  "serde_json",
  "tauri",
  "tauri-build",
@@ -3400,6 +3401,18 @@ dependencies = [
  "serde",
  "serde_core",
  "typeid",
+]
+
+[[package]]
+name = "serde-xml-fast"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2449bf73602e8d641980c920704e23b06a32991782b262ae8b2faeb3379641be"
+dependencies = [
+ "itoa",
+ "memchr",
+ "ryu",
+ "serde",
 ]
 
 [[package]]

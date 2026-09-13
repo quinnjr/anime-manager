@@ -2,7 +2,8 @@
   import { onMount } from 'svelte';
   import { page } from '$app/state';
   import { goto } from '$app/navigation';
-  import { api, onEvent, type ShowDetail, type RenameTarget } from '$lib/api';
+  import { api, onEvent, type ShowDetail, type RenameTarget, type WantedEpisode } from '$lib/api';
+  import { openUrl } from '@tauri-apps/plugin-opener';
   import { toasts } from '$lib/stores/toasts.svelte';
   import { playback } from '$lib/stores/playback.svelte';
   import { isTypingTarget } from '$lib/keys';
@@ -19,6 +20,9 @@
   let renameOpen = $state(false);
   let renameTarget = $state<RenameTarget | null>(null);
   let inspecting = $state(false);
+  let finding = $state(false);
+  let wanted = $state<WantedEpisode[]>([]);
+  let found = $state(false);
   let editingTitle = $state(false);
   let titleDraft = $state('');
 
@@ -30,6 +34,12 @@
   // A background assist run can merge this show into another and delete it while the page is
   // open; reloading it then errors forever and the page sticks on "Loading…".
   let generation = 0;
+
+  // Guards findMissing replies the same way `generation` guards load(): a reply arriving
+  // after navigation belongs to the previous show and must not overwrite the new show's
+  // list (or its Nyaa links). Separate from `generation` so a search neither cancels a
+  // show load nor is cancelled by background reloads for the same show.
+  let searchGeneration = 0;
 
   async function load() {
     const mine = ++generation;
@@ -93,9 +103,48 @@
     } finally { inspecting = false; }
   }
 
+  async function findMissing() {
+    if (!show) return;
+    const mine = ++searchGeneration;
+    finding = true;
+    try {
+      const r = await api.findMissing(show.id);
+      if (mine !== searchGeneration) return;
+      wanted = r;
+      found = true;
+      // Pure query: nothing on disk or in the database changed, so no reload.
+      if (r.length === 0) toasts.push('info', 'No missing episodes — the owned range has no gaps.');
+      else if (r.every((w) => w.hits.length === 0)) toasts.push('info', 'Missing episodes found, but none has a strict match yet.');
+    } catch (e) {
+      if (mine !== searchGeneration) return;
+      toasts.error(e);
+    } finally {
+      // A stale reply must not clobber the new show's state: the $effect reset already
+      // cleared `finding`, and only the latest search may clear it here.
+      if (mine === searchGeneration) finding = false;
+    }
+  }
+
+  async function openPage(url: string) {
+    try { await openUrl(url); } catch (e) { toasts.error(e); }
+  }
+
+  function formatSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ['KiB', 'MiB', 'GiB', 'TiB'];
+    let v = bytes / 1024;
+    let u = 0;
+    while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
+    return `${v.toFixed(v >= 100 ? 0 : 1)} ${units[u]}`;
+  }
+
   $effect(() => {
     id; // track
     highlight = 0;
+    wanted = [];
+    found = false;
+    finding = false;
+    searchGeneration++; // invalidate any in-flight search for the previous show
     load();
   });
 
@@ -160,12 +209,42 @@
             onclick={inspect}>
             {inspecting ? 'Checking…' : 'Check seasons with AI'}
           </button>
+          <button class="btn" disabled={finding}
+            title="Search Nyaa for episodes missing from this show"
+            onclick={findMissing}>
+            {finding ? 'Finding…' : 'Find missing'}
+          </button>
           <button class="btn" title="Use your own title for this show"
             onclick={() => { titleDraft = show!.user_title_override ?? show!.display_title; editingTitle = true; }}>Retitle</button>
         </div>
       </div>
     </div>
   </section>
+
+  {#if found}
+    <section aria-label="Missing episodes" class="mb-7 border-b border-edge pb-6">
+      <div class="eyebrow mb-2">Missing episodes</div>
+      {#if wanted.length === 0}
+        <p class="tag">No missing episodes — the owned range has no gaps.</p>
+      {:else}
+        <ul class="flex flex-col gap-2">
+          {#each wanted as w (w.season + ':' + w.number)}
+            {@const best = w.hits[0]}
+            <li class="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <span class="tag-chip shrink-0">S{w.season}E{w.number}</span>
+              {#if best}
+                <span class="min-w-0 flex-1 truncate">{best.title}</span>
+                <span class="tag shrink-0">{formatSize(best.size_bytes)} · {best.seeders} seeder{best.seeders === 1 ? '' : 's'}</span>
+                <button class="btn shrink-0" onclick={() => void openPage(best.page_url)}>Nyaa page</button>
+              {:else}
+                <span class="tag">no strict match</span>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
+  {/if}
 
   <SeasonList {seasons} highlightedId={rows[highlight]?.group.primary.id ?? null}
     onRename={(episodeId) => openRename({ type: 'episode', id: episodeId })} />
