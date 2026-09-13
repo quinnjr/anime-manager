@@ -98,7 +98,7 @@ CREATE TABLE rss_feeds (
   `parsed_title` identity or `parse_overrides`.
 - `torrent_prefs.save_path` default: the show's library root (first
   root containing an owned episode, else first readable root). A save
-  path outside all library roots requires explicit confirmation, or
+  path outside all library roots requires an explicit warning before the action; the click itself is the confirmation, or
   completions never scan in and the two systems silently diverge.
 - `rss_feeds` maps a registered subscription label back to its show so
   monitor-added torrents (which have no add-time pin) can be attributed
