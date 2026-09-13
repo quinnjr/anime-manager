@@ -863,8 +863,8 @@ pub async fn torrent_list(state: State<'_, AppState>) -> Result<Vec<LinkedTorren
 }
 
 /// Send one strict Nyaa hit to rustorrent and pin the result to its episode.
-/// Dedups by `info_hash` when given (already pinned → link it, no double add).
-/// Returns the server's info_hash.
+/// Dedups by `info_hash` when given: already pinned OR already on the server →
+/// link it to the requested episode, no double add. Returns the server's info_hash.
 // Arity is the IPC contract (flat args per the design spec), not a refactor target.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
@@ -882,8 +882,29 @@ pub async fn torrent_add(
     require_torrent_armed(&state.db)?;
     let client = torrent::TorrentClient::from_db(&state.db)?;
     let clean = |o: Option<String>| o.filter(|v| !v.trim().is_empty());
-    if let Some(hash) = clean(info_hash)
+    let given = clean(info_hash);
+    if let Some(hash) = given.clone()
         && state.db.torrent_link(&hash)?.is_some()
+    {
+        state.db.add_torrent_link(&TorrentLink {
+            info_hash: hash.clone(),
+            show_id,
+            season,
+            number,
+            added_at: db::now(),
+        })?;
+        let _ = app.emit("torrent-changed", ());
+        let _ = app.emit("show-updated", show_id);
+        return Ok(hash);
+    }
+    // Already on the server (added outside the app, no pin) → link, no re-add.
+    // A failing list() is loud: fall-through would risk a blind duplicate add.
+    if let Some(hash) = given
+        && client
+            .list()
+            .await?
+            .iter()
+            .any(|t| t.info_hash == hash)
     {
         state.db.add_torrent_link(&TorrentLink {
             info_hash: hash.clone(),
