@@ -1,6 +1,7 @@
 pub mod anilist;
 pub mod commands;
 pub mod db;
+pub mod dlna;
 pub mod error;
 pub mod kitsu;
 pub mod metadata;
