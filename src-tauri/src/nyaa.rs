@@ -1,19 +1,19 @@
 //! Nyaa torrent provider: title classifier, size parser, RSS search client,
 //! and the missing-episode hunt (`find_missing`) with strict release matching.
 
-use std::sync::OnceLock;
+use std::collections::{BTreeMap, HashMap};
 
-use quick_xml::events::Event;
-use quick_xml::reader::Reader;
+use once_cell::sync::Lazy;
 use regex::Regex;
 
 use crate::db::Db;
 use crate::error::{AppError, Result};
 use crate::models::EpisodeStatus;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A single Nyaa search result row.
-pub struct NyaaHit {
+#[derive(Debug)]
+struct NyaaHit {
     pub title: String,
     pub page_url: String,
     pub size_bytes: u64,
@@ -27,61 +27,60 @@ pub struct SingleEpisode {
     pub episode: u32,
 }
 
-fn range_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\d+\s*[-~–]\s*\d+").expect("valid range regex"))
-}
+static RANGE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\d+\s*[-~–]\s*\d+").unwrap());
 
-fn reject_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        // Word-boundaried so `backpack` survives; `vol.` carries its own dot.
-        Regex::new(r"(?i)\b(batch|complete|collection|packs?|movies?)\b|vol\.")
-            .expect("valid reject regex")
-    })
-}
+// Word-boundaried so `backpack` survives; `\bvol\.` keeps rejecting `Vol.`
+// while letting `Evol.` through.
+static REJECT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\b(batch|complete|collection|packs?|movies?)\b|\bvol\.").unwrap()
+});
 
-fn resolution_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?i)\b(480p|720p|1080p|2160p)\b").expect("valid resolution regex")
-    })
-}
+static RESOLUTION_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\b(480p|720p|1080p|2160p)\b").unwrap());
 
-fn bracket_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\[[^\]]*\]").expect("valid bracket regex"))
-}
+static BRACKET_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\[[^\]]*\]").unwrap());
 
-fn number_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\d+").expect("valid number regex"))
-}
+static NUMBER_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\d+").unwrap());
 
-fn size_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?i)^\s*([\d.]+)\s*([kmgt]ib|b|[kmgt]b)\s*$").expect("valid size regex")
-    })
-}
+static SIZE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)^\s*([\d.]+)\s*([kmgt]ib|b|[kmgt]b)\s*$").unwrap());
 
-fn version_tag_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)(?:^|[^a-z0-9])(?:v|ver)\s*$").expect("valid version regex"))
-}
+static VERSION_TAG_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)(?:^|[^a-z0-9])(?:v|ver)\s*$").unwrap());
 
 /// A version suffix glued onto an episode number (`06v2`, `06ver2`): the run
 /// before it is still the episode, the `v2` a release revision, not a number.
-fn glued_version_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)^(?:v\d+|ver\d+)").expect("valid glued version regex"))
-}
+static GLUED_VERSION_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^(?:v\d+|ver\d+)").unwrap());
+
+/// Explicit season-episode marker (`S01E06`, `E06`, `EP06`): preferred over
+/// any standalone number, so the `01` in `S01E06` never wins as episode 1.
+static SEASON_EP_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:^|[^a-z0-9])(?:s\d{1,2}e|e|ep)(\d{1,4})(?:$|[^a-z0-9])").unwrap()
+});
+
+/// A `[ABCDEF12]` CRC token: eight hex digits, never a release group.
+static CRC_TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^[0-9a-f]{8}$").unwrap());
+
+/// A `[v2]` / `[ver2]` release-revision token: never a release group.
+static VERSION_TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^(?:v\d+|ver\d+)$").unwrap());
 
 /// Strip a trailing file extension (`...mkv`) so rules run on the stem.
+/// Only known media/subtitle containers count — anything else (`12.5`)
+/// is part of the title, not an extension.
 fn stem_of(title: &str) -> &str {
+    const EXT: &[&str] = &["mkv", "mp4", "avi", "m2ts", "ts", "ass", "srt"];
     let t = title.trim();
     match t.rfind('.') {
-        Some(i) if i > 0 && !t[i + 1..].contains(['/', '\\', ' ', '[', ']']) => &t[..i],
+        Some(i) if i > 0 => {
+            let ext = &t[i + 1..];
+            if ext.contains(['/', '\\', ' ', '[', ']']) {
+                t
+            } else if EXT.contains(&ext.to_lowercase().as_str()) {
+                &t[..i]
+            } else {
+                t
+            }
+        }
         _ => t,
     }
 }
@@ -93,40 +92,54 @@ pub fn classify_title(title: &str) -> Option<SingleEpisode> {
     let stem = stem_of(title);
 
     // Batches, collections, and movies are never single episodes.
-    if reject_re().is_match(stem) {
-        return None;
-    }
-    // Any `NN-MM` style range means this is not one episode.
-    if range_re().is_match(stem) {
+    if REJECT_RE.is_match(stem) {
         return None;
     }
 
-    // Leading `[Group]` bracket token (first bracket group only).
-    let group = stem
-        .strip_prefix('[')
-        .and_then(|rest| rest.find(']').map(|i| &rest[..i]))
-        .map(|g| g.trim().to_lowercase())
-        .filter(|g| !g.is_empty());
+    let resolution = RESOLUTION_RE.find(stem).map(|m| m.as_str().to_lowercase());
 
-    let resolution = resolution_re()
-        .find(stem)
-        .map(|m| m.as_str().to_lowercase());
-
-    // Resolution token range: numbers inside it are not episodes.
-
-    // Episode = LAST standalone number run outside bracket tokens that is
-    // not part of the resolution token and not a `v2`/`ver2` version tag.
-    let bracket_spans: Vec<(usize, usize)> = bracket_re()
+    // Bracket and resolution spans first: numbers inside them are not
+    // episodes, and a `NN-MM` range touching the resolution token
+    // (`06-1080p`) is a dash-glued quality tag, not a range.
+    let bracket_spans: Vec<(usize, usize)> = BRACKET_RE
         .find_iter(stem)
         .map(|m| (m.start(), m.end()))
         .collect();
-    let res_span: Option<(usize, usize)> =
-        resolution_re().find(stem).map(|m| (m.start(), m.end()));
+    let res_span: Option<(usize, usize)> = RESOLUTION_RE.find(stem).map(|m| (m.start(), m.end()));
+    let touches = |span: Option<(usize, usize)>, start: usize, end: usize| {
+        span.map(|(s, e)| start <= e && end >= s).unwrap_or(false)
+    };
+    // Any `NN-MM` style range means this is not one episode.
+    if RANGE_RE
+        .find_iter(stem)
+        .any(|m| !touches(res_span, m.start(), m.end()))
+    {
+        return None;
+    }
+
+    // Release group: first `[...]` token that is not a resolution, CRC, or
+    // version token, so trailing `[AwesomeSub]` and leading groups both work.
+    let group = BRACKET_RE
+        .find_iter(stem)
+        .map(|m| stem[m.start() + 1..m.end() - 1].trim())
+        .find(|tok| {
+            !tok.is_empty()
+                && RESOLUTION_RE.find(tok).is_none()
+                && !CRC_TOKEN_RE.is_match(tok)
+                && !VERSION_TOKEN_RE.is_match(tok)
+        })
+        .map(|g| g.to_lowercase());
+
     let inside = |span: Option<(usize, usize)>, start: usize, end: usize| {
         span.map(|(s, e)| start >= s && end <= e).unwrap_or(false)
     };
-    let mut episode: Option<u32> = None;
-    for m in number_re().find_iter(stem) {
+    // Explicit `S01E06` / `E06` / `EP06` marker wins over standalone
+    // numbers, so the season in `S01E06` never reads as episode 1.
+    let mut episode: Option<u32> = SEASON_EP_RE.captures(stem).and_then(|c| c[1].parse().ok());
+    // Episode = FIRST standalone number run outside bracket tokens that is
+    // not part of the resolution token and not a `v2`/`ver2` version tag,
+    // so a trailing year (`Show - 06 (2024)`) cannot overwrite episode 6.
+    for m in NUMBER_RE.find_iter(stem) {
         // Skip group tags, resolution brackets, CRCs, and other `[...]` tokens.
         if bracket_spans
             .iter()
@@ -152,15 +165,33 @@ pub fn classify_title(title: &str) -> Option<SingleEpisode> {
             .next()
             .map(|c| !c.is_alphanumeric())
             .unwrap_or(true)
-            || glued_version_re().is_match(after);
+            || GLUED_VERSION_RE.is_match(after);
         if !before_ok || !after_ok {
             continue;
         }
-        // Skip `v2` / `ver2` version tags.
-        if version_tag_re().is_match(&stem[..m.start()]) {
+        // Decimal episode markers (`12.5`) are unparseable: skip the
+        // integer run glued to `.5` and the fractional run glued to `12.`.
+        if after.starts_with('.')
+            && after[1..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+        {
             continue;
         }
-        if let Ok(n) = m.as_str().parse::<u32>() {
+        {
+            let mut before = stem[..m.start()].chars().rev();
+            if before.next() == Some('.') && before.next().is_some_and(|c| c.is_ascii_digit()) {
+                continue;
+            }
+        }
+        // Skip `v2` / `ver2` version tags.
+        if VERSION_TAG_RE.is_match(&stem[..m.start()]) {
+            continue;
+        }
+        if episode.is_none()
+            && let Ok(n) = m.as_str().parse::<u32>()
+        {
             episode = Some(n);
         }
     }
@@ -172,7 +203,8 @@ pub fn classify_title(title: &str) -> Option<SingleEpisode> {
     })
 }
 
-/// Nyaa base URL in production; tests pass the mock server URI to `Nyaa::with`.
+/// Nyaa base URL in production; tests pass the mock server URI to
+/// `Nyaa::with_endpoint`.
 pub const NYAA_BASE: &str = "https://nyaa.si";
 
 /// Nyaa RSS search client. `base_url` is [`NYAA_BASE`] in production;
@@ -183,153 +215,145 @@ pub struct Nyaa {
 }
 
 impl Nyaa {
-    pub fn with(base_url: String) -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .user_agent("anime-manager/0.1")
-                .timeout(std::time::Duration::from_secs(20))
-                .build()
-                .expect("client"),
+    pub fn with_endpoint(base_url: String) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .user_agent("anime-manager/0.1")
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(|e| AppError::Network(e.to_string()))?;
+        Ok(Self {
+            client,
             base_url: base_url.trim_end_matches('/').to_string(),
-        }
+        })
     }
 
     /// Search Nyaa via its RSS feed. Returns every parsed hit; strict
     /// single-episode filtering belongs to the DB matching pass.
-    pub async fn search(&self, query: &str) -> Result<Vec<NyaaHit>> {
-        let url = format!(
-            "{}/?page=rss&q={}&c=1_2&f=0",
-            self.base_url,
-            encode(query)
-        );
-        let resp = self.client.get(&url).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(AppError::Network(format!("nyaa returned {status}")));
+    ///
+    /// Retryable failures (429/5xx, transport timeouts) retry twice with
+    /// 200ms/800ms backoff plus jitter, honouring `Retry-After` (capped at
+    /// 30s). Anything else fails fast naming the query, status and a
+    /// body snippet; transport errors propagate as-is.
+    async fn search(&self, query: &str) -> Result<Vec<NyaaHit>> {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let sent = self
+                .client
+                .get(format!("{}/", self.base_url))
+                .query(&[("page", "rss"), ("q", query), ("c", "1_2"), ("f", "0")])
+                .send()
+                .await;
+            let resp = match sent {
+                Ok(resp) => resp,
+                Err(e) if e.is_timeout() && attempt < 3 => {
+                    tokio::time::sleep(retry_wait(attempt)).await;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let status = resp.status();
+            if status.is_success() {
+                let bytes = resp.bytes().await?;
+                if bytes.len() > 4_000_000 {
+                    return Err(AppError::Network("nyaa response too large".into()));
+                }
+                let body =
+                    std::str::from_utf8(&bytes).map_err(|e| AppError::Parse(e.to_string()))?;
+                return parse_rss(body);
+            }
+            let retryable = status.as_u16() == 429 || status.is_server_error();
+            if retryable && attempt < 3 {
+                let asked = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|s| std::time::Duration::from_secs(s.min(30)));
+                tokio::time::sleep(asked.unwrap_or_else(|| retry_wait(attempt))).await;
+                continue;
+            }
+            let body = resp.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(200).collect();
+            return Err(AppError::Network(format!(
+                "nyaa search {query:?} returned {status}: {snippet}"
+            )));
         }
-        let body = resp.text().await?;
-        parse_rss(&body)
     }
 }
 
-/// Minimal form-urlencoding: alnum and `-_.~` pass through, space becomes
-/// `+`, everything else is `%XX` uppercase hex over the UTF-8 bytes.
-fn encode(q: &str) -> String {
-    let mut out = String::with_capacity(q.len());
-    for b in q.bytes() {
-        match b {
-            b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            b' ' => out.push('+'),
-            _ => {
-                out.push('%');
-                out.push(char::from_digit((b >> 4) as u32, 16).expect("hex").to_ascii_uppercase());
-                out.push(char::from_digit((b & 0xF) as u32, 16).expect("hex").to_ascii_uppercase());
-            }
-        }
-    }
-    out
+/// Backoff before Nyaa retry `attempt` (1-based): 200ms, then 800ms, plus
+/// a sub-100ms jitter so concurrent hunts do not march in step.
+fn retry_wait(attempt: u32) -> std::time::Duration {
+    let base = if attempt <= 1 { 200 } else { 800 };
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() % 100) as u64)
+        .unwrap_or(0);
+    std::time::Duration::from_millis(base + jitter)
 }
 
-#[derive(Default)]
+/// RSS envelope: `<rss><channel><item>…`. Every field defaults so one
+/// malformed item degrades to empty strings (and is skipped below) rather
+/// than failing the whole feed. Namespace-prefixed names pass through
+/// verbatim, hence the explicit `nyaa:` renames.
+#[derive(Debug, Deserialize, Default)]
+struct Rss {
+    #[serde(default)]
+    channel: Channel,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct Channel {
+    #[serde(default)]
+    item: Vec<RawItem>,
+}
+#[derive(Debug, Deserialize, Default)]
 struct RawItem {
+    #[serde(default)]
     title: String,
+    #[serde(default)]
     link: String,
+    #[serde(default)]
     guid: String,
+    #[serde(default, rename = "nyaa:size")]
     size: String,
+    #[serde(default, rename = "nyaa:seeders")]
     seeders: String,
 }
 
-/// Push one decoded text node onto the in-progress item's field.
-fn push_field(item: &mut RawItem, field: &[u8], text: &str) {
-    match field {
-        b"title" => item.title.push_str(text),
-        b"link" => item.link.push_str(text),
-        b"guid" => item.guid.push_str(text),
-        b"size" => item.size.push_str(text),
-        b"seeders" => item.seeders.push_str(text),
-        _ => {}
-    }
-}
-
-/// Parse an RSS feed, matching element local names so namespace prefixes
-/// (`nyaa:size`, ...) don't matter. The live feed carries the `.torrent` file
-/// in `<link>` and the view page in `<guid>`; the UI links the view page and
-/// falls back to `<link>` when a feed omits `<guid>`. Items with neither are
-/// skipped.
+/// Parse an RSS feed. The live feed carries the `.torrent` file in `<link>`
+/// and the view page in `<guid>`; the UI links the view page and falls back
+/// to `<link>` when a feed omits `<guid>`. Items with neither are skipped.
 fn parse_rss(body: &str) -> Result<Vec<NyaaHit>> {
-    let mut reader = Reader::from_str(body);
-    let mut buf = Vec::new();
+    let rss: Rss = serde_xml::from_str(body).map_err(|e| AppError::Parse(e.to_string()))?;
     let mut hits = Vec::new();
-    let mut current: Option<RawItem> = None;
-    let mut field: Option<Vec<u8>> = None;
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) => {
-                let local = e.name().local_name().as_ref().to_vec();
-                if local == b"item" {
-                    current = Some(RawItem::default());
-                    field = None;
-                } else if current.is_some() {
-                    field = Some(local);
-                }
-            }
-            Ok(Event::Text(ref t)) => {
-                if let (Some(item), Some(f)) = (current.as_mut(), field.as_ref()) {
-                    let text = t
-                        .decode()
-                        .map_err(|e| AppError::Parse(e.to_string()))?;
-                    push_field(item, f, text.trim());
-                }
-            }
-            Ok(Event::CData(ref t)) => {
-                if let (Some(item), Some(f)) = (current.as_mut(), field.as_ref()) {
-                    let text = t
-                        .decode()
-                        .map_err(|e| AppError::Parse(e.to_string()))?;
-                    push_field(item, f, text.trim());
-                }
-            }
-            Ok(Event::End(ref e)) => {
-                let local = e.name().local_name();
-                if local.as_ref() == b"item" {
-                    if let Some(item) = current.take() {
-                        // Live shape: `<link>` is the `.torrent` file, `<guid>`
-                        // the view page. Prefer the view page; feeds without a
-                        // guid fall back to the link.
-                        let page_url = if item.guid.is_empty() {
-                            item.link
-                        } else {
-                            item.guid
-                        };
-                        if !page_url.is_empty() {
-                            hits.push(NyaaHit {
-                                title: item.title,
-                                page_url,
-                                size_bytes: parse_size(&item.size),
-                                seeders: item.seeders.parse().unwrap_or(0),
-                            });
-                        }
-                    }
-                    field = None;
-                } else {
-                    field = None;
-                }
-            }
-            Ok(Event::Eof) => break,
-            Err(e) => return Err(AppError::Parse(e.to_string())),
-            _ => {}
+    for item in rss.channel.item {
+        // Trim once here so titles with surrounding whitespace match cleanly.
+        let title = item.title.trim().to_string();
+        let link = item.link.trim().to_string();
+        let guid = item.guid.trim().to_string();
+        let size = item.size.trim().to_string();
+        let seeders = item.seeders.trim().to_string();
+        // Live shape: `<link>` is the `.torrent` file, `<guid>`
+        // the view page. Prefer the view page; feeds without a
+        // guid fall back to the link.
+        let page_url = if guid.is_empty() { link } else { guid };
+        if !page_url.is_empty() {
+            hits.push(NyaaHit {
+                title,
+                page_url,
+                size_bytes: parse_size(&size),
+                seeders: seeders.parse().unwrap_or(0),
+            });
         }
-        buf.clear();
     }
     Ok(hits)
 }
 
 /// Parse a Nyaa size string (`1.4 GiB`) into bytes. Unknown input → 0.
 pub fn parse_size(s: &str) -> u64 {
-    let caps = match size_re().captures(s) {
+    let caps = match SIZE_RE.captures(s) {
         Some(c) => c,
         None => return 0,
     };
@@ -378,17 +402,13 @@ struct Owned {
     number: u32,
     group: Option<String>,
     resolution: Option<String>,
-    size: u64,
 }
 
 /// Episode numbers to hunt, per season: gaps strictly inside the owned range,
 /// plus continuation past the owned max for season 1 only, where a known
 /// total (`shows.total_episodes`) ceilings it. Unmatched and null-total shows
 /// hunt gaps only — never guess unaired numbers.
-fn wanted_numbers(
-    per_season: &std::collections::BTreeMap<u32, Vec<u32>>,
-    total: Option<u32>,
-) -> Vec<(u32, u32)> {
+fn wanted_numbers(per_season: &BTreeMap<u32, Vec<u32>>, total: Option<u32>) -> Vec<(u32, u32)> {
     let mut out = Vec::new();
     for (&season, nums) in per_season {
         if nums.is_empty() {
@@ -416,11 +436,10 @@ fn wanted_numbers(
 /// comparison against classifier output. Rows without a value do not vote;
 /// ties break toward the value carried by the earliest owned episode.
 fn modal_by(owned: &[Owned], pick: impl Fn(&Owned) -> Option<&str>) -> Option<String> {
-    let mut counts: std::collections::HashMap<String, (usize, (u32, u32))> =
-        std::collections::HashMap::new();
+    let mut counts: HashMap<String, (usize, (u32, u32))> = HashMap::new();
     for o in owned {
         if let Some(v) = pick(o) {
-            let key = v.to_lowercase();
+            let key = v.trim().to_lowercase();
             if key.is_empty() {
                 continue;
             }
@@ -451,6 +470,9 @@ fn modal_resolution(owned: &[Owned]) -> Option<String> {
 
 /// Median owned size ±30%. Displayed context only, never a filter: strictness
 /// applies to identity (who released it, in what quality), not byte counts.
+/// Test-only pin: the design fixes the band here, so a future edit that turns
+/// size into a filter must update the spec first.
+#[cfg(test)]
 fn size_band(sizes: &[u64]) -> Option<(u64, u64)> {
     if sizes.is_empty() {
         return None;
@@ -469,8 +491,7 @@ pub async fn find_missing(db: &Db, nyaa: &Nyaa, show_id: i64) -> Result<Vec<Want
     let show = db.get_show(show_id)?;
 
     let mut owned: Vec<Owned> = Vec::new();
-    let mut per_season: std::collections::BTreeMap<u32, Vec<u32>> =
-        std::collections::BTreeMap::new();
+    let mut per_season: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     for season in &show.seasons {
         if season.number == 0 {
             continue;
@@ -484,7 +505,6 @@ pub async fn find_missing(db: &Db, nyaa: &Nyaa, show_id: i64) -> Result<Vec<Want
                 number: ep.number,
                 group: ep.release_group.clone(),
                 resolution: ep.resolution.clone(),
-                size: ep.size.max(0) as u64,
             });
             per_season.entry(season.number).or_default().push(ep.number);
         }
@@ -496,23 +516,23 @@ pub async fn find_missing(db: &Db, nyaa: &Nyaa, show_id: i64) -> Result<Vec<Want
     };
     let pref_group = modal_group(&owned);
     let pref_res = modal_resolution(&owned);
-    // Spec pin: the design fixes the band at median ±30% as displayed context
-    // only. Computed (and unit-tested below) so a future edit that turns size
-    // into a filter must update the spec first; deliberately unused here.
-    let _size_band = size_band(&owned.iter().map(|o| o.size).collect::<Vec<_>>());
 
     // One request per distinct query string: the query names the episode
     // number only, so (1,2) and (2,2) ask Nyaa the same thing, and the strict
     // filter is episode-scoped too — filtered hits are shared. The linked
     // view page disambiguates cross-season lookalikes.
-    let mut seen: std::collections::HashMap<String, Vec<WantedHit>> =
-        std::collections::HashMap::new();
+    let mut seen: HashMap<String, Vec<WantedHit>> = HashMap::new();
     let mut wanted = Vec::new();
     for (season, number) in wanted_numbers(&per_season, total) {
         let query = format!("{} {number}", show.display_title);
         let hits = if let Some(cached) = seen.get(&query) {
             cached.clone()
         } else {
+            if !seen.is_empty() {
+                // Space per-query searches so a multi-season hunt
+                // does not burst the tracker.
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
             let mut kept: Vec<WantedHit> = nyaa
                 .search(&query)
                 .await?
@@ -571,7 +591,11 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let hits = Nyaa::with(server.uri()).search("Show 6").await.unwrap();
+        let hits = Nyaa::with_endpoint(server.uri())
+            .unwrap()
+            .search("Show 6")
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 3);
         assert_eq!(
             hits[0].page_url, "https://nyaa.si/view/12345",
@@ -591,9 +615,64 @@ mod tests {
         assert_eq!(hits[2].page_url, "https://nyaa.si/view/77");
     }
 
-    #[test]
-    fn encode_query_uses_plus_for_spaces() {
-        assert_eq!(encode("Sousou no Frieren 6"), "Sousou+no+Frieren+6");
+    #[tokio::test]
+    async fn query_params_are_encoded_by_reqwest() {
+        let server = MockServer::start().await;
+        // Wiremock matches decoded params: if `.query()` did not encode
+        // `&`, `:` and `!`, this mock would never match.
+        Mock::given(method("GET"))
+            .and(query_param("page", "rss"))
+            .and(query_param("q", "Re:Zero & K-ON! 6"))
+            .and(query_param("c", "1_2"))
+            .and(query_param("f", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(rss_wrap("")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let hits = Nyaa::with_endpoint(server.uri())
+            .unwrap()
+            .search("Re:Zero & K-ON! 6")
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_200_reports_query_status_and_snippet() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("tracker blew up"))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let err = Nyaa::with_endpoint(server.uri())
+            .unwrap()
+            .search("Show 6")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("\"Show 6\""), "names the query: {msg}");
+        assert!(msg.contains("500"), "names the status: {msg}");
+        assert!(msg.contains("tracker blew up"), "carries a snippet: {msg}");
+    }
+
+    #[tokio::test]
+    async fn malformed_rss_is_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(rss_wrap("<item><title>Fish & Chips</title></item>")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let err = Nyaa::with_endpoint(server.uri())
+            .unwrap()
+            .search("Show 6")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Parse(_)), "got {err:?}");
     }
 
     #[test]
@@ -730,7 +809,7 @@ mod tests {
         .await;
         mock_q(&server, "T 2", &item_xml("[G] T - 02 [1080p]", 108, 7)).await;
 
-        let wanted = find_missing(&db, &Nyaa::with(server.uri()), show_id)
+        let wanted = find_missing(&db, &Nyaa::with_endpoint(server.uri()).unwrap(), show_id)
             .await
             .unwrap();
 
@@ -776,7 +855,7 @@ mod tests {
         let server = MockServer::start().await;
         mock_q(&server, "U 2", &item_xml("[G] U - 02 [1080p]", 201, 4)).await;
 
-        let wanted = find_missing(&db, &Nyaa::with(server.uri()), show_id)
+        let wanted = find_missing(&db, &Nyaa::with_endpoint(server.uri()).unwrap(), show_id)
             .await
             .unwrap();
         assert_eq!(wanted.len(), 1, "gaps only, nothing past max without a total");
@@ -810,7 +889,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let wanted = find_missing(&db, &Nyaa::with(server.uri()), show_id)
+        let wanted = find_missing(&db, &Nyaa::with_endpoint(server.uri()).unwrap(), show_id)
             .await
             .unwrap();
         let nums: Vec<(u32, u32)> = wanted.iter().map(|w| (w.season, w.number)).collect();
@@ -827,14 +906,12 @@ mod tests {
                 number: 1,
                 group: Some("A".into()),
                 resolution: None,
-                size: 1,
             },
             Owned {
                 season: 1,
                 number: 2,
                 group: Some("B".into()),
                 resolution: None,
-                size: 1,
             },
         ];
         assert_eq!(modal_group(&owned).as_deref(), Some("a"));
@@ -844,5 +921,253 @@ mod tests {
     fn size_band_is_median_plus_minus_thirty_percent() {
         assert_eq!(size_band(&[100, 200, 300]), Some((140, 260)));
         assert_eq!(size_band(&[]), None);
+    }
+
+    #[test]
+    fn season_episode_markers_win() {
+        for title in [
+            "[Sub] Show S01E06 [1080p]",
+            "[Sub] Show E06 [1080p]",
+            "[Sub] Show EP06 [1080p]",
+        ] {
+            assert_eq!(classify_title(title).map(|s| s.episode), Some(6), "{title}");
+        }
+        // The season in S01E06 must not read as episode 1.
+        assert_eq!(
+            classify_title("[Sub] Show S02E13 [1080p]").map(|s| s.episode),
+            Some(13)
+        );
+    }
+
+    #[test]
+    fn trailing_year_does_not_overwrite_episode() {
+        let s = classify_title("[G] Show - 06 (2024) [1080p]").expect("single");
+        assert_eq!(s.episode, 6);
+    }
+
+    #[test]
+    fn dash_glued_quality_is_not_a_range() {
+        let s = classify_title("[G] Show - 06-1080p").expect("single");
+        assert_eq!(s.episode, 6);
+        assert_eq!(s.resolution.as_deref(), Some("1080p"));
+    }
+
+    #[test]
+    fn group_comes_from_any_bracket_token() {
+        let s = classify_title("Show - 06 [1080p] [AwesomeSub]").expect("single");
+        assert_eq!(s.group.as_deref(), Some("awesomesub"));
+        assert_eq!(s.episode, 6);
+        let s = classify_title("[1080p] Show - 06 [G]").expect("single");
+        assert_eq!(s.group.as_deref(), Some("g"));
+        assert_eq!(s.episode, 6);
+        // CRC and version tokens never read as groups.
+        let s = classify_title("[G] Show - 06 [1080p][ABCDEF12]").expect("single");
+        assert_eq!(s.group.as_deref(), Some("g"));
+        let s = classify_title("[G] Show - 06 [1080p] [v2]").expect("single");
+        assert_eq!(s.group.as_deref(), Some("g"));
+    }
+
+    #[test]
+    fn evol_is_not_a_volume() {
+        assert_eq!(
+            classify_title("[G] Evol. - 03 [1080p]").map(|s| s.episode),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn decimal_episodes_are_unparseable() {
+        assert!(classify_title("[G] Show - 12.5").is_none());
+        assert!(classify_title("[G] Show - 12.5 [1080p]").is_none());
+    }
+
+    #[test]
+    fn stem_strips_only_known_extensions() {
+        assert_eq!(
+            classify_title("[G] Show - 06.MKV").map(|s| s.episode),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn modal_keys_trim_before_lowercase() {
+        let owned = vec![Owned {
+            season: 1,
+            number: 1,
+            group: Some("  G  ".into()),
+            resolution: None,
+        }];
+        assert_eq!(modal_group(&owned).as_deref(), Some("g"));
+    }
+
+    #[test]
+    fn modal_resolution_and_no_votes() {
+        let owned = vec![
+            Owned {
+                season: 1,
+                number: 1,
+                group: Some("G".into()),
+                resolution: Some("1080p".into()),
+            },
+            Owned {
+                season: 1,
+                number: 2,
+                group: Some("G".into()),
+                resolution: Some("1080p".into()),
+            },
+        ];
+        assert_eq!(modal_resolution(&owned).as_deref(), Some("1080p"));
+        assert!(modal_group(&[]).is_none());
+        assert!(modal_resolution(&[]).is_none());
+        let novote = vec![Owned {
+            season: 1,
+            number: 1,
+            group: None,
+            resolution: None,
+        }];
+        assert!(modal_group(&novote).is_none());
+        assert!(modal_resolution(&novote).is_none());
+    }
+
+    #[test]
+    fn parse_size_extended() {
+        assert_eq!(parse_size("1.4 gib"), 1_503_238_553, "lowercase unit");
+        assert_eq!(parse_size("  700 MiB  "), 734_003_200, "surrounding spaces");
+        assert_eq!(parse_size("0 B"), 0);
+        assert_eq!(parse_size("10 XB"), 0, "unknown unit");
+    }
+
+    #[test]
+    fn reject_list_one_liners() {
+        for title in [
+            "[G] Show Complete [1080p]",
+            "[G] Show Collection [1080p]",
+            "[G] Show Packs [1080p]",
+            "[G] Show 12~13 [1080p]",
+            "[G] Show 6–7 [1080p]",
+        ] {
+            assert!(classify_title(title).is_none(), "{title}");
+        }
+        let s = classify_title("[G] Show - 06 [480p]").expect("480p is a resolution");
+        assert_eq!(s.resolution.as_deref(), Some("480p"));
+        assert_eq!(s.episode, 6);
+        let s = classify_title("[G] Show - 06 [2160p]").expect("2160p is a resolution");
+        assert_eq!(s.resolution.as_deref(), Some("2160p"));
+        let s = classify_title("Show - 06 [1080p]").expect("no group");
+        assert_eq!(s.group, None);
+        assert_eq!(s.episode, 6);
+        let s = classify_title("Show - 06 1080p").expect("unbracketed resolution");
+        assert_eq!(s.episode, 6);
+        assert_eq!(s.resolution.as_deref(), Some("1080p"));
+    }
+
+    #[tokio::test]
+    async fn live_faithful_item_shape() {
+        let server = MockServer::start().await;
+        let rss = r#"<?xml version="1.0"?><rss version="2.0" xmlns:nyaa="https://nyaa.si/xmlns/nyaa"><channel><item><title>[G] A &amp; B - 03 [1080p]</title><link>https://nyaa.si/download/5.torrent</link><guid isPermaLink="false">https://nyaa.si/view/5</guid><nyaa:infoHash>abcdef0123456789abcdef0123456789abcdef01</nyaa:infoHash><nyaa:category>Anime - English-translated</nyaa:category><nyaa:size>1.4 GiB</nyaa:size><nyaa:seeders/></item></channel></rss>"#;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(rss))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let hits = Nyaa::with_endpoint(server.uri())
+            .unwrap()
+            .search("A & B 3")
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "[G] A & B - 03 [1080p]", "entity rejoins");
+        assert_eq!(hits[0].page_url, "https://nyaa.si/view/5");
+        assert_eq!(hits[0].seeders, 0, "self-closing seeders reads as 0");
+    }
+
+    #[tokio::test]
+    async fn items_without_url_are_skipped() {
+        let server = MockServer::start().await;
+        let rss = rss_wrap(
+            "<item><title>[G] No URL - 01 [1080p]</title><nyaa:size>1.4 GiB</nyaa:size></item>",
+        );
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(rss))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let hits = Nyaa::with_endpoint(server.uri())
+            .unwrap()
+            .search("No URL 1")
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_show_id_errors() {
+        let db = Db::open_memory().unwrap();
+        let nyaa = Nyaa::with_endpoint("http://127.0.0.1:1".into()).unwrap();
+        assert!(find_missing(&db, &nyaa, 9999).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn specials_only_show_wants_nothing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(rss_wrap("")))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("S", 0, 1, None, None), &rf("/lib/S/special.mkv"))
+            .unwrap();
+        let show_id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+        let wanted = find_missing(&db, &Nyaa::with_endpoint(server.uri()).unwrap(), show_id)
+            .await
+            .unwrap();
+        assert!(wanted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn total_at_or_below_max_hunts_nothing() {
+        // No mocks mounted: any request would 404 and fail the unwrap.
+        let server = MockServer::start().await;
+        for total in [3i64, 2] {
+            let db = Db::open_memory().unwrap();
+            for e in [1u32, 2, 3] {
+                db.upsert_episode(
+                    &pn("T", 1, e, Some("G"), Some("1080p")),
+                    &rf(&format!("/lib/T/0{e}.mkv")),
+                )
+                .unwrap();
+            }
+            let show_id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+            db.set_anilist(show_id, &match_stub("T", total)).unwrap();
+            let wanted = find_missing(&db, &Nyaa::with_endpoint(server.uri()).unwrap(), show_id)
+                .await
+                .unwrap();
+            assert!(wanted.is_empty(), "total {total}");
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_total_means_unknown_hunts_gaps_only() {
+        let db = Db::open_memory().unwrap();
+        for e in [1u32, 2, 4] {
+            db.upsert_episode(
+                &pn("Z", 1, e, Some("G"), Some("1080p")),
+                &rf(&format!("/lib/Z/0{e}.mkv")),
+            )
+            .unwrap();
+        }
+        let show_id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+        db.set_anilist(show_id, &match_stub("Z", 0)).unwrap();
+
+        let server = MockServer::start().await;
+        mock_q(&server, "Z 3", &item_xml("[G] Z - 03 [1080p]", 401, 4)).await;
+
+        let wanted = find_missing(&db, &Nyaa::with_endpoint(server.uri()).unwrap(), show_id)
+            .await
+            .unwrap();
+        assert_eq!(wanted.len(), 1, "gap only, no continuation past max");
+        assert_eq!((wanted[0].season, wanted[0].number), (1, 3));
+        assert_eq!(wanted[0].hits.len(), 1);
     }
 }

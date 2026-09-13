@@ -47,11 +47,11 @@ version = "0.8.0"
 dependencies = [
  "dirs",
  "once_cell",
- "quick-xml 0.38.4",
  "regex",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
+ "serde-xml-fast",
  "serde_json",
  "tauri",
  "tauri-build",
@@ -2757,7 +2757,7 @@ checksum = "2896bade328c13f7042a297ea5ac5b0951f6cf989dea5f32c2fd98da398195cb"
 dependencies = [
  "base64 0.23.1",
  "indexmap 2.14.2",
- "quick-xml 0.42.0",
+ "quick-xml",
  "serde",
  "time",
 ]
@@ -2898,15 +2898,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "quick-xml"
-version = "0.38.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
-dependencies = [
- "memchr",
 ]
 
 [[package]]
@@ -3410,6 +3401,17 @@ dependencies = [
  "serde",
  "serde_core",
  "typeid",
+]
+
+[[package]]
+name = "serde-xml-fast"
+version = "2.0.0"
+source = "git+https://github.com/quinnjr/serde-xml?rev=1868762d8bec64177d6f36b8bdab0f47dddfdeae#1868762d8bec64177d6f36b8bdab0f47dddfdeae"
+dependencies = [
+ "itoa",
+ "memchr",
+ "ryu",
+ "serde",
 ]
 
 [[package]]

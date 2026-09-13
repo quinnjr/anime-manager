@@ -48,8 +48,10 @@ No preference UI: strict means derived. A future "loosen" toggle is parked.
   on-demand clicks only, no background traffic, so no throttle cache. Known limitation:
   the query names the episode number only, so identical queries across seasons share
   filtered hits and the filter is episode-scoped; the linked view page disambiguates.
-- New dependency: `quick-xml` for the RSS (small, no build scripts). Recorded here
-  for the supply-chain trail; no other new deps.
+- New dependency: `serde-xml-fast` (git rev-pinned until its unknown-attribute
+  fix releases; then move to the versioned release). Recorded here for the
+  supply-chain trail; no other new deps.
+- Search retries 429/5xx/timeout twice with backoff, honors Retry-After ≤30s, 150ms between per-episode queries.
 
 ## Strict matching
 
@@ -61,7 +63,8 @@ A hit survives only when all hold:
    (`1080p` matches `1080p`, not `720p` or untagged).
 4. Title is a single episode: drop ranges (`01-12`, `6-7`), `Batch`,
    `Complete`, `Collection`, multi-episode packs. Volumes (`Vol.`) and movies
-   (`Movie`/`Movies`) are likewise rejected as non-episodes — word-boundaried, so `backpack` survives.
+   (   `Movie`/`Movies`) are likewise rejected as non-episodes — word-boundaried, so `backpack` survives.
+- SxxEyy and scene-style titles are supported by the classifier.
 
 Best (highest seeders) strict hit per wanted episode is the row's link; size and
 seeders displayed beside it. Episodes with no strict hit render a "no strict
@@ -71,7 +74,8 @@ match" row — never silently dropped.
 
 `find_missing(show_id) -> Vec<WantedEpisode { season, number, hits: Vec<WantedHit> }>`.
 Pure query: writes nothing, emits nothing. Errors (network, non-200, RSS parse)
-return `Err` — on-demand means loud, surfaced as a toast with the reason.
+ return `Err` — on-demand means loud, surfaced as a toast with the reason.
+- Errors abort the whole hunt today; per-query partial results plus an errors side-channel is a spec revision, not this change.
 
 ## Frontend (show page)
 

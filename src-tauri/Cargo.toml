@@ -28,7 +28,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 walkdir = "2"
 regex = "1"
 once_cell = "1"
-quick-xml = "0.38"
+serde-xml-fast = { git = "https://github.com/quinnjr/serde-xml", rev = "1868762d8bec64177d6f36b8bdab0f47dddfdeae" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["process", "net", "io-util", "time", "sync", "macros"] }
 thiserror = "2"
