@@ -5,7 +5,7 @@
   import { api, onEvent, type PlaybackChanged, type AppError, type InspectReport, type AssistProgress, type MatchProgress } from '$lib/api';
   import { saveShelfScroll } from '$lib/shelfScroll';
   import { playback } from '$lib/stores/playback.svelte';
-  import { assist } from '$lib/stores/assist.svelte';
+  import { assist, assistErrorSummary } from '$lib/stores/assist.svelte';
   import { matching } from '$lib/stores/matching.svelte';
   import { toasts } from '$lib/stores/toasts.svelte';
   import {
@@ -23,7 +23,8 @@
   // or changing the interval takes effect without a reload. Silent by design — the grid
   // refreshes through the usual library-changed / show-updated events — but failures and
   // degraded summaries go to the console, because scan() reports errors to its caller
-  // rather than emitting them.
+  // rather than emitting them. The background AI assist is likewise silent on success
+  // (re-homes land via library-changed); only reports carrying failure notes toast.
   let autoTimer: ReturnType<typeof setTimeout> | undefined;
   let autoCancelled = false;
 
@@ -91,9 +92,15 @@
       onEvent<AppError>('error', (e) => toasts.error(e)),
       onEvent<AssistProgress>('llm-assist-progress', (p) => assist.apply(p)),
       onEvent<MatchProgress>('match-progress', (p) => matching.apply(p)),
+      // 'llm-assist' is failures-only: background success stays silent by design
+      // (no popups), but a report carrying notes means folders were judged
+      // degraded or not at all, and that must not vanish quietly.
       onEvent<InspectReport>('llm-assist', (r) => {
-        if (r.folders === 0 && r.notes.length === 0) return;
-        toasts.push('info', `AI checked ${r.folders} uncertain folder(s): ${r.changes.length} file(s) re-homed, ${r.ignored} ignored`);
+        if (r.changes.length > 0) console.info(`llm-assist re-homed ${r.changes.length} file(s) in ${r.folders} folder(s)`);
+        const summary = assistErrorSummary(r);
+        if (summary === null) return;
+        console.error('llm-assist reported notes', r.notes);
+        toasts.push('error', summary);
       })
     ];
     api.assistProgress().then((p) => assist.apply(p)).catch(() => {});
