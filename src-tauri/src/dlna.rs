@@ -158,16 +158,34 @@ fn escape_filter_path(p: &std::path::Path) -> String {
 }
 
 /// Transcode `src` to H.264/AAC MP4 at `dst`, or reuse `dst` when present.
-/// Writes to a `.tmp` sibling and renames, so a half-written transcode is
-/// never served; runs eviction afterwards. Blocking: callers use spawn_blocking.
+/// Concurrency: a per-destination in-process lock serialises same-episode
+/// transcodes (the work is minutes-long, so the loser cache-hits instead of
+/// redoing it), and every attempt writes to a unique `<stem>.<pid>-<seq>.tmp`
+/// sibling, so two writers can never interleave into one file. The final
+/// rename(2) is atomic, hence the cache entry is always a complete transcode.
+/// Blocking: callers use spawn_blocking.
 fn ensure_remux(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    if std::fs::metadata(dst).is_ok() {
+        return Ok(dst.to_path_buf());
+    }
+    let guard = {
+        let mut m = remux_locks().lock().unwrap_or_else(|e| e.into_inner());
+        m.get(dst).cloned().unwrap_or_else(|| {
+            let g: std::sync::Arc<std::sync::Mutex<()>> = Default::default();
+            m.insert(dst.to_path_buf(), g.clone());
+            g
+        })
+    };
+    let _held = guard.lock().unwrap_or_else(|e| e.into_inner());
+    // Re-check under the lock: a concurrent transcode may have finished first.
     if std::fs::metadata(dst).is_ok() {
         return Ok(dst.to_path_buf());
     }
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
+        sweep_stale_tmps(parent, dst);
     }
-    let tmp = dst.with_extension("tmp");
+    let tmp = remux_tmp_path(dst);
     let mut cmd = std::process::Command::new("ffmpeg");
     cmd.args(["-y", "-i"]).arg(src).args(["-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac"]);
     if has_ass_subtitles(src) {
@@ -185,7 +203,62 @@ fn ensure_remux(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
     if let Some(parent) = dst.parent() {
         evict_remux_cache(parent, REMUX_CACHE_CAP_BYTES);
     }
+    // Drop the map entry when nobody else is waiting on it; the tmp-name
+    // uniqueness (not this map) is what keeps hypothetical cross-process
+    // writers safe — a second app instance is already ruled out by the
+    // single-instance plugin.
+    {
+        let mut m = remux_locks().lock().unwrap_or_else(|e| e.into_inner());
+        if std::sync::Arc::strong_count(&guard) <= 2 {
+            m.remove(dst);
+        }
+    }
     Ok(dst.to_path_buf())
+}
+
+/// In-process mutex per remux destination, so concurrent requests for the same
+/// episode serialise instead of transcoding twice.
+fn remux_locks() -> &'static std::sync::Mutex<
+    std::collections::HashMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<()>>>,
+> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<()>>>,
+        >,
+    > = std::sync::OnceLock::new();
+    LOCKS.get_or_init(Default::default)
+}
+
+static REMUX_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Unique tmp sibling per transcode attempt: `<stem>.<pid>-<seq>.tmp`.
+/// Two concurrent attempts never share a file, so their writes cannot
+/// interleave; the atomic rename then promotes exactly one complete file.
+fn remux_tmp_path(dst: &std::path::Path) -> std::path::PathBuf {
+    dst.with_extension(format!(
+        "{}-{}.tmp",
+        std::process::id(),
+        REMUX_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ))
+}
+
+/// Best-effort removal of orphaned `<stem>.*.tmp` siblings of `dst` (crashed
+/// transcodes). Only files for this destination are touched, and the caller
+/// holds its per-dst lock, so no live attempt can own them in-process.
+fn sweep_stale_tmps(dir: &std::path::Path, dst: &std::path::Path) {
+    let Some(stem) = dst.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let prefix = format!("{stem}.");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&prefix) && name.ends_with(".tmp") {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 pub fn browse(db: &crate::db::Db, object_id: &str) -> crate::error::Result<String> {
@@ -1603,18 +1676,25 @@ mod tests {
 
     /// Fake ffmpeg: answers `-version`, otherwise copies `-i SRC` to the last
     /// arg (the `<dst>.tmp`), like a transcode that preserves bytes.
+    /// `sleep_secs` delays the copy so concurrent attempts actually overlap.
     fn fake_ffmpeg_dir() -> tempfile::TempDir {
+        fake_ffmpeg_dir_with_sleep(0)
+    }
+    fn fake_ffmpeg_dir_with_sleep(sleep_secs: u64) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("ffmpeg"),
-            "#!/bin/sh\n\
-             if [ \"$1\" = \"-version\" ]; then echo \"ffmpeg version fake\"; exit 0; fi\n\
-             src=\"\"\nprev=\"\"\nlast=\"\"\n\
-             for a in \"$@\"; do\n\
-               if [ \"$prev\" = \"-i\" ]; then src=\"$a\"; fi\n\
-               prev=\"$a\"\nlast=\"$a\"\n\
-             done\n\
-             cp \"$src\" \"$last\"\n",
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = \"-version\" ]; then echo \"ffmpeg version fake\"; exit 0; fi\n\
+                 src=\"\"\nprev=\"\"\nlast=\"\"\n\
+                 for a in \"$@\"; do\n\
+                   if [ \"$prev\" = \"-i\" ]; then src=\"$a\"; fi\n\
+                   prev=\"$a\"\nlast=\"$a\"\n\
+                 done\n\
+                 sleep {sleep_secs}\n\
+                 cp \"$src\" \"$last\"\n"
+            ),
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -1647,9 +1727,53 @@ mod tests {
         let out = crate::dlna::ensure_remux(&src, &dst).unwrap();
         assert_eq!(out, dst);
         assert_eq!(std::fs::read(&dst).unwrap(), b"fake-video-bytes");
-        assert!(!dir.path().join("3-16-9.tmp").exists());
+        assert_no_tmp_leftovers(dir.path());
         // Second call reuses the cached file without re-running ffmpeg.
         assert_eq!(crate::dlna::ensure_remux(&src, &dst).unwrap(), dst);
+    }
+
+    fn assert_no_tmp_leftovers(dir: &std::path::Path) {
+        let leftovers: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn remux_tmp_names_are_unique_per_attempt() {
+        let dst = std::path::Path::new("/c/7-100-5.mp4");
+        let a = crate::dlna::remux_tmp_path(dst);
+        let b = crate::dlna::remux_tmp_path(dst);
+        assert_ne!(a, b);
+        for t in [&a, &b] {
+            assert_eq!(t.parent(), dst.parent());
+            let name = t.file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with("7-100-5.") && name.ends_with(".tmp"), "{name}");
+        }
+    }
+
+    #[test]
+    fn concurrent_remux_same_dst_yields_one_valid_file() {        let fake = fake_ffmpeg_dir_with_sleep(1);
+        let _guard = ScopedPath::prepend(fake.path());
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("ep.mkv");
+        std::fs::write(&src, b"fake-video-bytes").unwrap();
+        let dst = crate::dlna::remux_path(dir.path(), 9, 16, 9);
+        // Overlapping attempts at the same destination: the per-dst lock
+        // serialises them and unique tmp names keep the writes disjoint, so
+        // the cached file is one complete copy and no tmp survives.
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| s.spawn(|| crate::dlna::ensure_remux(&src, &dst)))
+                .collect();
+            for h in handles {
+                assert_eq!(h.join().unwrap().unwrap(), dst);
+            }
+        });
+        assert_eq!(std::fs::read(&dst).unwrap(), b"fake-video-bytes");
+        assert_no_tmp_leftovers(dir.path());
     }
 
     #[test]
