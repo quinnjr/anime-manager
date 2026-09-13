@@ -7,6 +7,7 @@ pub mod kitsu;
 pub mod llm;
 pub mod metadata;
 pub mod models;
+pub mod nyaa;
 pub mod parser;
 pub mod player;
 pub mod rename;
