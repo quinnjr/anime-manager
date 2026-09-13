@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { sendButtonState, torrentBadge } from './torrentDisplay';
+import { isSavePathInsideRoots, sendButtonState, torrentBadge } from './torrentDisplay';
 
 describe('torrentBadge', () => {
   it('shows download progress with the linked episode', () => {
@@ -53,5 +53,21 @@ describe('sendButtonState', () => {
 
   it('has nothing to offer when the hit carries no torrent url', () => {
     expect(sendButtonState({ torrent_url: null, linked: null })).toBe('unavailable');
+  });
+});
+
+describe('isSavePathInsideRoots', () => {
+  it('treats a save path equal to a root as inside (no warning)', () => {
+    expect(isSavePathInsideRoots('/media/anime', ['/media/anime'])).toBe(true);
+  });
+
+  it('treats a path under a root as inside and a lookalike prefix as outside', () => {
+    expect(isSavePathInsideRoots('/r1/Owned/01.mkv', ['/r1', '/media/anime'])).toBe(true);
+    expect(isSavePathInsideRoots('/r10/lookalike', ['/r1'])).toBe(false);
+  });
+
+  it('ignores trailing slashes on roots', () => {
+    expect(isSavePathInsideRoots('/media/anime', ['/media/anime/'])).toBe(true);
+    expect(isSavePathInsideRoots('/media/anime/Frieren', ['/media/anime//'])).toBe(true);
   });
 });

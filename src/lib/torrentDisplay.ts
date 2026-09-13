@@ -45,3 +45,16 @@ export function sendButtonState(h: SendCandidate): SendButtonState {
   if (h.linked) return (h.progress ?? 0) >= 1 ? 'seeding' : 'downloading';
   return h.torrent_url ? 'send' : 'unavailable';
 }
+
+/** True when `savePath` sits under one of `roots` — exact match or `root/`
+ *  prefix after trimming trailing slashes. Mirrors the backend rule
+ *  (`commands::path_inside_roots`): a save path equal to a root is inside
+ *  and must not warn. */
+export function isSavePathInsideRoots(savePath: string | null | undefined, roots: string[]): boolean {
+  if (!savePath) return true;
+  return roots.some((r) => {
+    let root = r.replace(/\/+$/, '');
+    if (!root) root = '/';
+    return savePath === root || savePath.startsWith(root + '/');
+  });
+}
