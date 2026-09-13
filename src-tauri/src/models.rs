@@ -322,3 +322,23 @@ pub struct TorrentPrefs {
 pub struct RssFeedLink {
     pub label: String, pub show_id: i64, pub added_at: i64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TorrentFile { pub index: usize, #[serde(default)] pub path: String, #[serde(default)] pub size: u64 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TorrentInfo {
+    pub info_hash: String, #[serde(default)] pub name: String,
+    #[serde(default)] pub status: String, #[serde(default)] pub progress: f64,
+    #[serde(default)] pub total_size: u64, #[serde(default)] pub downloaded: u64,
+    #[serde(default)] pub download_speed: u64, #[serde(default)] pub upload_speed: u64,
+    #[serde(default)] pub peers: usize, #[serde(default)] pub seeds: usize,
+    #[serde(default)] pub save_path: String, #[serde(default)] pub category: Option<String>,
+    #[serde(default)] pub ratio: f64, pub eta: Option<u64>,
+    pub error_message: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TorrentDetail { #[serde(flatten)] pub info: TorrentInfo, #[serde(default)] pub files: Vec<TorrentFile> }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LinkedTo { pub show_id: i64, pub season: u32, pub number: u32 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LinkedTorrent { #[serde(flatten)] pub info: TorrentInfo, pub linked: Option<LinkedTo> }
