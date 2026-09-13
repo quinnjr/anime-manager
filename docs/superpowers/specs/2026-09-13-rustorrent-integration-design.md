@@ -76,6 +76,24 @@ commands.
   `Set-Cookie` value in process memory, resend as `Cookie`; re-login
   transparently on 401 using the stored password. No cookie-jar crate;
   manual header handling keeps new dependencies at zero here.
+- rustorrent mDNS carries completion announcements only, no persistent server advertisement — browse candidates are opportunistic (recently-active instances); manual URL is the primary path.
+
+## Path mapping (NAS)
+
+- The desktop sees NAS paths differently than the server (verified:
+  server `/downloads/Anime/X/f.mkv` == local
+  `/mnt/nas/Downloads/Anime/X/f.mkv`). The `torrent_path_map` setting
+  holds comma-separated `server_prefix=local_prefix` pairs, e.g.
+  `/downloads=/mnt/nas/Downloads`.
+- Translation runs both directions: local→server on `torrent_add`
+  (prefs/default save paths are local form, POSTed in server form);
+  server→local for the backfill `save_path` + `files[]` join and the
+  subscribe outside-roots check (the displayed subscribe path stays
+  server form; only the check uses the translated path).
+- Prefilter rule: a torrent whose translated save_path sits under none
+  of the library roots skips its detail fetch entirely — pure prefix
+  check before any HTTP, so a large server (live-verified 2234
+  torrents) lists fast.
 
 ## Data model (schema v6 → v7)
 
