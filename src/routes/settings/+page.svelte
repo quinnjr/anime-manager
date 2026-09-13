@@ -35,6 +35,7 @@
   let dlnaName = $state('');
   let dlnaPortField = $state('28987');
   let dlnaSaving = $state(false);
+  let dlnaToggling = $state(false);
 
   /** "3 minutes ago", so a scan time reads at a glance. */
   function ago(secs: number): string {
@@ -190,13 +191,23 @@
     finally { testing = false; }
   }
 
-  async function toggleDlna() {
+  async function toggleDlna(next: boolean) {
+    if (dlnaToggling) return;
+    dlnaToggling = true;
     try {
-      await api.dlnaSetEnabled(!dlnaRunning);
+      await api.dlnaSetEnabled(next);
       const d = await api.dlnaStatus();
       dlnaRunning = d.running;
       dlnaPort = d.port;
-    } catch (e) { toasts.error(e); }
+    } catch (e) {
+      toasts.error(e);
+      try {
+        const d = await api.dlnaStatus();
+        dlnaRunning = d.running;
+        dlnaPort = d.port;
+      } catch { /* error already reported; keep last known state */ }
+    }
+    finally { dlnaToggling = false; }
   }
 
   async function saveDlna() {
@@ -357,7 +368,7 @@
     </div>
     <div class="mt-3 flex flex-wrap items-center gap-3">
       <label class="flex items-center gap-2 text-sm">
-        <input type="checkbox" checked={dlnaRunning} onchange={toggleDlna} />
+        <input type="checkbox" checked={dlnaRunning} disabled={dlnaToggling} onchange={(e) => toggleDlna((e.target as HTMLInputElement).checked)} />
         <span class="text-muted">Share over DLNA</span>
       </label>
       <button class="btn" disabled={dlnaSaving} onclick={saveDlna}>{dlnaSaving ? 'Saving…' : 'Save DLNA options'}</button>

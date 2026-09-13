@@ -302,4 +302,9 @@ pub struct DlnaStatus {
     pub running: bool,
     pub port: u16,
     pub clients_seen: u64,
+    /// Degraded-mode note (SSDP discovery down, loopback LOCATION…);
+    /// `None` means healthy. `#[serde(default)]` keeps older payloads
+    /// decoding.
+    #[serde(default)]
+    pub dlna_warning: Option<String>,
 }

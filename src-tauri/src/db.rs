@@ -701,6 +701,18 @@ impl Db {
         })
     }
 
+    /// Direct existence probe for the DLNA browse path, so it never scans the
+    /// whole library to validate one season id.
+    pub fn season_exists(&self, id: i64) -> Result<bool> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM seasons WHERE id=?1)",
+                params![id],
+                |r| r.get(0),
+            )?)
+        })
+    }
+
     /// Apply a provider's match. One statement, because auto-match is gated on `match_source`:
     /// a half-applied match (source set, id NULL) would otherwise be excluded from future scans
     /// forever. `cover_path` is cleared because the new match's art is a different image, and
@@ -1388,6 +1400,13 @@ mod tests {
         let (show, season) = db.episode_show_and_season(id).unwrap();
         assert_eq!(show.parsed_title, "Show");
         assert_eq!(season, 3);
+        let season_id = db
+            .get_show(db.list_shows("", ShowSort::Title).unwrap()[0].id)
+            .unwrap()
+            .seasons[0]
+            .id;
+        assert!(db.season_exists(season_id).unwrap());
+        assert!(!db.season_exists(season_id + 9999).unwrap());
         db.update_episode_path(id, "/z/renamed.mkv").unwrap();
         assert_eq!(db.get_episode(id).unwrap().path, "/z/renamed.mkv");
     }

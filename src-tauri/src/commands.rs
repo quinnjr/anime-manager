@@ -64,6 +64,7 @@ fn dlna_port_setting(db: &Db) -> Result<u16> {
     Ok(db
         .get_setting(SETTING_DLNA_PORT)?
         .and_then(|v| v.parse().ok())
+        .filter(|p| *p != 0)
         .unwrap_or(DLNA_DEFAULT_PORT))
 }
 
@@ -85,6 +86,7 @@ fn dlna_snapshot(dlna: &DlnaState) -> DlnaStatus {
         running: dlna.running.load(Ordering::SeqCst),
         port: dlna.port.load(Ordering::SeqCst),
         clients_seen: dlna.clients_seen.load(Ordering::SeqCst),
+        dlna_warning: crate::dlna::dlna_warning(),
     }
 }
 
@@ -105,6 +107,23 @@ pub async fn dlna_set_enabled(
         stop_dlna(&app, &state).await;
     }
     Ok(())
+}
+
+/// Validate DLNA options: trim the name, reject blank names and port 0.
+/// Pure so validation and port probing are unit-testable without Tauri state.
+fn validate_dlna_options(name: &str, port: u16) -> Result<(String, u16)> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(crate::error::AppError::Parse(
+            "DLNA name cannot be blank".into(),
+        ));
+    }
+    if port == 0 {
+        return Err(crate::error::AppError::Parse(
+            "DLNA port must be 1-65535".into(),
+        ));
+    }
+    Ok((name, port))
 }
 
 /// First free port in port..=port+20, so enabling and rebinding share one
@@ -161,6 +180,13 @@ async fn start_dlna(app: &AppHandle, state: &AppState) -> Result<()> {
     let (tx, rx) = tokio::sync::watch::channel(false);
     *guard = Some(tx);
     drop(guard);
+    // Played-marking failures are invisible in the packaged app (stderr is
+    // discarded), so report them through the global `error` event the
+    // frontend already toasts.
+    let app2 = app.clone();
+    crate::dlna::set_dlna_error_sink(Some(std::sync::Arc::new(move |e| {
+        let _ = app2.emit("error", e);
+    })));
     let server = crate::dlna::DlnaServer {
         port,
         name,
@@ -189,33 +215,59 @@ pub async fn dlna_set_options(
     name: String,
     port: u16,
 ) -> Result<()> {
-    if name.trim().is_empty() {
-        return Err(crate::error::AppError::Parse(
-            "DLNA name cannot be blank".into(),
-        ));
-    }
-    if port == 0 {
-        return Err(crate::error::AppError::Parse(
-            "DLNA port must be 1-65535".into(),
-        ));
-    }
-    let name = name.trim().to_string();
+    let (name, port) = validate_dlna_options(&name, port)?;
     if !state.dlna.running.load(Ordering::SeqCst) {
         state.db.set_setting(SETTING_DLNA_NAME, &name)?;
         state.db.set_setting(SETTING_DLNA_PORT, &port.to_string())?;
         return Ok(());
     }
+    if port == state.dlna.port.load(Ordering::SeqCst) {
+        // Name-only change: the old listener still holds this port, so
+        // probing first would see EADDRINUSE and drift one port per save.
+        // Stop the old server first, then bind the requested port (now free).
+        let uuid = dlna_uuid(&state.db)?;
+        let mut guard = state.dlna.stop_tx.lock().await;
+        if let Some(tx) = guard.take() {
+            let _ = tx.send(true);
+        }
+        // The old task drops its listener on its next poll; wait for the
+        // port itself to free up rather than probing past it.
+        let mut freed = None;
+        for _ in 0..100 {
+            match tokio::net::TcpListener::bind(std::net::SocketAddr::from(([0, 0, 0, 0], port)))
+                .await
+            {
+                Ok(l) => {
+                    freed = Some(l);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+        let Some(listener) = freed else {
+            return Err(crate::error::AppError::Io(format!(
+                "DLNA port {port} did not free up after stopping the server"
+            )));
+        };
+        state.db.set_setting(SETTING_DLNA_NAME, &name)?;
+        state.db.set_setting(SETTING_DLNA_PORT, &port.to_string())?;
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        *guard = Some(tx);
+        drop(guard);
+        let server = crate::dlna::DlnaServer {
+            port,
+            name,
+            uuid,
+            clients_seen: state.dlna.clients_seen.clone(),
+        };
+        serve_dlna(&app, &state, state.db.clone(), listener, server, rx);
+        return Ok(());
+    }
     // Bind-first: the new port range is probed while the old server still
     // runs, so a failed rebind cannot take down a healthy server. On failure
-    // the status is re-emitted unchanged and nothing is persisted or stopped.
+    // nothing is persisted or stopped.
     let uuid = dlna_uuid(&state.db)?;
-    let (listener, bound) = match bind_free_dlna_port(port).await {
-        Ok(b) => b,
-        Err(e) => {
-            let _ = app.emit("dlna-changed", dlna_snapshot(&state.dlna));
-            return Err(e);
-        }
-    };
+    let (listener, bound) = bind_free_dlna_port(port).await?;
     state.db.set_setting(SETTING_DLNA_NAME, &name)?;
     state.db.set_setting(SETTING_DLNA_PORT, &port.to_string())?;
     let mut guard = state.dlna.stop_tx.lock().await;
@@ -488,6 +540,21 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String
 
 #[tauri::command]
 pub fn set_setting(state: State<'_, AppState>, key: String, value: String) -> Result<()> {
+    // DLNA keys bypass `dlna_set_options`, so validate here too. No restart:
+    // the running server keeps its port until the next enable or option save.
+    if key == SETTING_DLNA_NAME && value.trim().is_empty() {
+        return Err(crate::error::AppError::Parse(
+            "DLNA name cannot be blank".into(),
+        ));
+    }
+    if key == SETTING_DLNA_PORT && !value.parse::<u16>().is_ok_and(|p| p != 0) {
+        return Err(crate::error::AppError::Parse(
+            "DLNA port must be 1-65535".into(),
+        ));
+    }
+    if key == SETTING_DLNA_UUID && value.trim().is_empty() {
+        return Ok(());
+    }
     state.db.set_setting(&key, &value)
 }
 
@@ -697,6 +764,8 @@ mod tests {
         assert_eq!(dlna_port_setting(&db).unwrap(), 1234);
         db.set_setting(SETTING_DLNA_PORT, "junk").unwrap();
         assert_eq!(dlna_port_setting(&db).unwrap(), DLNA_DEFAULT_PORT);
+        db.set_setting(SETTING_DLNA_PORT, "0").unwrap();
+        assert_eq!(dlna_port_setting(&db).unwrap(), DLNA_DEFAULT_PORT);
     }
 
     #[test]
@@ -705,5 +774,51 @@ mod tests {
         let first = dlna_uuid(&db).unwrap();
         assert!(first.starts_with("uuid:"));
         assert_eq!(dlna_uuid(&db).unwrap(), first);
+    }
+
+    #[test]
+    fn dlna_options_reject_blank_name_and_zero_port() {
+        assert!(validate_dlna_options("", 28987).is_err());
+        assert!(validate_dlna_options("   ", 28987).is_err());
+        assert!(validate_dlna_options("Anime", 0).is_err());
+        let (name, port) = validate_dlna_options("  Anime  ", 28987).unwrap();
+        assert_eq!(name, "Anime");
+        assert_eq!(port, 28987);
+    }
+
+    #[tokio::test]
+    async fn dlna_port_probe_bumps_past_occupied_port() {
+        let want = pick_unbound_test_port().await;
+        let _held =
+            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], want)))
+                .await
+                .unwrap();
+        let (_listener, bound) = bind_free_dlna_port(want).await.unwrap();
+        assert_eq!(bound, want + 1);
+    }
+
+    #[tokio::test]
+    async fn dlna_port_probe_errors_when_range_full() {
+        let want = pick_unbound_test_port().await;
+        let mut held = Vec::new();
+        for p in want..=want + DLNA_PORT_TRIES {
+            held.push(
+                tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], p)))
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert!(bind_free_dlna_port(want).await.is_err());
+    }
+
+    /// An ephemeral-bound port, released again: free in practice, stable
+    /// enough as a probe base since the tests hold what they need.
+    async fn pick_unbound_test_port() -> u16 {
+        tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     }
 }
