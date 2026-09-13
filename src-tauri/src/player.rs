@@ -1,7 +1,7 @@
 use crate::db::Db;
 use crate::error::{AppError, Result};
 use crate::models::{EpisodeStatus, PlaybackChanged};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,23 +14,41 @@ pub struct Player {
 }
 
 impl Player {
-    pub fn new() -> Self { Player { current: Mutex::new(None) } }
-    pub fn current(&self) -> Option<i64> { *self.current.lock().unwrap() }
+    pub fn new() -> Self {
+        Player {
+            current: Mutex::new(None),
+        }
+    }
+    pub fn current(&self) -> Option<i64> {
+        *self.current.lock().unwrap()
+    }
     fn claim(&self, id: i64) -> Result<()> {
         let mut cur = self.current.lock().unwrap();
         if let Some(existing) = *cur {
-            return Err(AppError::Player(format!("episode {existing} is already playing")));
+            return Err(AppError::Player(format!(
+                "episode {existing} is already playing"
+            )));
         }
         *cur = Some(id);
         Ok(())
     }
-    fn release(&self) { *self.current.lock().unwrap() = None; }
+    fn release(&self) {
+        *self.current.lock().unwrap() = None;
+    }
 }
 
-impl Default for Player { fn default() -> Self { Self::new() } }
+impl Default for Player {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 pub fn mpv_binary(db: &Db) -> String {
-    db.get_setting("mpv_path").ok().flatten().filter(|s| !s.is_empty()).unwrap_or_else(|| "mpv".into())
+    db.get_setting("mpv_path")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "mpv".into())
 }
 
 /// Fails fast when the file vanished. Called synchronously from `commands::play` for the
@@ -38,16 +56,20 @@ pub fn mpv_binary(db: &Db) -> String {
 pub fn ensure_file_present(path: &str) -> Result<()> {
     match std::fs::metadata(path) {
         Ok(_) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
-            Err(AppError::Player(format!("could not open '{path}': file not found"))),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied =>
-            Err(AppError::Player(format!("could not open '{path}': permission denied"))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(AppError::Player(format!(
+            "could not open '{path}': file not found"
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Err(AppError::Player(
+            format!("could not open '{path}': permission denied"),
+        )),
         Err(e) => Err(AppError::Io(e.to_string())),
     }
 }
 
 fn socket_path(episode_id: i64) -> PathBuf {
-    let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
     let dir = base.join("anime-manager");
     let _ = std::fs::create_dir_all(&dir);
     dir.join(format!("{episode_id}.sock"))
@@ -65,9 +87,15 @@ impl Ipc {
         loop {
             if let Ok(s) = UnixStream::connect(path).await {
                 let (r, w) = s.into_split();
-                return Some(Ipc { write: w, read: BufReader::new(r), next_id: 1 });
+                return Some(Ipc {
+                    write: w,
+                    read: BufReader::new(r),
+                    next_id: 1,
+                });
             }
-            if tokio::time::Instant::now() >= deadline { return None; }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
@@ -81,8 +109,13 @@ impl Ipc {
         // mpv interleaves event lines; read until our request_id shows up (bounded).
         for _ in 0..50 {
             line.clear();
-            let n = tokio::time::timeout(Duration::from_secs(2), self.read.read_line(&mut line)).await.ok()?.ok()?;
-            if n == 0 { return None; }
+            let n = tokio::time::timeout(Duration::from_secs(2), self.read.read_line(&mut line))
+                .await
+                .ok()?
+                .ok()?;
+            if n == 0 {
+                return None;
+            }
             let v: Value = serde_json::from_str(line.trim()).ok()?;
             if v.get("request_id").and_then(|r| r.as_u64()) == Some(id) {
                 return v.get("data").and_then(|d| d.as_f64());
@@ -125,7 +158,12 @@ pub async fn play_episode(
         player.release();
         return Err(e);
     }
-    notify(PlaybackChanged { episode_id, status: EpisodeStatus::Playing, position_secs: ep.position_secs, duration_secs: ep.duration_secs });
+    notify(PlaybackChanged {
+        episode_id,
+        status: EpisodeStatus::Playing,
+        position_secs: ep.position_secs,
+        duration_secs: ep.duration_secs,
+    });
 
     let mut ipc = Ipc::connect(&sock, Duration::from_secs(5)).await;
     // Without the IPC socket there is no position or duration, so the watched judgement below
@@ -153,9 +191,21 @@ pub async fn play_episode(
     if !tracked {
         // Restore the pre-playback state untouched and tell the user why nothing was recorded.
         let before = db.get_episode(episode_id)?;
-        db.set_status(episode_id, if before.status == EpisodeStatus::Playing { EpisodeStatus::Unplayed } else { before.status })?;
+        db.set_status(
+            episode_id,
+            if before.status == EpisodeStatus::Playing {
+                EpisodeStatus::Unplayed
+            } else {
+                before.status
+            },
+        )?;
         let after = db.get_episode(episode_id)?;
-        notify(PlaybackChanged { episode_id, status: after.status, position_secs: after.position_secs, duration_secs: after.duration_secs });
+        notify(PlaybackChanged {
+            episode_id,
+            status: after.status,
+            position_secs: after.position_secs,
+            duration_secs: after.duration_secs,
+        });
         return Err(AppError::Player(
             "could not reach mpv's IPC socket, so playback position was not tracked; this episode's progress is unchanged".into(),
         ));
@@ -163,11 +213,20 @@ pub async fn play_episode(
 
     let threshold = db.played_threshold()?;
     let finished = matches!(duration, Some(d) if d > 0.0 && last_pos / d >= threshold);
-    let status = if finished { EpisodeStatus::Played } else { EpisodeStatus::Unplayed };
+    let status = if finished {
+        EpisodeStatus::Played
+    } else {
+        EpisodeStatus::Unplayed
+    };
     db.set_position(episode_id, last_pos, duration)?;
     db.set_status(episode_id, status)?;
     let after = db.get_episode(episode_id)?;
-    notify(PlaybackChanged { episode_id, status, position_secs: after.position_secs, duration_secs: after.duration_secs });
+    notify(PlaybackChanged {
+        episode_id,
+        status,
+        position_secs: after.position_secs,
+        duration_secs: after.duration_secs,
+    });
     Ok(())
 }
 
@@ -197,20 +256,43 @@ mod tests {
 
     struct NoIpcGuard;
     impl NoIpcGuard {
-        fn set() -> Self { unsafe { std::env::set_var("FAKE_MPV_NO_IPC", "1") }; NoIpcGuard }
+        fn set() -> Self {
+            unsafe { std::env::set_var("FAKE_MPV_NO_IPC", "1") };
+            NoIpcGuard
+        }
     }
     impl Drop for NoIpcGuard {
-        fn drop(&mut self) { unsafe { std::env::remove_var("FAKE_MPV_NO_IPC") }; }
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("FAKE_MPV_NO_IPC") };
+        }
     }
 
     fn seeded() -> (Arc<Db>, i64) {
         let db = Arc::new(Db::open_memory().unwrap());
         db.set_setting("mpv_path", &fixture()).unwrap();
         let _ = std::fs::write("/tmp/fake.mkv", b"fake");
-        let p = ParsedName { title: "S".into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
-        let f = RawFile { path: PathBuf::from("/tmp/fake.mkv"), size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
+        let p = ParsedName {
+            title: "S".into(),
+            season: 1,
+            episode: 1,
+            release_group: None,
+            resolution: None,
+            crc: None,
+        };
+        let f = RawFile {
+            path: PathBuf::from("/tmp/fake.mkv"),
+            size: 1,
+            mtime: 1,
+            stem: "".into(),
+            dirs: vec![],
+        };
         db.upsert_episode(&p, &f).unwrap();
-        let id = db.get_show(db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].id).unwrap().seasons[0].episodes[0].id;
+        let id = db
+            .get_show(db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].id)
+            .unwrap()
+            .seasons[0]
+            .episodes[0]
+            .id;
         (db, id)
     }
 
@@ -220,7 +302,15 @@ mod tests {
         let (db, id) = seeded();
         let events = Arc::new(StdMutex::new(Vec::new()));
         let ev = events.clone();
-        play_episode(db.clone(), Arc::new(Player::new()), id, move |e| ev.lock().unwrap().push(e), Duration::from_millis(50)).await.unwrap();
+        play_episode(
+            db.clone(),
+            Arc::new(Player::new()),
+            id,
+            move |e| ev.lock().unwrap().push(e),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
         let ep = db.get_episode(id).unwrap();
         assert_eq!(ep.status, EpisodeStatus::Played);
         assert_eq!(ep.position_secs, 0.0);
@@ -233,10 +323,22 @@ mod tests {
     async fn interruption_reverts_to_unplayed_keeping_position() {
         fake_mpv("40", "1.2");
         let (db, id) = seeded();
-        play_episode(db.clone(), Arc::new(Player::new()), id, |_| {}, Duration::from_millis(200)).await.unwrap();
+        play_episode(
+            db.clone(),
+            Arc::new(Player::new()),
+            id,
+            |_| {},
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
         let ep = db.get_episode(id).unwrap();
         assert_eq!(ep.status, EpisodeStatus::Unplayed);
-        assert!(ep.position_secs > 20.0 && ep.position_secs <= 40.0, "pos={}", ep.position_secs);
+        assert!(
+            ep.position_secs > 20.0 && ep.position_secs <= 40.0,
+            "pos={}",
+            ep.position_secs
+        );
         assert_eq!(ep.duration_secs, Some(100.0));
     }
 
@@ -245,7 +347,15 @@ mod tests {
         fake_mpv("99", "1.0");
         let (db, id) = seeded();
         db.set_setting("mpv_path", "/nonexistent/mpv").unwrap();
-        let err = play_episode(db.clone(), Arc::new(Player::new()), id, |_| {}, Duration::from_millis(200)).await.unwrap_err();
+        let err = play_episode(
+            db.clone(),
+            Arc::new(Player::new()),
+            id,
+            |_| {},
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, AppError::Player(_)));
         assert_eq!(db.get_episode(id).unwrap().status, EpisodeStatus::Unplayed);
     }
@@ -257,16 +367,46 @@ mod tests {
         db.set_setting("mpv_path", &fixture()).unwrap();
         let missing = PathBuf::from("/tmp/anime-manager-test-missing.mkv");
         let _ = std::fs::remove_file(&missing);
-        let p = ParsedName { title: "Gone".into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
-        let f = RawFile { path: missing, size: 1, mtime: 1, stem: "".into(), dirs: vec![] };
+        let p = ParsedName {
+            title: "Gone".into(),
+            season: 1,
+            episode: 1,
+            release_group: None,
+            resolution: None,
+            crc: None,
+        };
+        let f = RawFile {
+            path: missing,
+            size: 1,
+            mtime: 1,
+            stem: "".into(),
+            dirs: vec![],
+        };
         db.upsert_episode(&p, &f).unwrap();
         let show_id = db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].id;
         let missing_id = db.get_show(show_id).unwrap().seasons[0].episodes[0].id;
         let player = Arc::new(Player::new());
-        let err = play_episode(db.clone(), player.clone(), missing_id, |_| {}, Duration::from_millis(50)).await.unwrap_err();
-        assert!(matches!(err, AppError::Player(ref m) if m.contains("could not open") && m.contains("file not found")), "{err:?}");
-        assert_eq!(db.get_episode(missing_id).unwrap().status, EpisodeStatus::Unplayed);
-        assert!(player.current().is_none(), "rejected launch must not hold the player claim");
+        let err = play_episode(
+            db.clone(),
+            player.clone(),
+            missing_id,
+            |_| {},
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Player(ref m) if m.contains("could not open") && m.contains("file not found")),
+            "{err:?}"
+        );
+        assert_eq!(
+            db.get_episode(missing_id).unwrap().status,
+            EpisodeStatus::Unplayed
+        );
+        assert!(
+            player.current().is_none(),
+            "rejected launch must not hold the player claim"
+        );
     }
 
     #[tokio::test]
@@ -274,9 +414,23 @@ mod tests {
         fake_mpv("99", "1.0");
         let (db, id) = seeded();
         let player = Arc::new(Player::new());
-        let first = tokio::spawn(play_episode(db.clone(), player.clone(), id, |_| {}, Duration::from_millis(200)));
+        let first = tokio::spawn(play_episode(
+            db.clone(),
+            player.clone(),
+            id,
+            |_| {},
+            Duration::from_millis(200),
+        ));
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let err = play_episode(db.clone(), player.clone(), id, |_| {}, Duration::from_millis(200)).await.unwrap_err();
+        let err = play_episode(
+            db.clone(),
+            player.clone(),
+            id,
+            |_| {},
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, AppError::Player(_)));
         first.await.unwrap().unwrap();
     }
@@ -290,17 +444,39 @@ mod tests {
         let _guard = NoIpcGuard::set();
         db.set_position(id, 1300.0, Some(1400.0)).unwrap();
         db.set_status(id, EpisodeStatus::Unplayed).unwrap();
-        let err = play_episode(db.clone(), Arc::new(Player::new()), id, |_| {}, Duration::from_millis(50)).await.unwrap_err();
-        assert!(matches!(err, AppError::Player(ref m) if m.contains("IPC")), "{err:?}");
+        let err = play_episode(
+            db.clone(),
+            Arc::new(Player::new()),
+            id,
+            |_| {},
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, AppError::Player(ref m) if m.contains("IPC")),
+            "{err:?}"
+        );
         let ep = db.get_episode(id).unwrap();
-        assert_eq!(ep.status, EpisodeStatus::Unplayed, "must not be flipped to played from a stale 1300/1400");
-        assert_eq!(ep.position_secs, 1300.0, "the resume point must not be rewound");
+        assert_eq!(
+            ep.status,
+            EpisodeStatus::Unplayed,
+            "must not be flipped to played from a stale 1300/1400"
+        );
+        assert_eq!(
+            ep.position_secs, 1300.0,
+            "the resume point must not be rewound"
+        );
     }
 
     #[test]
     fn ensure_file_present_rejects_missing_path_with_player_error() {
-        let err = ensure_file_present("/tmp/anime-manager-test-definitely-missing.mkv").unwrap_err();
-        assert!(matches!(err, AppError::Player(ref m) if m.contains("could not open") && m.contains("file not found")), "{err:?}");
+        let err =
+            ensure_file_present("/tmp/anime-manager-test-definitely-missing.mkv").unwrap_err();
+        assert!(
+            matches!(err, AppError::Player(ref m) if m.contains("could not open") && m.contains("file not found")),
+            "{err:?}"
+        );
     }
     #[test]
     fn ensure_file_present_accepts_existing_path() {

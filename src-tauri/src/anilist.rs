@@ -1,7 +1,7 @@
 use crate::db::Db;
 use crate::error::{AppError, Result};
 use crate::models::MetadataHit;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 const QUERY: &str = r#"
@@ -27,7 +27,10 @@ pub struct AniList {
 }
 
 fn normalize(s: &str) -> Vec<char> {
-    s.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()
+    s.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect()
 }
 
 fn bigrams(cs: &[char]) -> Vec<(char, char)> {
@@ -39,8 +42,12 @@ fn bigrams(cs: &[char]) -> Vec<(char, char)> {
 /// still score highly against "Sousou no Frieren".
 pub fn similarity(a: &str, b: &str) -> f64 {
     let (na, nb) = (normalize(a), normalize(b));
-    if na.is_empty() || nb.is_empty() { return 0.0; }
-    if na.len() < 2 || nb.len() < 2 { return if na == nb { 1.0 } else { 0.0 }; }
+    if na.is_empty() || nb.is_empty() {
+        return 0.0;
+    }
+    if na.len() < 2 || nb.len() < 2 {
+        return if na == nb { 1.0 } else { 0.0 };
+    }
     let (ba, bb) = (bigrams(&na), bigrams(&nb));
     let mut remaining = bb.clone();
     let mut shared = 0usize;
@@ -57,8 +64,12 @@ pub fn similarity(a: &str, b: &str) -> f64 {
 pub fn best_match<'a>(title: &str, hits: &'a [MetadataHit]) -> Option<&'a MetadataHit> {
     hits.iter()
         .map(|h| {
-            let s = similarity(title, &h.title_romaji)
-                .max(h.title_english.as_deref().map(|e| similarity(title, e)).unwrap_or(0.0));
+            let s = similarity(title, &h.title_romaji).max(
+                h.title_english
+                    .as_deref()
+                    .map(|e| similarity(title, e))
+                    .unwrap_or(0.0),
+            );
             (h, s)
         })
         .filter(|(_, s)| *s >= MIN_AUTO_MATCH_SIMILARITY)
@@ -95,10 +106,16 @@ impl AniList {
             attempt += 1;
             let resp = self.client.post(&self.endpoint).json(&body).send().await?;
             let status = resp.status();
-            if status.is_success() { break resp.json().await?; }
+            if status.is_success() {
+                break resp.json().await?;
+            }
             // AniList rate-limits aggressively and states the wait in Retry-After.
-            let retry_after = resp.headers().get("retry-after").and_then(|h| h.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok()).map(std::time::Duration::from_secs);
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(std::time::Duration::from_secs);
             let retryable = status.as_u16() == 429 || status.is_server_error();
             if !retryable || attempt >= MAX_ATTEMPTS {
                 return Err(AppError::Network(format!("anilist returned {status}")));
@@ -106,7 +123,11 @@ impl AniList {
             let backoff = self.retry_base * 2u32.pow(attempt - 1);
             tokio::time::sleep(retry_after.unwrap_or(backoff).max(backoff)).await;
         };
-        let media = v.pointer("/data/Page/media").and_then(|m| m.as_array()).cloned().unwrap_or_default();
+        let media = v
+            .pointer("/data/Page/media")
+            .and_then(|m| m.as_array())
+            .cloned()
+            .unwrap_or_default();
         Ok(media
             .iter()
             .filter_map(|m| {
@@ -114,18 +135,29 @@ impl AniList {
                     id: m.get("id")?.as_i64()?,
                     source: SOURCE.to_string(),
                     title_romaji: m.pointer("/title/romaji")?.as_str()?.to_string(),
-                    title_english: m.pointer("/title/english").and_then(|t| t.as_str()).map(String::from),
-                    cover_url: m.pointer("/coverImage/large").and_then(|t| t.as_str()).map(String::from),
+                    title_english: m
+                        .pointer("/title/english")
+                        .and_then(|t| t.as_str())
+                        .map(String::from),
+                    cover_url: m
+                        .pointer("/coverImage/large")
+                        .and_then(|t| t.as_str())
+                        .map(String::from),
                     episodes: m.get("episodes").and_then(|e| e.as_i64()),
                 })
             })
             .collect())
     }
 
-    pub fn client(&self) -> &reqwest::Client { &self.client }
+    pub fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
 
     /// Shorten retry waits (tests).
-    pub fn with_retry_base(mut self, d: std::time::Duration) -> Self { self.retry_base = d; self }
+    pub fn with_retry_base(mut self, d: std::time::Duration) -> Self {
+        self.retry_base = d;
+        self
+    }
 
     pub async fn search(&self, q: &str) -> Result<Vec<MetadataHit>> {
         self.run(json!({"q": q})).await
@@ -161,7 +193,12 @@ fn cover_extension(url: &str) -> &str {
 /// Download a show's cover art next to the database and record where it landed. Cover art is
 /// otherwise fetched from AniList's CDN on every render, so the library is blank offline.
 /// Already-downloaded art is left alone.
-pub async fn download_cover(db: &Db, client: &reqwest::Client, show_id: i64, url: &str) -> Result<std::path::PathBuf> {
+pub async fn download_cover(
+    db: &Db,
+    client: &reqwest::Client,
+    show_id: i64,
+    url: &str,
+) -> Result<std::path::PathBuf> {
     download_cover_into(db, client, &covers_dir(), show_id, url).await
 }
 
@@ -183,7 +220,10 @@ pub async fn download_cover_into(
     let dest_str = crate::db::path_to_str(&dest)?;
     let resp = client.get(url).send().await?;
     if !resp.status().is_success() {
-        return Err(AppError::Network(format!("cover download returned {}", resp.status())));
+        return Err(AppError::Network(format!(
+            "cover download returned {}",
+            resp.status()
+        )));
     }
     let bytes = resp.bytes().await?;
     if bytes.is_empty() {
@@ -219,8 +259,14 @@ pub async fn download_missing_covers(
         }
         first = false;
         let changed = match download_cover(&db, &client, show_id, &url).await {
-            Ok(_) => { fetched += 1; Some(show_id) }
-            Err(e) => { eprintln!("cover {show_id}: {e}"); None }
+            Ok(_) => {
+                fetched += 1;
+                Some(show_id)
+            }
+            Err(e) => {
+                eprintln!("cover {show_id}: {e}");
+                None
+            }
         };
         on_progress(crate::models::MatchProgress {
             done: i + 1,
@@ -251,7 +297,11 @@ mod tests {
     #[tokio::test]
     async fn search_parses_hits() {
         let server = MockServer::start().await;
-        Mock::given(method("POST")).and(path("/")).respond_with(ResponseTemplate::new(200).set_body_json(body())).mount(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body()))
+            .mount(&server)
+            .await;
         let api = AniList::with_endpoint(server.uri());
         let hits = api.search("frieren").await.unwrap();
         assert_eq!(hits.len(), 2);
@@ -264,9 +314,16 @@ mod tests {
     #[tokio::test]
     async fn http_error_is_network_error() {
         let server = MockServer::start().await;
-        Mock::given(method("POST")).respond_with(ResponseTemplate::new(500)).mount(&server).await;
-        let api = AniList::with_endpoint(server.uri()).with_retry_base(std::time::Duration::from_millis(1));
-        assert!(matches!(api.search("x").await, Err(crate::error::AppError::Network(_))));
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let api = AniList::with_endpoint(server.uri())
+            .with_retry_base(std::time::Duration::from_millis(1));
+        assert!(matches!(
+            api.search("x").await,
+            Err(crate::error::AppError::Network(_))
+        ));
     }
 
     #[test]
@@ -276,22 +333,47 @@ mod tests {
         assert!(similarity("Bagel Girl", "Sousou no Frieren") < MIN_AUTO_MATCH_SIMILARITY);
         assert!(similarity("Sekirei", "Sousou no Frieren") < MIN_AUTO_MATCH_SIMILARITY);
         assert!(similarity("Yuru Yuri", "Yuru Yuri San Hai!") >= MIN_AUTO_MATCH_SIMILARITY);
-        let hits = vec![
-            MetadataHit { id: 1, source: "anilist".into(), title_romaji: "Totally Unrelated Show".into(), title_english: None, cover_url: None, episodes: None },
-        ];
-        assert!(best_match("Bagel Girl", &hits).is_none(), "a bad first hit must not be applied unattended");
-        let hits = vec![
-            MetadataHit { id: 2, source: "anilist".into(), title_romaji: "Sousou no Frieren".into(), title_english: Some("Frieren: Beyond Journey's End".into()), cover_url: None, episodes: None },
-        ];
-        assert_eq!(best_match("Frieren", &hits).map(|h| h.id), Some(2), "the English title also counts");
+        let hits = vec![MetadataHit {
+            id: 1,
+            source: "anilist".into(),
+            title_romaji: "Totally Unrelated Show".into(),
+            title_english: None,
+            cover_url: None,
+            episodes: None,
+        }];
+        assert!(
+            best_match("Bagel Girl", &hits).is_none(),
+            "a bad first hit must not be applied unattended"
+        );
+        let hits = vec![MetadataHit {
+            id: 2,
+            source: "anilist".into(),
+            title_romaji: "Sousou no Frieren".into(),
+            title_english: Some("Frieren: Beyond Journey's End".into()),
+            cover_url: None,
+            episodes: None,
+        }];
+        assert_eq!(
+            best_match("Frieren", &hits).map(|h| h.id),
+            Some(2),
+            "the English title also counts"
+        );
     }
 
     #[tokio::test]
     async fn rate_limited_search_is_retried() {
         let server = MockServer::start().await;
-        Mock::given(method("POST")).respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0")).up_to_n_times(1).mount(&server).await;
-        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200).set_body_json(body())).mount(&server).await;
-        let api = AniList::with_endpoint(server.uri()).with_retry_base(std::time::Duration::from_millis(1));
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body()))
+            .mount(&server)
+            .await;
+        let api = AniList::with_endpoint(server.uri())
+            .with_retry_base(std::time::Duration::from_millis(1));
         assert_eq!(api.search("frieren").await.unwrap().len(), 2);
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
@@ -309,42 +391,111 @@ mod tests {
         use crate::parser::ParsedName;
         use crate::scanner::RawFile;
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/a.jpg"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"FIRST".to_vec())).mount(&server).await;
-        Mock::given(method("GET")).and(path("/b.jpg"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SECOND".to_vec())).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/a.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"FIRST".to_vec()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/b.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SECOND".to_vec()))
+            .mount(&server)
+            .await;
 
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_memory().unwrap();
-        let p = ParsedName { title: "Show".into(), season: 1, episode: 1, release_group: None, resolution: None, crc: None };
-        db.upsert_episode(&p, &RawFile { path: "/a/1.mkv".into(), size: 1, mtime: 1, stem: "".into(), dirs: vec![] }).unwrap();
+        let p = ParsedName {
+            title: "Show".into(),
+            season: 1,
+            episode: 1,
+            release_group: None,
+            resolution: None,
+            crc: None,
+        };
+        db.upsert_episode(
+            &p,
+            &RawFile {
+                path: "/a/1.mkv".into(),
+                size: 1,
+                mtime: 1,
+                stem: "".into(),
+                dirs: vec![],
+            },
+        )
+        .unwrap();
         let id = db.list_shows("", crate::models::ShowSort::Title).unwrap()[0].id;
         let client = reqwest::Client::new();
-        let hit = |n: &str| MetadataHit { id: 1, source: "anilist".into(), title_romaji: "Show".into(),
-            title_english: None, cover_url: Some(format!("{}/{n}", server.uri())), episodes: None };
+        let hit = |n: &str| MetadataHit {
+            id: 1,
+            source: "anilist".into(),
+            title_romaji: "Show".into(),
+            title_english: None,
+            cover_url: Some(format!("{}/{n}", server.uri())),
+            episodes: None,
+        };
 
         db.set_anilist(id, &hit("a.jpg")).unwrap();
-        let first = download_cover_into(&db, &client, dir.path(), id, &hit("a.jpg").cover_url.unwrap()).await.unwrap();
+        let first = download_cover_into(
+            &db,
+            &client,
+            dir.path(),
+            id,
+            &hit("a.jpg").cover_url.unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(std::fs::read(&first).unwrap(), b"FIRST");
-        assert_eq!(db.get_show(id).unwrap().cover_path.as_deref(), Some(first.to_str().unwrap()));
+        assert_eq!(
+            db.get_show(id).unwrap().cover_path.as_deref(),
+            Some(first.to_str().unwrap())
+        );
 
         // Re-matching to a different entry must not leave the old poster in place.
         db.set_anilist(id, &hit("b.jpg")).unwrap();
-        assert!(db.get_show(id).unwrap().cover_path.is_none(), "a new match drops the stale art");
-        let second = download_cover_into(&db, &client, dir.path(), id, &hit("b.jpg").cover_url.unwrap()).await.unwrap();
-        assert_eq!(std::fs::read(&second).unwrap(), b"SECOND", "the file is refetched, not adopted");
+        assert!(
+            db.get_show(id).unwrap().cover_path.is_none(),
+            "a new match drops the stale art"
+        );
+        let second = download_cover_into(
+            &db,
+            &client,
+            dir.path(),
+            id,
+            &hit("b.jpg").cover_url.unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&second).unwrap(),
+            b"SECOND",
+            "the file is refetched, not adopted"
+        );
     }
 
     #[tokio::test]
     async fn a_failed_cover_download_is_not_recorded() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).respond_with(ResponseTemplate::new(404)).mount(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_memory().unwrap();
         let client = reqwest::Client::new();
-        let err = download_cover_into(&db, &client, dir.path(), 1, &format!("{}/x.jpg", server.uri())).await.unwrap_err();
+        let err = download_cover_into(
+            &db,
+            &client,
+            dir.path(),
+            1,
+            &format!("{}/x.jpg", server.uri()),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, AppError::Network(_)), "{err:?}");
-        assert!(!dir.path().join("1.jpg").exists(), "no partial file left behind");
+        assert!(
+            !dir.path().join("1.jpg").exists(),
+            "no partial file left behind"
+        );
         assert!(!dir.path().join("1.part").exists());
     }
 
@@ -352,14 +503,29 @@ mod tests {
     fn an_exact_tie_goes_to_the_first_provider() {
         // Providers::search appends AniList before Kitsu, so an identical score must keep AniList
         // rather than silently migrating the whole library to the other provider's ids.
-        let mk = |source: &str, id: i64| MetadataHit { id, source: source.into(),
-            title_romaji: "Sousou no Frieren".into(), title_english: None, cover_url: None, episodes: None };
+        let mk = |source: &str, id: i64| MetadataHit {
+            id,
+            source: source.into(),
+            title_romaji: "Sousou no Frieren".into(),
+            title_english: None,
+            cover_url: None,
+            episodes: None,
+        };
         let hits = vec![mk("anilist", 154587), mk("kitsu", 46474)];
         let best = best_match("Sousou no Frieren", &hits).unwrap();
         assert_eq!((best.source.as_str(), best.id), ("anilist", 154587));
         // A strictly better score still wins regardless of order.
-        let hits = vec![mk("anilist", 1), MetadataHit { id: 2, source: "kitsu".into(),
-            title_romaji: "Sousou no Frieren".into(), title_english: None, cover_url: None, episodes: None }];
+        let hits = vec![
+            mk("anilist", 1),
+            MetadataHit {
+                id: 2,
+                source: "kitsu".into(),
+                title_romaji: "Sousou no Frieren".into(),
+                title_english: None,
+                cover_url: None,
+                episodes: None,
+            },
+        ];
         assert_eq!(best_match("Sousou no Frieren", &hits).unwrap().id, 1);
     }
 }

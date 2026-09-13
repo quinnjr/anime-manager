@@ -57,6 +57,7 @@ export interface MatchProgress { done: number; total: number; title: string; pha
 export interface AssistProgress { done: number; total: number; folder: string; running: boolean }
 export interface InspectReport { folders: number; ignored: number; changes: InspectChange[]; notes: string[]; show_id: number | null }
 export interface ScanProgress { done: number; total: number; current_path: string }
+export interface DlnaStatus { running: boolean; port: number; clients_seen: number; dlna_warning?: string; }
 export interface PlaybackChanged { episode_id: number; status: EpisodeStatus; position_secs: number; duration_secs: number | null }
 export type MetadataSource = 'anilist' | 'kitsu';
 export interface MetadataHit {
@@ -73,6 +74,8 @@ export type RenameTarget = { type: 'show'; id: number } | { type: 'episode'; id:
 export type SettingsMap = Record<string, string> & {
   auto_scan_interval_mins?: string;
   library_sort?: ShowSort;
+  dlna_name?: string;
+  dlna_port?: string;
 };
 
 export const api = {
@@ -101,7 +104,10 @@ export const api = {
   assistProgress: () => invoke<AssistProgress>('assist_progress'),
   clearAiDecisions: () => invoke<number>('clear_ai_decisions'),
   matchLibrary: () => invoke<number>('match_library'),
-  setShowTitle: (showId: number, title: string | null) => invoke<ShowDetail>('set_show_title', { showId, title })
+  setShowTitle: (showId: number, title: string | null) => invoke<ShowDetail>('set_show_title', { showId, title }),
+  dlnaStatus: () => invoke<DlnaStatus>('dlna_status'),
+  dlnaSetEnabled: (enabled: boolean) => invoke<void>('dlna_set_enabled', { enabled }),
+  dlnaSetOptions: (name: string, port: number) => invoke<void>('dlna_set_options', { name, port })
 };
 
 export function onEvent<T>(name: string, cb: (payload: T) => void): Promise<UnlistenFn> {
