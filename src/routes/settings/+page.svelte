@@ -34,6 +34,7 @@
 
   let torrentBaseUrl = $state('');
   let torrentPassword = $state('');
+  let torrentPathMap = $state('');
   let torrentTested = $state(false);
   let torrentTesting = $state(false);
   let torrentDiscovering = $state(false);
@@ -77,6 +78,7 @@
       llmTested = isTestedFlag(s.llm_test_ok);
       torrentBaseUrl = s.torrent_base_url ?? '';
       torrentPassword = s.torrent_password ?? '';
+      torrentPathMap = s.torrent_path_map ?? '';
       torrentTested = isTestedFlag(s.torrent_test_ok);
       provider = LLM_PROVIDERS.find((p) => p.baseUrl === llmBaseUrl)?.id ?? 'custom';
       dlnaName = s.dlna_name ?? '';
@@ -184,6 +186,8 @@
       const torrentUrl = torrentBaseUrl.trim();
       if (torrentUrl) await api.setSetting('torrent_base_url', torrentUrl);
       await api.setSetting('torrent_password', torrentPassword.trim());
+      // A bad pair fails loudly here and the stored mapping is left alone.
+      await api.setSetting('torrent_path_map', torrentPathMap.trim());
       await refreshTestFlag();
       await refreshTorrentFlag();
       toasts.push('success', 'Settings saved');
@@ -502,6 +506,11 @@
       <label class="block text-sm sm:col-span-2">
         <span class="text-muted">Base URL</span>
         <input bind:value={torrentBaseUrl} class="field mt-1 w-full" placeholder="http://nas:8080/" />
+      </label>
+      <label class="block text-sm sm:col-span-2">
+        <span class="text-muted">Path mapping (NAS)</span>
+        <input bind:value={torrentPathMap} class="field mt-1 w-full" placeholder="/downloads=/mnt/nas/Downloads" />
+        <span class="tag mt-1 block">Comma-separated server=local pairs, e.g. /downloads=/mnt/nas/Downloads — the server sees NAS paths differently than this machine. A bad pair fails the save loudly and keeps the old value.</span>
       </label>
     </div>
     <div class="mt-3 flex flex-wrap items-center gap-3">

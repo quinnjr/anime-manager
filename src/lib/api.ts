@@ -110,6 +110,7 @@ export type SettingsMap = Record<string, string> & {
   torrent_base_url?: string;
   torrent_password?: string;
   torrent_test_ok?: string;
+  torrent_path_map?: string;
 };
 
 export const api = {

@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 pub const BASE_URL_KEY: &str = "torrent_base_url";
 pub const PASSWORD_KEY: &str = "torrent_password";
 pub const TEST_OK_KEY: &str = "torrent_test_ok";
+/// NAS path mapping: comma-separated `server_prefix=local_prefix` pairs, e.g.
+/// `/downloads=/mnt/nas/Downloads`. The server and this machine see the same
+/// files under different roots; every comparison translates first.
+pub const PATH_MAP_KEY: &str = "torrent_path_map";
 
 /// What `control` asks the server to do to one torrent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,6 +278,21 @@ impl TorrentClient {
         Ok(added.info_hash)
     }
 
+    /// Add with a local save path: translate local→server via the NAS map
+    /// before POST, so prefs/defaults (local form) reach the server in its
+    /// own form. Pure translation, unit-testable through the wiremock below.
+    pub async fn add_torrent_mapped(
+        &self,
+        bytes: Vec<u8>,
+        filename: &str,
+        local_save_path: &str,
+        category: &str,
+        map: &[(String, String)],
+    ) -> Result<String> {
+        let server_path = map_to_server(local_save_path, map);
+        self.add_torrent(bytes, filename, &server_path, category).await
+    }
+
     pub async fn control(&self, hash: &str, op: &ControlOp) -> Result<()> {
         match op {
             ControlOp::Start => {
@@ -406,6 +425,20 @@ impl TorrentClient {
     /// `linked: None` and never fails the list.
     pub async fn attribute(&self, db: &Db, torrents: Vec<TorrentInfo>) -> Vec<LinkedTorrent> {
         let mut index: Option<Vec<(i64, String)>> = None;
+        // The NAS map is stored, so read it once here — never per torrent —
+        // and translate every server save_path to local form before comparing.
+        // A stored value that no longer parses is treated as no mapping: the
+        // Settings save rejects bad pairs loudly, so this is only defensive.
+        let map = db
+            .get_setting(PATH_MAP_KEY)
+            .ok()
+            .flatten()
+            .and_then(|raw| parse_path_map(&raw).ok())
+            .unwrap_or_default();
+        let roots: Vec<String> = db
+            .list_roots()
+            .map(|rs| rs.into_iter().map(|r| r.path).collect())
+            .unwrap_or_default();
         let mut out = Vec::with_capacity(torrents.len());
         for info in torrents {
             let linked = match db.torrent_link(&info.info_hash) {
@@ -414,7 +447,7 @@ impl TorrentClient {
                     season: link.season,
                     number: link.number,
                 }),
-                _ => self.backfill(db, &info, &mut index).await,
+                _ => self.backfill(db, &info, &mut index, &map, &roots).await,
             };
             out.push(LinkedTorrent { info, linked });
         }
@@ -432,7 +465,15 @@ impl TorrentClient {
         db: &Db,
         info: &TorrentInfo,
         index: &mut Option<Vec<(i64, String)>>,
+        map: &[(String, String)],
+        roots: &[String],
     ) -> Option<LinkedTo> {
+        // Detail-fetch prefilter (perf: live-verified 2234-torrent server):
+        // a torrent whose translated save_path sits under none of the
+        // library roots can match nothing, so skip the HTTP entirely.
+        if !path_under_roots(&map_to_local(&info.save_path, map), roots) {
+            return None;
+        }
         if index.is_none() {
             let mut built = Vec::new();
             if let Ok(shows) = db.list_shows("", ShowSort::Title) {
@@ -449,9 +490,12 @@ impl TorrentClient {
             return None;
         }
         let detail = self.detail(&info.info_hash).await.ok()?;
+        // Server truth translated to local form before the join: without
+        // this a NAS-backed server never backfills.
+        let local_save = map_to_local(&detail.info.save_path, map);
         let hit = candidates
             .iter()
-            .find(|(_, path)| episode_in_torrent(&detail.info.save_path, &detail.files, path))?;
+            .find(|(_, path)| episode_in_torrent(&local_save, &detail.files, path))?;
         // The path came from this show's episode list; resolve which
         // season/episode it is so the badge can name it.
         let show = db.get_show(hit.0).ok()?;
@@ -549,6 +593,101 @@ fn join_root(root: &str, sub: &str) -> String {
         return root.to_string();
     }
     format!("{root}/{sub}")
+}
+
+/// Parse a `torrent_path_map` setting into `(server_prefix, local_prefix)`
+/// pairs. Empty/blank string is no mapping, not an error. Every pair is
+/// trimmed and both sides must be non-empty absolute paths; a bad pair is a
+/// loud `Parse` error naming the pair, so Settings can reject it on save.
+pub fn parse_path_map(raw: &str) -> Result<Vec<(String, String)>> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for pair in raw.split(',') {
+        let trimmed = pair.trim();
+        let Some((server, local)) = trimmed.split_once('=') else {
+            return Err(AppError::Parse(format!(
+                "bad path mapping pair '{trimmed}': expected server_prefix=local_prefix"
+            )));
+        };
+        let server = server.trim();
+        let local = local.trim();
+        if server.is_empty() || local.is_empty() || !server.starts_with('/') || !local.starts_with('/') {
+            return Err(AppError::Parse(format!(
+                "bad path mapping pair '{trimmed}': both sides must be non-empty absolute paths"
+            )));
+        }
+        out.push((server.to_string(), local.to_string()));
+    }
+    Ok(out)
+}
+
+/// A stored prefix with trailing slashes removed (`/` stays `/`), so
+/// `/downloads/` and `/downloads` compare identically.
+fn normalize_prefix(prefix: &str) -> &str {
+    let trimmed = prefix.trim_end_matches('/');
+    if trimmed.is_empty() { "/" } else { trimmed }
+}
+
+/// True when `prefix` (already normalized) matches `path` on a `/`
+/// boundary: the whole string, or followed by a separator. `/dl` never
+/// matches `/dl2/x`.
+fn boundary_match(path: &str, prefix: &str) -> bool {
+    if prefix == "/" {
+        return path.starts_with('/');
+    }
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+/// Translate `path` across the map in one direction. Longest matching
+/// prefix wins; no match returns the input unchanged.
+fn translate(path: &str, map: &[(String, String)], to_local: bool) -> String {
+    let mut best: Option<(&str, &str)> = None;
+    for (server, local) in map {
+        let (from, to) = if to_local {
+            (server.as_str(), local.as_str())
+        } else {
+            (local.as_str(), server.as_str())
+        };
+        let from = normalize_prefix(from);
+        if !boundary_match(path, from) {
+            continue;
+        }
+        if best.is_none_or(|(prev, _)| from.len() > prev.len()) {
+            best = Some((from, normalize_prefix(to)));
+        }
+    }
+    let Some((from, to)) = best else {
+        return path.to_string();
+    };
+    let rest = &path[from.len()..];
+    if rest.is_empty() {
+        to.to_string()
+    } else if rest.starts_with('/') {
+        format!("{to}{rest}")
+    } else {
+        // Only reachable via the `/` prefix, which consumed the leading slash.
+        format!("{to}/{rest}")
+    }
+}
+
+/// A local path as the server sees it, for POSTing `save_path` on add.
+pub fn map_to_server(local: &str, map: &[(String, String)]) -> String {
+    translate(local, map, false)
+}
+
+/// A server `save_path` as this machine sees it, for library comparisons.
+pub fn map_to_local(server: &str, map: &[(String, String)]) -> String {
+    translate(server, map, true)
+}
+
+/// True when `path` sits under one of `roots` (exact match or `root/`
+/// prefix after trimming trailing slashes). Pure so the detail-fetch
+/// prefilter and the subscribe placement check share it unit-testably.
+pub fn path_under_roots(path: &str, roots: &[String]) -> bool {
+    roots.iter().any(|r| boundary_match(path, normalize_prefix(r)))
 }
 
 /// Backoff before retry `attempt` (1-based): 200ms, then 800ms, plus
@@ -1157,14 +1296,19 @@ mod tests {
             .mount(&s)
             .await;
         let db = Db::open_memory().unwrap();
+        db.add_root("/r1").unwrap();
         db.upsert_episode(&pn("Owned", 1), &rf("/r1/Owned/01.mkv", 11)).unwrap();
         let owned = show_id(&db, "Owned");
         db.add_torrent_link(&TorrentLink {
             info_hash: "pinned".into(), show_id: owned, season: 1, number: 1, added_at: 0,
         }).unwrap();
         let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        // The list-time save_path drives the prefilter, so it is realistic:
+        // under a root for the backfilled torrent, empty for the ghost.
+        let mut unpinned = torrent_info("unpinned");
+        unpinned.save_path = "/r1".into();
         let out = c
-            .attribute(&db, vec![torrent_info("pinned"), torrent_info("unpinned"), torrent_info("ghost")])
+            .attribute(&db, vec![torrent_info("pinned"), unpinned, torrent_info("ghost")])
             .await;
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].linked, Some(crate::models::LinkedTo { show_id: owned, season: 1, number: 1 }));
@@ -1244,5 +1388,141 @@ mod tests {
         let cfg = c.server_config().await.unwrap();
         assert_eq!(cfg.default_save_path.as_deref(), Some("/dl"));
         assert_eq!(resolve_category_path(&cfg, "anime"), "/dl/tv");
+    }
+
+    #[test]
+    fn parse_path_map_empty_is_no_mapping() {
+        assert!(parse_path_map("").unwrap().is_empty());
+        assert!(parse_path_map("   ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_path_map_multi_pair() {
+        let map = parse_path_map("/downloads=/mnt/nas/Downloads, /media/anime = /anime").unwrap();
+        assert_eq!(
+            map,
+            vec![
+                ("/downloads".to_string(), "/mnt/nas/Downloads".to_string()),
+                ("/media/anime".to_string(), "/anime".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_path_map_rejects_bad_pairs_loudly() {
+        for bad in [
+            "/downloads",            // no '=' at all
+            "=/mnt/nas/Downloads",   // empty server side
+            "/downloads=",           // empty local side
+            "downloads=/mnt/nas",    // server side not absolute
+            "/downloads=mnt/nas",    // local side not absolute
+            "/a=/b,not-a-pair",      // second pair bad
+            "/a=/b,",                // trailing comma is a bad (empty) pair
+        ] {
+            let err = parse_path_map(bad).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("bad path mapping pair"), "{bad}: {msg}");
+        }
+    }
+
+    #[test]
+    fn map_longest_prefix_wins() {
+        let map = parse_path_map("/downloads=/mnt/nas/Downloads,/downloads/anime=/anime").unwrap();
+        assert_eq!(
+            map_to_local("/downloads/anime/Frieren/01.mkv", &map),
+            "/anime/Frieren/01.mkv"
+        );
+        assert_eq!(
+            map_to_server("/anime/Frieren/01.mkv", &map),
+            "/downloads/anime/Frieren/01.mkv"
+        );
+        // The shorter prefix still serves what the longer one does not cover.
+        assert_eq!(
+            map_to_local("/downloads/other/01.mkv", &map),
+            "/mnt/nas/Downloads/other/01.mkv"
+        );
+    }
+
+    #[test]
+    fn map_prefix_boundary_is_safe() {
+        let map = parse_path_map("/dl=/mnt/nas").unwrap();
+        // `/dl` must NOT map `/dl2/x`: the match ends mid-segment.
+        assert_eq!(map_to_local("/dl2/x", &map), "/dl2/x");
+        assert_eq!(map_to_server("/mnt/nas2/x", &map), "/mnt/nas2/x");
+        assert_eq!(map_to_local("/dl/x", &map), "/mnt/nas/x");
+        // Trailing slashes on either side normalize away.
+        let slashy = parse_path_map("/dl/=/mnt/nas/").unwrap();
+        assert_eq!(map_to_local("/dl/x", &slashy), "/mnt/nas/x");
+        assert_eq!(map_to_local("/dl", &slashy), "/mnt/nas");
+        // No match returns the input unchanged.
+        assert_eq!(map_to_local("/elsewhere/x", &map), "/elsewhere/x");
+        assert_eq!(map_to_server("/elsewhere/x", &map), "/elsewhere/x");
+    }
+
+    #[test]
+    fn map_round_trips_both_directions() {
+        let map = parse_path_map("/downloads=/mnt/nas/Downloads").unwrap();
+        let local = "/mnt/nas/Downloads/Anime/X/f.mkv";
+        let server = map_to_server(local, &map);
+        assert_eq!(server, "/downloads/Anime/X/f.mkv");
+        assert_eq!(map_to_local(&server, &map), local);
+        let server2 = "/downloads/Anime/Y/g.mkv";
+        let local2 = map_to_local(server2, &map);
+        assert_eq!(local2, "/mnt/nas/Downloads/Anime/Y/g.mkv");
+        assert_eq!(map_to_server(&local2, &map), server2);
+    }
+
+    #[test]
+    fn prefilter_skips_save_paths_outside_all_roots() {
+        let roots = vec!["/mnt/nas/Downloads".to_string(), "/media/anime/".to_string()];
+        assert!(path_under_roots("/mnt/nas/Downloads/Frieren/01.mkv", &roots));
+        assert!(path_under_roots("/media/anime/Frieren", &roots));
+        assert!(!path_under_roots("/downloads/Anime/Frieren/01.mkv", &roots));
+        assert!(!path_under_roots("/mnt/nas2/lookalike", &roots));
+        assert!(!path_under_roots("", &roots));
+        // …until the NAS map translates the server form into a root.
+        let map = parse_path_map("/downloads=/mnt/nas/Downloads").unwrap();
+        let translated = map_to_local("/downloads/Anime/Frieren/01.mkv", &map);
+        assert!(path_under_roots(&translated, &roots));
+    }
+
+    #[tokio::test]
+    async fn mapped_add_posts_the_server_form_of_save_path() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/api/torrents"))
+            .and(body_string_contains("/downloads/anime"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"info_hash": "abc123"})),
+            )
+            .expect(1)
+            .mount(&s)
+            .await;
+        let map = parse_path_map("/downloads=/mnt/nas/Downloads").unwrap();
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        let hash = c
+            .add_torrent_mapped(
+                b"fake-torrent-bytes".to_vec(),
+                "show.torrent",
+                "/mnt/nas/Downloads/anime",
+                "anime",
+                &map,
+            )
+            .await
+            .unwrap();
+        assert_eq!(hash, "abc123");
+        // The local form must never reach the wire: every POSTed body
+        // carries the server form instead.
+        let received = s.received_requests().await.unwrap_or_default();
+        let bodies: Vec<String> = received
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert!(bodies.iter().any(|b| b.contains("/downloads/anime")));
+        assert!(
+            !bodies.iter().any(|b| b.contains("/mnt/nas")),
+            "local save_path leaked to the server"
+        );
     }
 }

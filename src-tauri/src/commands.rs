@@ -563,6 +563,14 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String
             .get_setting(torrent::PASSWORD_KEY)?
             .unwrap_or_default(),
     );
+    // NAS prefix pairs (`server_prefix=local_prefix,…`); "" is no mapping.
+    m.insert(
+        torrent::PATH_MAP_KEY.into(),
+        state
+            .db
+            .get_setting(torrent::PATH_MAP_KEY)?
+            .unwrap_or_default(),
+    );
     // Read-only like its LLM counterpart: managed by Test connection.
     m.insert(
         torrent::TEST_OK_KEY.into(),
@@ -641,6 +649,11 @@ pub fn set_setting(state: State<'_, AppState>, key: String, value: String) -> Re
         return Err(crate::error::AppError::Parse(
             "torrent base URL cannot be blank".into(),
         ));
+    }
+    // A bad mapping pair never lands: the parse error names the pair and the
+    // stored value is left alone, so the Settings save fails loudly.
+    if key == torrent::PATH_MAP_KEY {
+        torrent::parse_path_map(&value)?;
     }
     // DLNA keys bypass `dlna_set_options`, so validate here too. No restart:
     // the running server keeps its port until the next enable or option save.
@@ -926,7 +939,17 @@ pub async fn torrent_add(
     let cat = clean(category)
         .or_else(|| clean(prefs.category.clone()))
         .unwrap_or_else(|| "anime".into());
-    let hash = client.add_torrent(bytes, &filename, &dest, &cat).await?;
+    // Prefs and defaults are local form; the server needs its own form.
+    let map = state
+        .db
+        .get_setting(torrent::PATH_MAP_KEY)
+        .ok()
+        .flatten()
+        .and_then(|raw| torrent::parse_path_map(&raw).ok())
+        .unwrap_or_default();
+    let hash = client
+        .add_torrent_mapped(bytes, &filename, &dest, &cat, &map)
+        .await?;
     state.db.add_torrent_link(&TorrentLink {
         info_hash: hash.clone(),
         show_id,
@@ -993,14 +1016,12 @@ pub struct RssSubscribeResult {
 }
 
 /// True when `path` sits under one of `roots` (exact match or `root/` prefix
-/// after trimming trailing slashes), so completions scan back in. Pure so the
-/// subscribe placement check is unit-testable without a database.
+/// after trimming trailing slashes), so completions scan back in. Thin alias
+/// over the shared torrent helper so the subscribe check and the attribute
+/// prefilter agree; pure so the subscribe placement check is unit-testable
+/// without a database.
 fn path_inside_roots(path: &str, roots: &[String]) -> bool {
-    roots.iter().any(|r| {
-        let root = r.trim_end_matches('/');
-        let root = if root.is_empty() { "/" } else { root };
-        path == root || path.starts_with(&format!("{root}/"))
-    })
+    torrent::path_under_roots(path, roots)
 }
 
 /// One-click subscribe: derive the feed URL and group/resolution preferences from the
@@ -1038,12 +1059,22 @@ pub async fn torrent_rss_subscribe(
         .await?;
     state.db.add_rss_feed(&label, show_id)?;
     // Server-truth placement: a config fetch failure never blocks the subscribe.
+    // The displayed path stays server form (server truth); the outside-roots
+    // warning is driven by the server path translated to local form, or a
+    // NAS-backed server would warn on every subscribe.
     let (resolved_path, outside_roots) = match client.server_config().await {
         Ok(cfg) => {
             let path = torrent::resolve_category_path(&cfg, &category);
+            let map = state
+                .db
+                .get_setting(torrent::PATH_MAP_KEY)
+                .ok()
+                .flatten()
+                .and_then(|raw| torrent::parse_path_map(&raw).ok())
+                .unwrap_or_default();
             let outside = match state.db.list_roots() {
                 Ok(roots) => !path_inside_roots(
-                    &path,
+                    &torrent::map_to_local(&path, &map),
                     &roots.into_iter().map(|r| r.path).collect::<Vec<_>>(),
                 ),
                 Err(e) => {
