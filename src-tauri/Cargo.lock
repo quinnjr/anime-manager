@@ -3405,8 +3405,9 @@ dependencies = [
 
 [[package]]
 name = "serde-xml-fast"
-version = "2.0.0"
-source = "git+https://github.com/quinnjr/serde-xml?rev=1868762d8bec64177d6f36b8bdab0f47dddfdeae#1868762d8bec64177d6f36b8bdab0f47dddfdeae"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2449bf73602e8d641980c920704e23b06a32991782b262ae8b2faeb3379641be"
 dependencies = [
  "itoa",
  "memchr",
