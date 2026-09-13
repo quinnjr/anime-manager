@@ -413,12 +413,17 @@ pub fn default_save_path(db: &Db, show_id: i64) -> Result<String> {
         let prefix = format!("{}/", r.path.trim_end_matches('/'));
         owned.iter().any(|p| p.starts_with(&prefix))
     }) {
-        return Ok(root.path.clone());
+        let trimmed = root.path.trim_end_matches('/');
+        let trimmed = if trimmed.is_empty() { "/" } else { trimmed };
+        return Ok(trimmed.to_string());
     }
     roots
         .iter()
         .find(|r| r.last_scan.as_ref().map(|s| s.readable).unwrap_or(true))
-        .map(|r| r.path.clone())
+        .map(|r| {
+            let trimmed = r.path.trim_end_matches('/');
+            if trimmed.is_empty() { "/".to_string() } else { trimmed.to_string() }
+        })
         .ok_or_else(|| AppError::Parse("no library root to save into".into()))
 }
 
@@ -770,6 +775,12 @@ mod tests {
         // No roots at all is an error, not a guess.
         let empty = Db::open_memory().unwrap();
         assert!(default_save_path(&empty, 1).is_err());
+        // A root stored with a trailing slash comes back trimmed, so the
+        // base + "/" + rel join in episode_in_torrent still matches.
+        let slash = Db::open_memory().unwrap();
+        slash.add_root("/tv/").unwrap();
+        slash.upsert_episode(&pn("Slash", 1), &rf("/tv/Slash/01.mkv", 14)).unwrap();
+        assert_eq!(default_save_path(&slash, show_id(&slash, "Slash")).unwrap(), "/tv");
     }
 
     #[test]
