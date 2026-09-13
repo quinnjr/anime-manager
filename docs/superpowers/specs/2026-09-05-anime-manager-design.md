@@ -184,7 +184,9 @@ the on-demand command reports that assist is busy rather than racing the worker.
 
 `llm_test()` sends a one-line prompt and returns the model's reply, for the settings
 drawer's "Test connection" button. Success arms the background worker for the current
-config; failure disarms it. Network failures are logged and non-fatal during
+config; failure disarms it. Upgrade note: databases predating the flag have none, so
+background assist stands down until the first successful Test after upgrading — the
+settings tag says so, and nothing toasts. Network failures are logged and non-fatal during
 scans; on-demand failures surface as toasts.
 
 ## Safety rules
@@ -287,6 +289,7 @@ set_status(episode_id, status)    rematch(show_id, match_id?, source?)
 search_metadata(query) -> SearchResult { hits: Vec<MetadataHit>, warnings }
 set_show_title(show_id, title?) -> ShowDetail
 inspect_show(show_id) -> InspectReport   llm_test() -> String
+llm_models_for(key, base_url) -> String[]   // list without persisting; the picker uses this
 assist_progress() -> AssistProgress      clear_ai_decisions() -> usize
 preview_rename(target) -> RenamePlan   apply_rename(plan) -> RenameResult
 undo_rename() -> RenameResult     get_settings() / set_setting(key, value)

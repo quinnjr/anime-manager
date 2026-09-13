@@ -1197,6 +1197,14 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_setting_really_removes_it() {
+        let db = Db::open_memory().unwrap();
+        db.set_setting("scratch_key", "1").unwrap();
+        db.delete_setting("scratch_key").unwrap();
+        assert!(db.get_setting("scratch_key").unwrap().is_none());
+    }
+
+    #[test]
     fn migrate_is_idempotent() {
         let db = Db::open_memory().unwrap();
         db.with(|c| {

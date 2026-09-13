@@ -31,7 +31,11 @@ pub const OVERRIDE_SOURCE: &str = "llm";
 /// Settings key recording that `llm_test` last succeeded. The background worker only drains
 /// when this holds TEST_OK_VALUE; see `Llm::test_ok`.
 pub const TEST_OK_KEY: &str = "llm_test_ok";
-const TEST_OK_VALUE: &str = "1";
+pub const TEST_OK_VALUE: &str = "1";
+/// Settings keys identifying the connection: writing any of them invalidates the last test.
+pub const SETTING_LLM_API_KEY: &str = "llm_api_key";
+pub const SETTING_LLM_BASE_URL: &str = "llm_base_url";
+pub const SETTING_LLM_MODEL: &str = "llm_model";
 /// Longest `Retry-After` worth honouring in-process; beyond this the quota is spent, not busy.
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// Attempts per request; waits grow as retry_base * 2^n and honour Retry-After.
@@ -124,6 +128,11 @@ pub struct Llm {
 }
 
 impl Llm {
+    /// Associated aliases of the module-level key consts, so callers holding the type can name
+    /// them as `Llm::TEST_OK_KEY` without importing the free consts.
+    pub const TEST_OK_KEY: &str = crate::llm::TEST_OK_KEY;
+    pub const TEST_OK_VALUE: &str = crate::llm::TEST_OK_VALUE;
+
     pub fn with(base_url: String, api_key: Option<String>, model: String) -> Self {
         let client = reqwest::Client::builder()
             .user_agent("anime-manager/0.1")
@@ -167,7 +176,9 @@ impl Llm {
     }
 
     pub fn configured(&self) -> bool {
-        self.api_key.is_some()
+        // A key alone is not enough: with no model every request fails, so the scan gate
+        // treats that as unconfigured rather than queueing work that cannot run.
+        self.api_key.is_some() && !self.model.trim().is_empty()
     }
 
     /// Background assist only runs after the settings "Test connection" button has succeeded
@@ -194,11 +205,24 @@ impl Llm {
     /// Writing a new key, endpoint or model invalidates the last successful test: the flag
     /// says the *current* config works, so any change to it re-arms only via another test.
     pub fn invalidates_test(key: &str) -> bool {
-        matches!(key, "llm_api_key" | "llm_base_url" | "llm_model")
+        matches!(
+            key,
+            SETTING_LLM_API_KEY | SETTING_LLM_BASE_URL | SETTING_LLM_MODEL
+        )
     }
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// Snapshot of the connection identity, so callers can tell whether the settings they
+    /// tested against are still the ones in force.
+    pub fn identity(&self) -> (String, String, String) {
+        (
+            self.base_url.clone(),
+            self.model.clone(),
+            self.api_key.clone().unwrap_or_default(),
+        )
     }
 
     pub async fn chat(&self, system: &str, user: &str) -> Result<String> {
@@ -207,7 +231,7 @@ impl Llm {
         })?;
         if self.model.trim().is_empty() {
             return Err(AppError::Network(
-                "No model chosen: pick one in Settings (press List)".into(),
+                "No model chosen: pick one in Settings (Choose…)".into(),
             ));
         }
         let body = json!({
@@ -1767,19 +1791,32 @@ mod tests {
     fn rewriting_identity_settings_disarms_the_worker() {
         let db = Db::open_memory().unwrap();
         Llm::mark_tested(&db, true).unwrap();
-        for k in ["llm_api_key", "llm_base_url", "llm_model"] {
+        for k in [
+            SETTING_LLM_API_KEY,
+            SETTING_LLM_BASE_URL,
+            SETTING_LLM_MODEL,
+        ] {
             assert!(Llm::invalidates_test(k), "{k} must invalidate the last test");
         }
-        for k in ["llm_delay_ms", "llm_assist_on_scan", "mpv_path"] {
+        for k in [
+            "llm_delay_ms",
+            "llm_assist_on_scan",
+            "mpv_path",
+            Llm::TEST_OK_KEY,
+            "llm_model2",
+        ] {
             assert!(!Llm::invalidates_test(k), "{k} must not disarm anything");
         }
     }
 
     #[test]
-    fn deleting_a_setting_really_removes_it() {
+    fn test_ok_rejects_non_canonical_values() {
+        // Only the exact value `mark_tested` writes arms the worker; anything else is off.
         let db = Db::open_memory().unwrap();
-        db.set_setting("llm_test_ok", "1").unwrap();
-        db.delete_setting("llm_test_ok").unwrap();
-        assert!(db.get_setting("llm_test_ok").unwrap().is_none());
+        for v in ["true", "0", ""] {
+            db.set_setting(Llm::TEST_OK_KEY, v).unwrap();
+            assert!(!Llm::test_ok(&db), "{v:?} must not arm the worker");
+        }
     }
 }
+

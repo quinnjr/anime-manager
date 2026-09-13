@@ -76,6 +76,12 @@ export type SettingsMap = Record<string, string> & {
   library_sort?: ShowSort;
   dlna_name?: string;
   dlna_port?: string;
+  llm_api_key?: string;
+  llm_model?: string;
+  llm_base_url?: string;
+  llm_assist_on_scan?: string;
+  llm_delay_ms?: string;
+  llm_test_ok?: string;
 };
 
 export const api = {
@@ -99,6 +105,7 @@ export const api = {
   inspectShow: (showId: number) => invoke<InspectReport>('inspect_show', { showId }),
   llmTest: () => invoke<string>('llm_test'),
   llmModels: () => invoke<string[]>('llm_models'),
+  llmModelsFor: (key: string, baseUrl: string) => invoke<string[]>('llm_models_for', { key, baseUrl }),
   libraryStatus: () => invoke<LibraryStatus>('library_status'),
   mergeDuplicates: () => invoke<number>('merge_duplicates'),
   assistProgress: () => invoke<AssistProgress>('assist_progress'),

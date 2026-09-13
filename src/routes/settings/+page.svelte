@@ -7,6 +7,7 @@
     type Root, type ScanProgress, type ScanSummary, type LibraryStatus, type DlnaStatus
   } from '$lib/api';
   import { toasts } from '$lib/stores/toasts.svelte';
+  import { isTestedFlag } from '$lib/llmModels';
   import ModelPickerModal from '$lib/components/ModelPickerModal.svelte';
   import { matching } from '$lib/stores/matching.svelte';
   import { DEFAULT_AUTO_SCAN_MINS, parseValidatedAutoScanMins } from '$lib/autoScan';
@@ -66,7 +67,7 @@
       llmOnScan = (s.llm_assist_on_scan ?? 'true') !== 'false';
       autoScanMins = s.auto_scan_interval_mins ?? String(DEFAULT_AUTO_SCAN_MINS);
       llmDelay = s.llm_delay_ms ?? '500';
-      llmTested = (s.llm_test_ok ?? 'false') === 'true';
+      llmTested = isTestedFlag(s.llm_test_ok);
       provider = LLM_PROVIDERS.find((p) => p.baseUrl === llmBaseUrl)?.id ?? 'custom';
       dlnaName = s.dlna_name ?? '';
       dlnaPortField = s.dlna_port ?? '28987';
@@ -154,11 +155,11 @@
     if (p && p.baseUrl) llmBaseUrl = p.baseUrl;
   }
 
-  async function saveAll() {
+  async function saveAll(): Promise<boolean> {
     const t = Number(threshold);
-    if (!(t > 0 && t <= 1)) { toasts.push('error', 'Played threshold must be between 0 and 1'); return; }
+    if (!(t > 0 && t <= 1)) { toasts.push('error', 'Played threshold must be between 0 and 1'); return false; }
     const autoMins = parseValidatedAutoScanMins(autoScanMins);
-    if (autoMins === null) { toasts.push('error', 'Auto-scan interval must be a whole number of minutes (0 turns it off)'); return; }
+    if (autoMins === null) { toasts.push('error', 'Auto-scan interval must be a whole number of minutes (0 turns it off)'); return false; }
     try {
       await api.setSetting('mpv_path', mpvPath.trim());
       await api.setSetting('played_threshold', String(t));
@@ -168,24 +169,26 @@
       await api.setSetting('llm_base_url', llmBaseUrl.trim());
       await api.setSetting('llm_assist_on_scan', llmOnScan ? 'true' : 'false');
       await api.setSetting('llm_delay_ms', String(Math.max(0, Number(llmDelay) || 0)));
+      await refreshTestFlag();
       toasts.push('success', 'Settings saved');
-    } catch (e) { toasts.error(e); }
+      return true;
+    } catch (e) { toasts.error(e); return false; }
   }
 
   async function refreshTestFlag() {
-    // The picker may have saved a new key or endpoint behind this page's back; only the
-    // flag is re-read, never the fields, so unsaved edits above it survive.
-    try { llmTested = ((await api.getSettings()).llm_test_ok ?? 'false') === 'true'; }
-    catch { /* flag keeps its last value; errors already surfaced where raised */ }
+    // Only the flag is re-read, never the fields, so unsaved edits above it survive.
+    // This is also the only surfacing path for a getSettings failure here, so it toasts.
+    try { llmTested = isTestedFlag((await api.getSettings()).llm_test_ok); }
+    catch (e) { toasts.error(e); }
   }
 
   async function testLlm() {
     testing = true;
     try {
-      await saveAll();
+      if (!(await saveAll())) { testing = false; return; }
       toasts.push('success', await api.llmTest());
-      llmTested = true;
-    } catch (e) { toasts.error(e); llmTested = false; }
+      await refreshTestFlag();
+    } catch (e) { toasts.error(e); await refreshTestFlag(); }
     finally { testing = false; }
   }
 
@@ -443,10 +446,9 @@
     apiKey={llmKey.trim()} baseUrl={llmBaseUrl.trim()} current={llmModel.trim()}
     bind:open={modelPickerOpen}
     onPick={(m) => (llmModel = m)}
-    onClose={refreshTestFlag}
   />
   <div class="sticky bottom-0 -mx-6 border-t border-edge bg-ink/95 px-6 py-3 backdrop-blur">
-    <button class="btn btn-key" onclick={saveAll}>Save settings</button>
+    <button class="btn btn-key" onclick={() => void saveAll()}>Save settings</button>
     <a href="/" class="btn ml-2 inline-block">Back to library</a>
   </div>
 </div>

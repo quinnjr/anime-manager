@@ -4,3 +4,8 @@ export function filterModels(models: string[], query: string): string[] {
   if (!q) return models;
   return models.filter((m) => m.toLowerCase().includes(q));
 }
+
+/** Single source for the IPC "true" encoding on the frontend. */
+export function isTestedFlag(v: string | undefined): boolean {
+  return v === 'true';
+}
