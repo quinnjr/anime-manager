@@ -863,8 +863,11 @@ pub async fn torrent_list(state: State<'_, AppState>) -> Result<Vec<LinkedTorren
 }
 
 /// Send one strict Nyaa hit to rustorrent and pin the result to its episode.
-/// Dedups by `info_hash` when given: already pinned OR already on the server →
-/// link it to the requested episode, no double add. Returns the server's info_hash.
+/// The server list is the source of truth: a given `info_hash` (trimmed and
+/// lowercased once) present on the server is linked to the requested episode
+/// with no double add, whether or not a pin exists. Absent from the server →
+/// download → add → pin, so a stale pin can never shadow a re-add. Returns
+/// the server's info_hash.
 // Arity is the IPC contract (flat args per the design spec), not a refactor target.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
@@ -882,29 +885,17 @@ pub async fn torrent_add(
     require_torrent_armed(&state.db)?;
     let client = torrent::TorrentClient::from_db(&state.db)?;
     let clean = |o: Option<String>| o.filter(|v| !v.trim().is_empty());
-    let given = clean(info_hash);
-    if let Some(hash) = given.clone()
-        && state.db.torrent_link(&hash)?.is_some()
-    {
-        state.db.add_torrent_link(&TorrentLink {
-            info_hash: hash.clone(),
-            show_id,
-            season,
-            number,
-            added_at: db::now(),
-        })?;
-        let _ = app.emit("torrent-changed", ());
-        let _ = app.emit("show-updated", show_id);
-        return Ok(hash);
-    }
-    // Already on the server (added outside the app, no pin) → link, no re-add.
-    // A failing list() is loud: fall-through would risk a blind duplicate add.
+    let given = clean(info_hash)
+        .map(|h| h.trim().to_lowercase())
+        .filter(|h| !h.is_empty());
+    // Server list first, single call: a failing list() is loud, so a blind
+    // duplicate add can never follow. Pins are only (re-)written here.
     if let Some(hash) = given
         && client
             .list()
             .await?
             .iter()
-            .any(|t| t.info_hash == hash)
+            .any(|t| t.info_hash.trim().to_lowercase() == hash)
     {
         state.db.add_torrent_link(&TorrentLink {
             info_hash: hash.clone(),
@@ -960,6 +951,14 @@ pub async fn torrent_control(
     torrent::TorrentClient::from_db(&state.db)?
         .control(&info_hash, &op)
         .await?;
+    // Forget semantics: the pin dies only after the server removal succeeded,
+    // so a failed remove keeps the link and a later re-add is never shadowed.
+    if matches!(op, torrent::ControlOp::Remove { .. }) {
+        let key = info_hash.trim().to_lowercase();
+        if !key.is_empty() {
+            state.db.remove_torrent_link(&key)?;
+        }
+    }
     let _ = app.emit("torrent-changed", ());
     Ok(())
 }

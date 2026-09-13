@@ -1064,6 +1064,15 @@ impl Db {
             .optional()?))
     }
 
+    /// Forget a pin after its torrent leaves the server, so a stale pin can
+    /// never shadow a later re-add of the same hash.
+    pub fn remove_torrent_link(&self, info_hash: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM torrent_links WHERE info_hash = ?1", params![info_hash])?;
+            Ok(())
+        })
+    }
+
     pub fn links_for_show(&self, show_id: i64) -> Result<Vec<TorrentLink>> {
         self.with(|c| {
             let mut st = c.prepare("SELECT info_hash, show_id, season, number, added_at FROM torrent_links WHERE show_id = ?1 ORDER BY rowid")?;
@@ -2445,6 +2454,8 @@ mod tests {
         let got = db.torrent_link("abc123").unwrap().expect("link stored");
         assert_eq!(got.number, 6);
         assert!(db.torrent_link("nope").unwrap().is_none());
+        db.remove_torrent_link("abc123").unwrap();
+        assert!(db.torrent_link("abc123").unwrap().is_none());
         let prefs = db.get_prefs(show_id).unwrap();
         assert_eq!(prefs, TorrentPrefs { show_id: 1, save_path: None, category: None });
         db.set_prefs(show_id, Some("/tv/Frieren"), Some("anime")).unwrap();
