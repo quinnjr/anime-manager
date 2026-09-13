@@ -162,7 +162,10 @@ pub fn classify_title(title: &str) -> Option<SingleEpisode> {
     })
 }
 
-/// Nyaa RSS search client. `base_url` is `https://nyaa.si` in production;
+/// Nyaa base URL in production; tests pass the mock server URI to `Nyaa::with`.
+pub const NYAA_BASE: &str = "https://nyaa.si";
+
+/// Nyaa RSS search client. `base_url` is [`NYAA_BASE`] in production;
 /// tests pass the mock server URI.
 pub struct Nyaa {
     client: reqwest::Client,

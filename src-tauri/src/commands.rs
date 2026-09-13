@@ -4,6 +4,7 @@ use crate::error::Result;
 use crate::llm::{self, AssistQueue, Llm};
 use crate::metadata::{self, Providers};
 use crate::models::*;
+use crate::nyaa::{self, Nyaa, WantedEpisode};
 use crate::player::{self, Player};
 use crate::rename;
 use std::collections::HashMap;
@@ -737,6 +738,18 @@ pub async fn inspect_show(
         let _ = app.emit("show-updated", id);
     }
     Ok(report)
+}
+
+/// Missing episodes for a show and their strict Nyaa matches, best seeders first.
+/// Pure query: writes nothing, emits nothing.
+#[tauri::command]
+pub async fn find_missing(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    show_id: i64,
+) -> Result<Vec<WantedEpisode>> {
+    let _ = &app;
+    nyaa::find_missing(&state.db, &Nyaa::with(nyaa::NYAA_BASE.into()), show_id).await
 }
 
 /// Model ids offered by whatever provider is configured right now.

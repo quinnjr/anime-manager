@@ -57,6 +57,8 @@ export interface MatchProgress { done: number; total: number; title: string; pha
 export interface AssistProgress { done: number; total: number; folder: string; running: boolean }
 export interface InspectReport { folders: number; ignored: number; changes: InspectChange[]; notes: string[]; show_id: number | null }
 export interface ScanProgress { done: number; total: number; current_path: string }
+export interface WantedHit { title: string; page_url: string; size_bytes: number; seeders: number }
+export interface WantedEpisode { season: number; number: number; hits: WantedHit[] }
 export interface DlnaStatus { running: boolean; port: number; clients_seen: number; dlna_warning?: string; }
 export interface PlaybackChanged { episode_id: number; status: EpisodeStatus; position_secs: number; duration_secs: number | null }
 export type MetadataSource = 'anilist' | 'kitsu';
@@ -103,6 +105,7 @@ export const api = {
   setSetting: (key: string, value: string) => invoke<void>('set_setting', { key, value }),
   purgeMissing: () => invoke<number>('purge_missing'),
   inspectShow: (showId: number) => invoke<InspectReport>('inspect_show', { showId }),
+  findMissing: (showId: number) => invoke<WantedEpisode[]>('find_missing', { showId }),
   llmTest: () => invoke<string>('llm_test'),
   llmModels: () => invoke<string[]>('llm_models'),
   llmModelsFor: (key: string, baseUrl: string) => invoke<string[]>('llm_models_for', { key, baseUrl }),
