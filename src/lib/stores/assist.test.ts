@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { assist, assistErrorSummary } from './assist.svelte';
+import { assist, assistErrorMessages } from './assist.svelte';
 
 describe('assist', () => {
   beforeEach(() => assist.reset());
@@ -18,12 +18,21 @@ describe('assist', () => {
   });
 });
 
-describe('assistErrorSummary', () => {
+describe('assistErrorMessages', () => {
   it('stays silent when the report carries no notes', () => {
-    expect(assistErrorSummary({ notes: [] })).toBeNull();
+    expect(assistErrorMessages({ notes: [] })).toEqual([]);
   });
 
-  it('surfaces how many issues a degraded report carries', () => {
-    expect(assistErrorSummary({ notes: ['a', 'b'] })).toBe('AI assist: 2 issue(s) — see console');
+  it('surfaces the note bodies so the popup is diagnosable without devtools', () => {
+    expect(assistErrorMessages({ notes: ['a', 'b'] })).toEqual(['a', 'b']);
+  });
+
+  it('caps a bad run instead of flooding the toast stack', () => {
+    expect(assistErrorMessages({ notes: ['a', 'b', 'c', 'd', 'e'] })).toEqual([
+      'a',
+      'b',
+      'c',
+      '… and 2 more issue(s)'
+    ]);
   });
 });

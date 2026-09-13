@@ -5,7 +5,7 @@
   import { api, onEvent, type PlaybackChanged, type AppError, type InspectReport, type AssistProgress, type MatchProgress } from '$lib/api';
   import { saveShelfScroll } from '$lib/shelfScroll';
   import { playback } from '$lib/stores/playback.svelte';
-  import { assist, assistErrorSummary } from '$lib/stores/assist.svelte';
+  import { assist, assistErrorMessages } from '$lib/stores/assist.svelte';
   import { matching } from '$lib/stores/matching.svelte';
   import { toasts } from '$lib/stores/toasts.svelte';
   import {
@@ -97,10 +97,10 @@
       // degraded or not at all, and that must not vanish quietly.
       onEvent<InspectReport>('llm-assist', (r) => {
         if (r.changes.length > 0) console.info(`llm-assist re-homed ${r.changes.length} file(s) in ${r.folders} folder(s)`);
-        const summary = assistErrorSummary(r);
-        if (summary === null) return;
+        const messages = assistErrorMessages(r);
+        if (messages.length === 0) return;
         console.error('llm-assist reported notes', r.notes);
-        toasts.push('error', summary);
+        for (const m of messages) toasts.push('error', m);
       })
     ];
     api.assistProgress().then((p) => assist.apply(p)).catch(() => {});

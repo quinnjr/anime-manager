@@ -12,8 +12,16 @@ export const assist = {
 
 /**
  * Background assist is silent on success; a report carrying failure notes
- * produces an error summary, else null. Pure so the silence contract is testable.
+ * produces the note bodies to toast, else an empty list. Capped so one bad
+ * run cannot flood the toast stack — mirrors the manual inspect path, which
+ * shows the first few notes. Pure so the silence contract is testable.
  */
-export function assistErrorSummary(r: Pick<InspectReport, 'notes'>): string | null {
-  return r.notes.length > 0 ? `AI assist: ${r.notes.length} issue(s) — see console` : null;
+export function assistErrorMessages(
+  r: Pick<InspectReport, 'notes'>,
+  limit = 3
+): string[] {
+  if (r.notes.length === 0) return [];
+  const shown = r.notes.slice(0, limit);
+  const rest = r.notes.length - shown.length;
+  return rest > 0 ? [...shown, `… and ${rest} more issue(s)`] : shown;
 }
