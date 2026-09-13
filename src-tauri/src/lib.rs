@@ -12,6 +12,7 @@ pub mod parser;
 pub mod player;
 pub mod rename;
 pub mod scanner;
+pub mod torrent;
 
 use std::sync::Arc;
 
