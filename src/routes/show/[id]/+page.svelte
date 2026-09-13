@@ -35,6 +35,12 @@
   // open; reloading it then errors forever and the page sticks on "Loading…".
   let generation = 0;
 
+  // Guards findMissing replies the same way `generation` guards load(): a reply arriving
+  // after navigation belongs to the previous show and must not overwrite the new show's
+  // list (or its Nyaa links). Separate from `generation` so a search neither cancels a
+  // show load nor is cancelled by background reloads for the same show.
+  let searchGeneration = 0;
+
   async function load() {
     const mine = ++generation;
     try {
@@ -99,17 +105,24 @@
 
   async function findMissing() {
     if (!show) return;
+    const mine = ++searchGeneration;
     finding = true;
     try {
       const r = await api.findMissing(show.id);
+      if (mine !== searchGeneration) return;
       wanted = r;
       found = true;
       // Pure query: nothing on disk or in the database changed, so no reload.
       if (r.length === 0) toasts.push('info', 'No missing episodes — the owned range has no gaps.');
       else if (r.every((w) => w.hits.length === 0)) toasts.push('info', 'Missing episodes found, but none has a strict match yet.');
     } catch (e) {
+      if (mine !== searchGeneration) return;
       toasts.error(e);
-    } finally { finding = false; }
+    } finally {
+      // A stale reply must not clobber the new show's state: the $effect reset already
+      // cleared `finding`, and only the latest search may clear it here.
+      if (mine === searchGeneration) finding = false;
+    }
   }
 
   async function openPage(url: string) {
@@ -130,6 +143,8 @@
     highlight = 0;
     wanted = [];
     found = false;
+    finding = false;
+    searchGeneration++; // invalidate any in-flight search for the previous show
     load();
   });
 
