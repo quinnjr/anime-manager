@@ -342,3 +342,18 @@ pub struct TorrentDetail { #[serde(flatten)] pub info: TorrentInfo, #[serde(defa
 pub struct LinkedTo { pub show_id: i64, pub season: u32, pub number: u32 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LinkedTorrent { #[serde(flatten)] pub info: TorrentInfo, pub linked: Option<LinkedTo> }
+/// POST /api/rss/feeds body: which remote feed to poll and what to grab.
+/// `exclude_batch` reproduces the strict no-packs rule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RssFeedConfig {
+    pub label: String, pub url: String, pub search: String, pub category: String,
+    pub enabled: bool, pub exclude_batch: bool,
+}
+/// One server-side feed joined to the local show it was registered for, if
+/// any — a feed the app did not create has `show_id: None`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RssFeedView {
+    pub label: String, #[serde(default)] pub url: String, #[serde(default)] pub search: String,
+    #[serde(default)] pub category: String, #[serde(default)] pub enabled: bool,
+    #[serde(default)] pub show_id: Option<i64>,
+}

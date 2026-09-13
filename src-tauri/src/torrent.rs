@@ -1,6 +1,9 @@
 use crate::db::Db;
 use crate::error::{AppError, Result};
-use crate::models::{TorrentDetail, TorrentFile, TorrentInfo};
+use crate::models::{
+    LinkedTo, LinkedTorrent, RssFeedConfig, RssFeedView, ShowSort, TorrentDetail, TorrentFile,
+    TorrentInfo,
+};
 use serde::{Deserialize, Serialize};
 
 pub const BASE_URL_KEY: &str = "torrent_base_url";
@@ -296,6 +299,159 @@ impl TorrentClient {
         }
     }
 
+    /// Subscribe the server's RSS monitor to a feed. The search regex is
+    /// validated before sending (defensive: `build_search_regex` already
+    /// produces valid patterns); the server rejects empty labels, bad
+    /// regexes and duplicate labels. Returns the label the server echoes.
+    pub async fn rss_add(&self, config: &RssFeedConfig) -> Result<String> {
+        if config.label.trim().is_empty() {
+            return Err(AppError::Parse("rss feed label must not be empty".into()));
+        }
+        if let Err(e) = regex::Regex::new(&config.search) {
+            return Err(AppError::Parse(format!("invalid rss search regex: {e}")));
+        }
+        let url = format!("{}/api/rss/feeds", self.base_url);
+        let resp = self
+            .send_authed(|| self.http.post(&url).json(config))
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = snippet(resp).await;
+            return Err(AppError::Network(format!(
+                "rustorrent rss add returned {status}: {body}"
+            )));
+        }
+        #[derive(Deserialize)]
+        struct Added {
+            #[serde(default)]
+            label: String,
+        }
+        let added: Added = resp
+            .json()
+            .await
+            .map_err(|e| AppError::Parse(e.to_string()))?;
+        if added.label.is_empty() {
+            Ok(config.label.clone())
+        } else {
+            Ok(added.label)
+        }
+    }
+
+    /// Every server-side feed joined to the local show it was registered
+    /// for, if any (a feed the app did not create has `show_id: None`).
+    pub async fn rss_list(&self, db: &Db) -> Result<Vec<RssFeedView>> {
+        let url = format!("{}/api/rss/feeds", self.base_url);
+        let resp = self.send_authed(|| self.http.get(&url)).await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = snippet(resp).await;
+            return Err(AppError::Network(format!(
+                "rustorrent rss list returned {status}: {body}"
+            )));
+        }
+        let mut feeds: Vec<RssFeedView> = resp
+            .json()
+            .await
+            .map_err(|e| AppError::Parse(e.to_string()))?;
+        for feed in &mut feeds {
+            feed.show_id = db.rss_feed_show(&feed.label)?;
+        }
+        Ok(feeds)
+    }
+
+    /// Flip a feed's enabled state. Removal is config-only server-side:
+    /// downloaded files are never touched.
+    pub async fn rss_toggle(&self, label: &str) -> Result<()> {
+        let url = format!(
+            "{}/api/rss/feeds/{}/toggle",
+            self.base_url,
+            encode_path_segment(label)
+        );
+        let resp = self.send_authed(|| self.http.post(&url)).await?;
+        Self::check_ok(resp, "rss toggle").await
+    }
+
+    pub async fn rss_remove(&self, label: &str) -> Result<()> {
+        let url = format!(
+            "{}/api/rss/feeds/{}",
+            self.base_url,
+            encode_path_segment(label)
+        );
+        let resp = self.send_authed(|| self.http.delete(&url)).await?;
+        Self::check_ok(resp, "rss remove").await
+    }
+
+    /// Resolve each torrent to the episode it belongs to, for the Downloads
+    /// view. The add-time pin (`torrent_links`) wins; anything without a pin
+    /// is backfilled by joining the torrent's `save_path` + `files[]`
+    /// against episode paths. Pure query: writes nothing. One failing
+    /// torrent (gone from the server, unreachable detail) resolves to
+    /// `linked: None` and never fails the list.
+    pub async fn attribute(&self, db: &Db, torrents: Vec<TorrentInfo>) -> Vec<LinkedTorrent> {
+        let mut index: Option<Vec<(i64, String)>> = None;
+        let mut out = Vec::with_capacity(torrents.len());
+        for info in torrents {
+            let linked = match db.torrent_link(&info.info_hash) {
+                Ok(Some(link)) => Some(LinkedTo {
+                    show_id: link.show_id,
+                    season: link.season,
+                    number: link.number,
+                }),
+                _ => self.backfill(db, &info, &mut index).await,
+            };
+            out.push(LinkedTorrent { info, linked });
+        }
+        out
+    }
+
+    /// Backfill one unpinned torrent: fetch its file list and test every
+    /// library episode path with `episode_in_torrent`. The `(show_id, path)`
+    /// index is built once, lazily, from the existing `Db` getters — the
+    /// same `episode_paths_for_show` accessor `default_save_path` uses, so
+    /// no second query fn. Any failure (no candidates, gone torrent,
+    /// unresolvable path) yields `None`.
+    async fn backfill(
+        &self,
+        db: &Db,
+        info: &TorrentInfo,
+        index: &mut Option<Vec<(i64, String)>>,
+    ) -> Option<LinkedTo> {
+        if index.is_none() {
+            let mut built = Vec::new();
+            if let Ok(shows) = db.list_shows("", ShowSort::Title) {
+                for show in shows {
+                    if let Ok(paths) = db.episode_paths_for_show(show.id) {
+                        built.extend(paths.into_iter().map(|path| (show.id, path)));
+                    }
+                }
+            }
+            *index = Some(built);
+        }
+        let candidates = index.as_ref().expect("index just built");
+        if candidates.is_empty() {
+            return None;
+        }
+        let detail = self.detail(&info.info_hash).await.ok()?;
+        let hit = candidates
+            .iter()
+            .find(|(_, path)| episode_in_torrent(&detail.info.save_path, &detail.files, path))?;
+        // The path came from this show's episode list; resolve which
+        // season/episode it is so the badge can name it.
+        let show = db.get_show(hit.0).ok()?;
+        for season in &show.seasons {
+            for episode in &season.episodes {
+                if episode.path == hit.1 {
+                    return Some(LinkedTo {
+                        show_id: hit.0,
+                        season: season.number,
+                        number: episode.number,
+                    });
+                }
+            }
+        }
+        None
+    }
+
     /// GET an external URL (a .torrent file) with the client's timeout/UA/backoff.
     /// Same 4MB cap as the Nyaa search client: oversized bodies are rejected.
     pub async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>> {
@@ -328,6 +484,21 @@ fn retry_wait(attempt: u32) -> std::time::Duration {
 
 async fn snippet(resp: reqwest::Response) -> String {
     resp.text().await.unwrap_or_default().chars().take(200).collect()
+}
+
+/// Percent-encode one URL path segment (feed labels read
+/// `animemgr:Sousou no Frieren`). Byte-wise, so non-ASCII UTF-8 encodes
+/// correctly; only RFC 3986 unreserved bytes pass through.
+fn encode_path_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 pub fn test_ok(db: &Db) -> bool {
@@ -481,7 +652,7 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use wiremock::matchers::{body_string_contains, header, method, path, query_param};
+    use wiremock::matchers::{body_json, body_string_contains, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn login_mock(token: &str) -> Mock {
@@ -781,6 +952,144 @@ mod tests {
         slash.add_root("/tv/").unwrap();
         slash.upsert_episode(&pn("Slash", 1), &rf("/tv/Slash/01.mkv", 14)).unwrap();
         assert_eq!(default_save_path(&slash, show_id(&slash, "Slash")).unwrap(), "/tv");
+    }
+
+    use crate::models::TorrentLink;
+
+    fn rss_config(label: &str) -> crate::models::RssFeedConfig {
+        crate::models::RssFeedConfig {
+            label: label.into(),
+            url: "https://nyaa.si/?page=rss&q=Frieren&c=1_2&f=0".into(),
+            search: "(?i)Frieren".into(),
+            category: "anime".into(),
+            enabled: true,
+            exclude_batch: true,
+        }
+    }
+
+    fn torrent_info(hash: &str) -> TorrentInfo {
+        serde_json::from_value(serde_json::json!({"info_hash": hash})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rss_add_posts_config_and_returns_label_echo() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/api/rss/feeds"))
+            .and(body_json(serde_json::json!({
+                "label": "animemgr:Frieren",
+                "url": "https://nyaa.si/?page=rss&q=Frieren&c=1_2&f=0",
+                "search": "(?i)Frieren",
+                "category": "anime",
+                "enabled": true,
+                "exclude_batch": true,
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"label": "animemgr:Frieren"})),
+            )
+            .expect(1)
+            .mount(&s)
+            .await;
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        assert_eq!(c.rss_add(&rss_config("animemgr:Frieren")).await.unwrap(), "animemgr:Frieren");
+    }
+
+    #[tokio::test]
+    async fn rss_add_rejects_bad_input_before_sending() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/api/rss/feeds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"label": "x"})))
+            .expect(0)
+            .mount(&s)
+            .await;
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        let err = c.rss_add(&rss_config("")).await.unwrap_err();
+        assert!(err.to_string().contains("label"), "{err}");
+        let mut bad = rss_config("animemgr:Frieren");
+        bad.search = "(?i)Frieren(".into();
+        let err = c.rss_add(&bad).await.unwrap_err();
+        assert!(err.to_string().contains("regex"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rss_list_joins_local_show() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/api/rss/feeds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"label": "animemgr:Owned", "url": "https://nyaa.si/?page=rss&q=Owned",
+                 "search": "(?i)Owned", "category": "anime", "enabled": true},
+                {"label": "animemgr:Stranger", "url": "https://x", "search": "(?i)Stranger",
+                 "category": "anime", "enabled": false},
+            ])))
+            .mount(&s)
+            .await;
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Owned", 1), &rf("/r1/Owned/01.mkv", 11)).unwrap();
+        db.add_rss_feed("animemgr:Owned", show_id(&db, "Owned")).unwrap();
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        let feeds = c.rss_list(&db).await.unwrap();
+        assert_eq!(feeds.len(), 2);
+        assert_eq!(feeds[0].label, "animemgr:Owned");
+        assert_eq!(feeds[0].show_id, Some(show_id(&db, "Owned")));
+        assert!(feeds[0].enabled);
+        assert_eq!(feeds[1].show_id, None, "unknown label maps to no show");
+    }
+
+    #[tokio::test]
+    async fn rss_toggle_and_remove_hit_label_paths() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        // "animemgr:My Show" must travel percent-encoded in the path.
+        Mock::given(method("POST"))
+            .and(path("/api/rss/feeds/animemgr%3AMy%20Show/toggle"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&s)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/rss/feeds/animemgr%3AMy%20Show"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        c.rss_toggle("animemgr:My Show").await.unwrap();
+        c.rss_remove("animemgr:My Show").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attribute_prefers_links_then_backfills() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        // Only the unpinned torrent's detail is ever fetched.
+        Mock::given(method("GET"))
+            .and(path("/api/torrents/unpinned"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "info_hash": "unpinned", "name": "Owned", "save_path": "/r1",
+                "files": [{"index": 0, "path": "Owned/01.mkv", "size": 11}],
+            })))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Owned", 1), &rf("/r1/Owned/01.mkv", 11)).unwrap();
+        let owned = show_id(&db, "Owned");
+        db.add_torrent_link(&TorrentLink {
+            info_hash: "pinned".into(), show_id: owned, season: 1, number: 1, added_at: 0,
+        }).unwrap();
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        let out = c
+            .attribute(&db, vec![torrent_info("pinned"), torrent_info("unpinned"), torrent_info("ghost")])
+            .await;
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].linked, Some(crate::models::LinkedTo { show_id: owned, season: 1, number: 1 }));
+        assert_eq!(out[1].linked, Some(crate::models::LinkedTo { show_id: owned, season: 1, number: 1 }));
+        assert_eq!(out[2].linked, None, "detail failure leaves linked None, never fails the list");
     }
 
     #[test]
