@@ -302,6 +302,12 @@ pub fn list_roots(state: State<'_, AppState>) -> Result<Vec<Root>> {
     state.db.list_roots()
 }
 
+/// Every input to the background-assist decision, as a conjunction: the scan toggle, a
+/// successful connection test against the current config, a configured provider, and work.
+fn should_assist(assist_on: bool, test_ok: bool, configured: bool, has_work: bool) -> bool {
+    assist_on && test_ok && configured && has_work
+}
+
 #[tauri::command]
 pub async fn scan(app: AppHandle, state: State<'_, AppState>) -> Result<ScanSummary> {
     let db = state.db.clone();
@@ -320,11 +326,22 @@ pub async fn scan(app: AppHandle, state: State<'_, AppState>) -> Result<ScanSumm
         .get_setting("llm_assist_on_scan")?
         .map(|v| v != "false")
         .unwrap_or(true);
-    if assist_on
-        && let Ok(l) = Llm::from_db(&state.db)
-        && l.configured()
-        && (!summary.low_confidence_folders.is_empty() || state.assist.has_pending())
-    {
+    let llm = match Llm::from_db(&state.db) {
+        Ok(l) => Some(l),
+        Err(e) => {
+            eprintln!("AI assist skipped: settings unreadable: {e}");
+            None
+        }
+    };
+    if llm.as_ref().is_some_and(|l| {
+        should_assist(
+            assist_on,
+            Llm::test_ok(&state.db),
+            l.configured(),
+            !summary.low_confidence_folders.is_empty() || state.assist.has_pending(),
+        )
+    }) {
+        let l = llm.expect("checked by should_assist gate");
         state
             .assist
             .enqueue(summary.low_confidence_folders.iter().cloned());
@@ -472,6 +489,12 @@ pub fn apply_settings_defaults(mut m: HashMap<String, String>) -> HashMap<String
     m
 }
 
+/// The armed flag as the settings page reads it: "true" only after a successful Test
+/// connection against the current config, "false" otherwise (including a fresh database).
+fn test_ok_flag(db: &Db) -> &'static str {
+    if Llm::test_ok(db) { "true" } else { "false" }
+}
+
 #[tauri::command]
 pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String>> {
     let mut m = HashMap::new();
@@ -521,6 +544,9 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String
             .get_setting("llm_delay_ms")?
             .unwrap_or_else(|| llm::DEFAULT_DELAY_MS.to_string()),
     );
+    // Whether the background worker is armed; the settings page reads this so an untested
+    // config says so instead of silently never assisting.
+    m.insert(llm::TEST_OK_KEY.into(), test_ok_flag(&state.db).into());
     m.insert(
         SETTING_DLNA_NAME.into(),
         state
@@ -538,8 +564,28 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String
     Ok(apply_settings_defaults(m))
 }
 
+/// Read-compare-write for settings that invalidate the LLM connection test: the write
+/// always lands, but the worker is disarmed only when the value actually changed, so
+/// re-saving an identical key does not stand a working config down.
+pub fn maybe_invalidate_test(db: &Db, key: &str, value: &str) -> Result<()> {
+    if !Llm::invalidates_test(key) {
+        return Ok(());
+    }
+    let old = db.get_setting(key)?;
+    db.set_setting(key, value)?;
+    if old.as_deref() != Some(value) {
+        Llm::mark_tested(db, false)?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn set_setting(state: State<'_, AppState>, key: String, value: String) -> Result<()> {
+    if key == llm::TEST_OK_KEY {
+        return Err(crate::error::AppError::Parse(
+            "llm_test_ok is managed by Test connection".into(),
+        ));
+    }
     // DLNA keys bypass `dlna_set_options`, so validate here too. No restart:
     // the running server keeps its port until the next enable or option save.
     if key == SETTING_DLNA_NAME && value.trim().is_empty() {
@@ -554,6 +600,11 @@ pub fn set_setting(state: State<'_, AppState>, key: String, value: String) -> Re
     }
     if key == SETTING_DLNA_UUID && value.trim().is_empty() {
         return Ok(());
+    }
+    // A new key, endpoint or model un-proves the last successful connection test, so the
+    // background worker stands down until it tests clean again.
+    if Llm::invalidates_test(&key) {
+        return maybe_invalidate_test(&state.db, &key, &value);
     }
     state.db.set_setting(&key, &value)
 }
@@ -694,9 +745,38 @@ pub async fn llm_models(state: State<'_, AppState>) -> Result<Vec<String>> {
     Llm::from_db(&state.db)?.models().await
 }
 
+/// Model ids for an explicitly passed provider key and base URL, without touching settings.
+/// The settings page uses this to list models for credentials the user has typed but not saved.
+#[tauri::command]
+pub async fn llm_models_for(key: String, base_url: String) -> Result<Vec<String>> {
+    Llm::with(base_url, Some(key), String::new()).models().await
+}
+
 #[tauri::command]
 pub async fn llm_test(state: State<'_, AppState>) -> Result<String> {
-    Llm::from_db(&state.db)?.test().await
+    // Snapshot the config before the round trip so a concurrent settings edit cannot move
+    // the flag under this test (TOCTOU). Flag persistence never overrides the reply: a
+    // failed write is logged and the reply is still returned.
+    let before = Llm::from_db(&state.db)?;
+    let reply = before.test().await;
+    match &reply {
+        Ok(_) => {
+            // Arm only if the config is unchanged since the test started: the success
+            // belongs to `before`, not to whatever is stored now.
+            let after = Llm::from_db(&state.db)?;
+            if before.identity() == after.identity()
+                && let Err(e) = Llm::mark_tested(&state.db, true)
+            {
+                eprintln!("llm_test: flag not persisted: {e}");
+            }
+        }
+        Err(_) => {
+            if let Err(e) = Llm::mark_tested(&state.db, false) {
+                eprintln!("llm_test: flag not persisted: {e}");
+            }
+        }
+    }
+    reply
 }
 
 #[tauri::command]
@@ -774,6 +854,54 @@ mod tests {
         let first = dlna_uuid(&db).unwrap();
         assert!(first.starts_with("uuid:"));
         assert_eq!(dlna_uuid(&db).unwrap(), first);
+    }
+
+    #[test]
+    fn maybe_invalidate_test_only_disarms_on_a_changed_value() {
+        // Re-saving the identical key must not stand a working config down, but the write
+        // itself always lands.
+        let db = Db::open_memory().unwrap();
+        db.set_setting("llm_api_key", "k1").unwrap();
+        Llm::mark_tested(&db, true).unwrap();
+        maybe_invalidate_test(&db, "llm_api_key", "k1").unwrap();
+        assert!(Llm::test_ok(&db), "same value stays armed");
+        assert_eq!(
+            db.get_setting("llm_api_key").unwrap().as_deref(),
+            Some("k1")
+        );
+        // A changed identity value disarms AND writes.
+        maybe_invalidate_test(&db, "llm_api_key", "k2").unwrap();
+        assert!(!Llm::test_ok(&db), "changed value disarms");
+        assert_eq!(
+            db.get_setting("llm_api_key").unwrap().as_deref(),
+            Some("k2")
+        );
+        // A non-identity key is a no-op here: the flag stays armed and nothing is
+        // written (the set_setting caller owns that write).
+        Llm::mark_tested(&db, true).unwrap();
+        maybe_invalidate_test(&db, "llm_delay_ms", "700").unwrap();
+        assert!(Llm::test_ok(&db), "non-identity key untouched");
+        assert_eq!(db.get_setting("llm_delay_ms").unwrap(), None);
+    }
+
+    #[test]
+    fn should_assist_needs_every_input() {
+        assert!(should_assist(true, true, true, true));
+        assert!(!should_assist(false, true, true, true));
+        assert!(!should_assist(true, false, true, true));
+        assert!(!should_assist(true, true, false, true));
+        assert!(!should_assist(true, true, true, false));
+        assert!(!should_assist(false, false, false, false));
+    }
+
+    #[test]
+    fn test_ok_flag_maps_the_armed_state() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(test_ok_flag(&db), "false", "fresh database is disarmed");
+        Llm::mark_tested(&db, true).unwrap();
+        assert_eq!(test_ok_flag(&db), "true");
+        Llm::mark_tested(&db, false).unwrap();
+        assert_eq!(test_ok_flag(&db), "false");
     }
 
     #[test]
