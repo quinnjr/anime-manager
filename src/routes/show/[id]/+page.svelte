@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { page } from '$app/state';
   import { goto } from '$app/navigation';
-  import { api, onEvent, type ShowDetail, type RenameTarget, type WantedEpisode } from '$lib/api';
+  import { api, onEvent, type ShowDetail, type RenameTarget, type RssFeedView, type TorrentControlOp, type TorrentEntry, type TorrentPrefs, type WantedEpisode } from '$lib/api';
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { toasts } from '$lib/stores/toasts.svelte';
   import { playback } from '$lib/stores/playback.svelte';
@@ -12,7 +12,12 @@
   import Cover from '$lib/components/Cover.svelte';
   import { flatten } from '$lib/episodes';
   import { formatSize, summariseWanted } from '$lib/nyaaDisplay';
+  import { sendButtonState, torrentBadge } from '$lib/torrentDisplay';
   import SeasonList from '$lib/components/SeasonList.svelte';
+
+  // The backend has carried torrent_url/info_hash on every WantedHit since the Nyaa
+  // handoff; api.ts types predate that, so the cast below recovers the runtime shape.
+  type Hit = { title: string; page_url: string; size_bytes: number; seeders: number; torrent_url?: string | null; info_hash?: string | null };
 
   const id = $derived(Number(page.params.id));
   let show = $state<ShowDetail | null>(null);
@@ -26,6 +31,108 @@
   let found = $state(false);
   let editingTitle = $state(false);
   let titleDraft = $state('');
+  let torrents = $state<TorrentEntry[]>([]);
+  let feeds = $state<RssFeedView[]>([]);
+  let prefs = $state<TorrentPrefs | null>(null);
+  let saveDraft = $state('');
+  let catDraft = $state('');
+  let prefsSaving = $state(false);
+  let sendingKey = $state<string | null>(null);
+  let busyHash = $state<string | null>(null);
+  let removeArmed = $state<string | null>(null);
+  let followBusy = $state(false);
+  let rootPaths = $state<string[]>([]);
+
+  // The feed this show was subscribed under, if any — the subscribed state of Follow.
+  const subscribedFeed = $derived(feeds.find((f) => f.show_id === id));
+  // A save path outside every library root never scans back in; say so before
+  // the user sends anything there, not after the files land out of reach.
+  const outsideRoots = $derived(
+    prefs?.save_path && rootPaths.length > 0
+      && !rootPaths.some((r) => prefs!.save_path!.startsWith(r.replace(/\/+$/, '') + '/'))
+      ? prefs.save_path : null
+  );
+
+  // Info-hash match first (the hit we sent), same-episode pin second (a re-search
+  // finding a torrent the monitor or an earlier send already pinned here).
+  function torrentFor(season: number, number: number, infoHash: string | null | undefined): TorrentEntry | undefined {
+    const want = (infoHash ?? '').trim().toLowerCase();
+    if (want) {
+      const byHash = torrents.find((t) => t.info_hash.trim().toLowerCase() === want);
+      if (byHash) return byHash;
+    }
+    return torrents.find((t) => t.linked?.show_id === id && t.linked.season === season && t.linked.number === number);
+  }
+
+  // Background refresh: silent while disarmed (list/rss refuse until the Test
+  // connection in Settings arms them), loud only for the actions below.
+  async function loadTorrentState() {
+    try { torrents = await api.torrentList(); } catch { /* disarmed or offline: rows still offer Send */ }
+    try { feeds = await api.torrentRssList(); } catch { feeds = []; }
+  }
+
+  async function loadPrefs() {
+    const forId = id;
+    try {
+      prefs = await api.torrentPrefsGet(forId);
+      if (forId !== id) return;
+      saveDraft = prefs.save_path ?? '';
+      catDraft = prefs.category ?? '';
+    } catch (e) { if (forId === id) toasts.error(e); }
+  }
+
+  async function savePrefs() {
+    if (!show) return;
+    prefsSaving = true;
+    try {
+      prefs = await api.torrentPrefsSet(show.id, saveDraft.trim() || null, catDraft.trim() || null);
+      saveDraft = prefs.save_path ?? '';
+      catDraft = prefs.category ?? '';
+      toasts.push('success', 'Download location saved.');
+    } catch (e) { toasts.error(e); } finally { prefsSaving = false; }
+  }
+
+  async function send(season: number, number: number, hit: Hit) {
+    if (!show || !hit.torrent_url) return;
+    const key = `${season}:${number}`;
+    sendingKey = key;
+    try {
+      await api.torrentAdd({
+        torrentUrl: hit.torrent_url, infoHash: hit.info_hash ?? null,
+        showId: show.id, season, number,
+        savePath: prefs?.save_path ?? null, category: prefs?.category ?? null
+      });
+      toasts.push('success', `Sent S${season}E${number} to rustorrent.`);
+      await loadTorrentState();
+    } catch (e) { toasts.error(e); } finally { if (sendingKey === key) sendingKey = null; }
+  }
+
+  async function control(t: TorrentEntry, op: TorrentControlOp) {
+    busyHash = t.info_hash;
+    try {
+      await api.torrentControl(t.info_hash, op);
+      removeArmed = null;
+      await loadTorrentState();
+    } catch (e) { toasts.error(e); } finally { if (busyHash === t.info_hash) busyHash = null; }
+  }
+
+  async function follow() {
+    if (!show) return;
+    followBusy = true;
+    try {
+      const r = await api.torrentRssSubscribe(show.id);
+      toasts.push('success', `Registered ${r.label} — the rustorrent RSS monitor picks this up on its next poll (monitor must be running).`);
+      await loadTorrentState();
+    } catch (e) { toasts.error(e); } finally { followBusy = false; }
+  }
+
+  async function toggleFeed(feed: RssFeedView) {
+    followBusy = true;
+    try {
+      await api.torrentRssToggle(feed.label, !feed.enabled);
+      await loadTorrentState();
+    } catch (e) { toasts.error(e); } finally { followBusy = false; }
+  }
 
   // Every season is on the page at once, so the show reads as a whole rather than one tab at a
   // time. `rows` is that same order flattened, which is what the arrow keys walk.
@@ -150,12 +257,18 @@
     wanted = [];
     found = false;
     finding = false;
+    torrents = [];
+    prefs = null;
+    removeArmed = null;
     searchGeneration++; // invalidate any in-flight search for the previous show
     load();
+    loadPrefs();
+    loadTorrentState();
+    api.listRoots().then((rs) => { rootPaths = rs.map((r) => r.path); }).catch(() => { rootPaths = []; });
   });
 
   onMount(() => {
-    const us = [onEvent('show-updated', load), onEvent('library-changed', load), onEvent('playback-changed', load)];
+    const us = [onEvent('show-updated', load), onEvent('library-changed', load), onEvent('playback-changed', load), onEvent('torrent-changed', loadTorrentState)];
     const key = (e: KeyboardEvent) => {
       // Settings lives in the layout, so a local open-flag cannot see it; ask the event target.
       if (rows.length === 0 || rematchOpen || renameOpen || isTypingTarget(e.target)) return;
@@ -230,18 +343,76 @@
   {#if found}
     <section aria-label="Missing episodes" class="mb-7 border-b border-edge pb-6">
       <div class="eyebrow mb-2">Missing episodes</div>
+      <div class="mb-4 flex flex-col gap-2">
+        <form class="flex flex-wrap items-end gap-2" onsubmit={(e) => { e.preventDefault(); savePrefs(); }}>
+          <label class="flex min-w-52 flex-1 flex-col gap-1">
+            <span class="tag">Save path</span>
+            <input bind:value={saveDraft} aria-label="Save path" placeholder="Library root by default" class="field font-mono text-xs" />
+          </label>
+          <label class="flex w-40 flex-col gap-1">
+            <span class="tag">Category</span>
+            <input bind:value={catDraft} aria-label="Category" placeholder="anime" class="field font-mono text-xs" />
+          </label>
+          <button class="btn shrink-0" disabled={prefsSaving}>{prefsSaving ? 'Saving…' : 'Save location'}</button>
+        </form>
+        {#if outsideRoots}
+          <p class="tag text-[var(--color-alarm)]">Save path is outside your library roots — completed files will not scan in until moved.</p>
+        {/if}
+        <div class="flex flex-wrap items-center gap-2">
+          {#if subscribedFeed}
+            <span class="tag-chip shrink-0">Following ✓</span>
+            <span class="tag">Registered — the rustorrent RSS monitor picks this up on its next poll (monitor must be running).</span>
+            <button class="btn shrink-0" disabled={followBusy} onclick={() => void toggleFeed(subscribedFeed)}>
+              {subscribedFeed.enabled ? 'Pause feed' : 'Resume feed'}
+            </button>
+          {:else}
+            <button class="btn shrink-0" disabled={followBusy} title="Register a rustorrent RSS feed for future episodes of this show"
+              onclick={follow}>
+              {followBusy ? 'Following…' : 'Follow new episodes'}
+            </button>
+          {/if}
+        </div>
+      </div>
       {#if wanted.length === 0}
         <p class="tag">No missing episodes — the owned range has no gaps.</p>
       {:else}
         <ul class="flex flex-col gap-2">
           {#each wanted as w (w.season + ':' + w.number)}
-            {@const best = w.hits[0]}
+            {@const best = w.hits[0] as Hit | undefined}
+            {@const t = best ? torrentFor(w.season, w.number, best.info_hash) : undefined}
+            {@const st = best ? sendButtonState({ torrent_url: best.torrent_url ?? null, linked: t?.linked ?? null, progress: t?.progress ?? null }) : 'unavailable'}
+            {@const key = w.season + ':' + w.number}
             <li class="flex flex-wrap items-center gap-x-3 gap-y-1">
               <span class="tag-chip shrink-0">S{w.season}E{w.number}</span>
               {#if best}
                 <span class="min-w-0 flex-1 truncate">{best.title}</span>
                 <span class="tag shrink-0">{formatSize(best.size_bytes)} · {best.seeders} seeder{best.seeders === 1 ? '' : 's'}</span>
                 <button class="btn shrink-0" onclick={() => void openPage(best.page_url)}>Nyaa page</button>
+                {#if st === 'send'}
+                  <button class="btn btn-key shrink-0" disabled={sendingKey === key}
+                    title="Download the .torrent and add it to rustorrent"
+                    onclick={() => void send(w.season, w.number, best)}>
+                    {sendingKey === key ? 'Sending…' : 'Send to rustorrent'}
+                  </button>
+                {:else if t && (st === 'downloading' || st === 'seeding')}
+                  <span class="tag shrink-0">{torrentBadge(t)}</span>
+                  {#if removeArmed === t.info_hash}
+                    <span class="tag shrink-0 font-mono text-xs">{t.save_path}</span>
+                    <button class="btn shrink-0" disabled={busyHash === t.info_hash}
+                      onclick={() => void control(t, { Remove: { delete_files: false } })}>Remove, keep files</button>
+                    <button class="btn shrink-0" disabled={busyHash === t.info_hash}
+                      title="Also deletes the downloaded files"
+                      onclick={() => void control(t, { Remove: { delete_files: true } })}>Delete files too</button>
+                    <button class="btn shrink-0" onclick={() => (removeArmed = null)}>Cancel</button>
+                  {:else}
+                    <button class="btn shrink-0" disabled={busyHash === t.info_hash}
+                      onclick={() => void control(t, 'Start')}>Start</button>
+                    <button class="btn shrink-0" disabled={busyHash === t.info_hash}
+                      onclick={() => void control(t, 'Pause')}>Pause</button>
+                    <button class="btn shrink-0" disabled={busyHash === t.info_hash}
+                      onclick={() => (removeArmed = t.info_hash)}>Remove</button>
+                  {/if}
+                {/if}
               {:else}
                 <span class="tag">no strict match</span>
               {/if}

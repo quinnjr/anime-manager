@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { torrentBadge } from './torrentDisplay';
+import { sendButtonState, torrentBadge } from './torrentDisplay';
 
 describe('torrentBadge', () => {
   it('shows download progress with the linked episode', () => {
@@ -30,5 +30,28 @@ describe('torrentBadge', () => {
   it('falls back when the error carries no message', () => {
     expect(torrentBadge({ status: 'error', progress: 0, error_message: null, linked: null }))
       .toBe('error: unknown error');
+  });
+
+  it('falls back to the raw status for server states it does not know', () => {
+    expect(torrentBadge({ status: 'Checking', progress: 0.5, linked: null }))
+      .toBe('checking');
+  });
+});
+
+describe('sendButtonState', () => {
+  it('offers send when the hit carries a torrent url and nothing is linked', () => {
+    expect(sendButtonState({ torrent_url: 'https://x/1.torrent', linked: null })).toBe('send');
+  });
+
+  it('reads seeding from a linked, complete torrent', () => {
+    expect(sendButtonState({ torrent_url: 'https://x/1.torrent', linked: { show_id: 1, season: 1, number: 6 }, progress: 1 })).toBe('seeding');
+  });
+
+  it('reads downloading from a linked, incomplete torrent', () => {
+    expect(sendButtonState({ torrent_url: 'https://x/1.torrent', linked: { show_id: 1, season: 1, number: 6 }, progress: 0.4 })).toBe('downloading');
+  });
+
+  it('has nothing to offer when the hit carries no torrent url', () => {
+    expect(sendButtonState({ torrent_url: null, linked: null })).toBe('unavailable');
   });
 });

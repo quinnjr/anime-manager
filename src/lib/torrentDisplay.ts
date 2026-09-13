@@ -28,3 +28,20 @@ export function torrentBadge(t: BadgeTorrent): string {
   const l = t.linked;
   return l ? `${state} · S${l.season}E${l.number}` : state;
 }
+
+/** Anything the show page needs to decide between Send and a linked badge. */
+export interface SendCandidate {
+  torrent_url?: string | null;
+  linked?: LinkedTo | null;
+  progress?: number | null;
+}
+
+export type SendButtonState = 'send' | 'downloading' | 'seeding' | 'unavailable';
+
+/** A hit with a `.torrent` URL and no linked torrent offers `send`; a linked
+ *  torrent reads `seeding` once complete, `downloading` before that; a hit
+ *  with no URL has nothing to send. */
+export function sendButtonState(h: SendCandidate): SendButtonState {
+  if (h.linked) return (h.progress ?? 0) >= 1 ? 'seeding' : 'downloading';
+  return h.torrent_url ? 'send' : 'unavailable';
+}
