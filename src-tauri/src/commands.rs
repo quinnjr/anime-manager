@@ -7,6 +7,7 @@ use crate::models::*;
 use crate::nyaa::{self, Nyaa, WantedEpisode};
 use crate::player::{self, Player};
 use crate::rename;
+use crate::torrent;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
@@ -549,6 +550,25 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String
     // config says so instead of silently never assisting.
     m.insert(llm::TEST_OK_KEY.into(), test_ok_flag(&state.db).into());
     m.insert(
+        torrent::BASE_URL_KEY.into(),
+        state
+            .db
+            .get_setting(torrent::BASE_URL_KEY)?
+            .unwrap_or_default(),
+    );
+    m.insert(
+        torrent::PASSWORD_KEY.into(),
+        state
+            .db
+            .get_setting(torrent::PASSWORD_KEY)?
+            .unwrap_or_default(),
+    );
+    // Read-only like its LLM counterpart: managed by Test connection.
+    m.insert(
+        torrent::TEST_OK_KEY.into(),
+        torrent_test_ok_flag(&state.db).into(),
+    );
+    m.insert(
         SETTING_DLNA_NAME.into(),
         state
             .db
@@ -580,11 +600,46 @@ pub fn maybe_invalidate_test(db: &Db, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// The torrent armed flag as the settings page reads it: "true" only after a successful
+/// Test connection against the current config, "false" otherwise (including fresh).
+fn torrent_test_ok_flag(db: &Db) -> &'static str {
+    if torrent::test_ok(db) {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+/// Read-compare-write mirroring `maybe_invalidate_test`: a new base URL or password
+/// un-proves the last successful connection test, so control/add/RSS paths refuse
+/// until it tests clean again.
+pub fn maybe_invalidate_torrent_test(db: &Db, key: &str, value: &str) -> Result<()> {
+    if !torrent::invalidates_test(key) {
+        return Ok(());
+    }
+    let old = db.get_setting(key)?;
+    db.set_setting(key, value)?;
+    if old.as_deref() != Some(value) {
+        torrent::mark_tested(db, false)?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn set_setting(state: State<'_, AppState>, key: String, value: String) -> Result<()> {
     if key == llm::TEST_OK_KEY {
         return Err(crate::error::AppError::Parse(
             "llm_test_ok is managed by Test connection".into(),
+        ));
+    }
+    if key == torrent::TEST_OK_KEY {
+        return Err(crate::error::AppError::Parse(
+            "torrent_test_ok is managed by Test connection".into(),
+        ));
+    }
+    if key == torrent::BASE_URL_KEY && value.trim().is_empty() {
+        return Err(crate::error::AppError::Parse(
+            "torrent base URL cannot be blank".into(),
         ));
     }
     // DLNA keys bypass `dlna_set_options`, so validate here too. No restart:
@@ -606,6 +661,10 @@ pub fn set_setting(state: State<'_, AppState>, key: String, value: String) -> Re
     // background worker stands down until it tests clean again.
     if Llm::invalidates_test(&key) {
         return maybe_invalidate_test(&state.db, &key, &value);
+    }
+    // Same for the torrent connection: control/add/RSS paths refuse while disarmed.
+    if torrent::invalidates_test(&key) {
+        return maybe_invalidate_torrent_test(&state.db, &key, &value);
     }
     state.db.set_setting(&key, &value)
 }
@@ -748,6 +807,259 @@ pub async fn find_missing(
     show_id: i64,
 ) -> Result<Vec<WantedEpisode>> {
     nyaa::find_missing(&state.db, &Nyaa::with_endpoint(nyaa::NYAA_BASE.into())?, show_id).await
+}
+
+/// Control/add/RSS paths refuse while the connection test is disarmed, with a toast
+/// pointing at Settings. Discover and test are always allowed.
+fn require_torrent_armed(db: &Db) -> Result<()> {
+    if torrent::test_ok(db) {
+        return Ok(());
+    }
+    Err(crate::error::AppError::Parse(
+        "rustorrent is not connected — set the base URL in Settings and run Test connection"
+            .into(),
+    ))
+}
+
+/// Candidate rustorrent base URLs on the LAN. Empty when nothing answers; manual entry
+/// is always available. Blocking mDNS browse, so off the async thread (scan precedent).
+#[tauri::command]
+pub async fn torrent_discover() -> Vec<String> {
+    tauri::async_runtime::spawn_blocking(|| torrent::discover(3000))
+        .await
+        .unwrap_or_default()
+}
+
+/// Prove the connection (login + `GET /api/stats`) and arm `torrent_test_ok` on
+/// success, disarm on failure. A failed write is logged and the reply still returned.
+#[tauri::command]
+pub async fn torrent_test(state: State<'_, AppState>) -> Result<String> {
+    let reply = torrent::TorrentClient::from_db(&state.db)?
+        .test()
+        .await;
+    match &reply {
+        Ok(_) => {
+            if let Err(e) = torrent::mark_tested(&state.db, true) {
+                eprintln!("torrent_test: flag not persisted: {e}");
+            }
+        }
+        Err(_) => {
+            if let Err(e) = torrent::mark_tested(&state.db, false) {
+                eprintln!("torrent_test: flag not persisted: {e}");
+            }
+        }
+    }
+    reply
+}
+
+/// Every torrent with the episode it belongs to (add-time pin, else path backfill).
+/// Pure query: writes nothing, emits nothing. One bad row never fails the view.
+#[tauri::command]
+pub async fn torrent_list(state: State<'_, AppState>) -> Result<Vec<LinkedTorrent>> {
+    require_torrent_armed(&state.db)?;
+    let client = torrent::TorrentClient::from_db(&state.db)?;
+    let torrents = client.list().await?;
+    Ok(client.attribute(&state.db, torrents).await)
+}
+
+/// Send one strict Nyaa hit to rustorrent and pin the result to its episode.
+/// Dedups by `info_hash` when given (already pinned → link it, no double add).
+/// Returns the server's info_hash.
+// Arity is the IPC contract (flat args per the design spec), not a refactor target.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+pub async fn torrent_add(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    torrent_url: Option<String>,
+    info_hash: Option<String>,
+    show_id: i64,
+    season: u32,
+    number: u32,
+    save_path: Option<String>,
+    category: Option<String>,
+) -> Result<String> {
+    require_torrent_armed(&state.db)?;
+    let client = torrent::TorrentClient::from_db(&state.db)?;
+    let clean = |o: Option<String>| o.filter(|v| !v.trim().is_empty());
+    if let Some(hash) = clean(info_hash)
+        && state.db.torrent_link(&hash)?.is_some()
+    {
+        state.db.add_torrent_link(&TorrentLink {
+            info_hash: hash.clone(),
+            show_id,
+            season,
+            number,
+            added_at: db::now(),
+        })?;
+        let _ = app.emit("torrent-changed", ());
+        let _ = app.emit("show-updated", show_id);
+        return Ok(hash);
+    }
+    let url = clean(torrent_url).ok_or_else(|| {
+        crate::error::AppError::Parse("no .torrent URL to send".into())
+    })?;
+    let bytes = client.fetch_bytes(&url).await?;
+    let filename = url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("download.torrent")
+        .to_string();
+    let prefs = state.db.get_prefs(show_id)?;
+    let dest = match clean(save_path).or_else(|| clean(prefs.save_path.clone())) {
+        Some(p) => p,
+        None => torrent::default_save_path(&state.db, show_id)?,
+    };
+    let cat = clean(category)
+        .or_else(|| clean(prefs.category.clone()))
+        .unwrap_or_else(|| "anime".into());
+    let hash = client.add_torrent(bytes, &filename, &dest, &cat).await?;
+    state.db.add_torrent_link(&TorrentLink {
+        info_hash: hash.clone(),
+        show_id,
+        season,
+        number,
+        added_at: db::now(),
+    })?;
+    let _ = app.emit("torrent-changed", ());
+    let _ = app.emit("show-updated", show_id);
+    Ok(hash)
+}
+
+/// Start / pause / recheck / remove one torrent.
+#[tauri::command]
+pub async fn torrent_control(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    info_hash: String,
+    op: torrent::ControlOp,
+) -> Result<()> {
+    require_torrent_armed(&state.db)?;
+    torrent::TorrentClient::from_db(&state.db)?
+        .control(&info_hash, &op)
+        .await?;
+    let _ = app.emit("torrent-changed", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub fn torrent_prefs_get(state: State<'_, AppState>, show_id: i64) -> Result<TorrentPrefs> {
+    state.db.get_prefs(show_id)
+}
+
+#[tauri::command]
+pub fn torrent_prefs_set(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    show_id: i64,
+    save_path: Option<String>,
+    category: Option<String>,
+) -> Result<TorrentPrefs> {
+    state.db.set_prefs(show_id, save_path.as_deref(), category.as_deref())?;
+    let _ = app.emit("torrent-changed", ());
+    state.db.get_prefs(show_id)
+}
+
+/// What `torrent_rss_subscribe` reports: the deterministic label and the feed URL.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RssSubscribeResult {
+    pub label: String,
+    pub url: String,
+}
+
+/// One-click subscribe: derive the feed URL and group/resolution preferences from the
+/// show's owned episodes, register the deterministic `animemgr:<parsed_title>` label
+/// server-side, and remember it for Downloads attribution.
+#[tauri::command]
+pub async fn torrent_rss_subscribe(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    show_id: i64,
+) -> Result<RssSubscribeResult> {
+    require_torrent_armed(&state.db)?;
+    let show = state.db.get_show(show_id)?;
+    let derivation = nyaa::subscribe_derivation(&state.db, show_id)?;
+    let search = torrent::build_search_regex(
+        &show.display_title,
+        derivation.group.as_deref(),
+        derivation.resolution.as_deref(),
+    )?;
+    let prefs = state.db.get_prefs(show_id)?;
+    let category = prefs
+        .category
+        .filter(|c| !c.trim().is_empty())
+        .unwrap_or_else(|| "anime".into());
+    let label = torrent::TorrentClient::from_db(&state.db)?
+        .rss_add(&RssFeedConfig {
+            label: torrent::feed_label(&show.parsed_title),
+            url: derivation.feed_url.clone(),
+            search,
+            category,
+            enabled: true,
+            exclude_batch: true,
+        })
+        .await?;
+    state.db.add_rss_feed(&label, show_id)?;
+    let _ = app.emit("torrent-changed", ());
+    let _ = app.emit("show-updated", show_id);
+    Ok(RssSubscribeResult {
+        label,
+        url: derivation.feed_url,
+    })
+}
+
+/// Every server-side feed joined to the local show it was registered for, if any.
+/// Pure query: writes nothing, emits nothing.
+#[tauri::command]
+pub async fn torrent_rss_list(state: State<'_, AppState>) -> Result<Vec<RssFeedView>> {
+    require_torrent_armed(&state.db)?;
+    torrent::TorrentClient::from_db(&state.db)?
+        .rss_list(&state.db)
+        .await
+}
+
+/// Idempotent enable/disable: the server only flips, so list first and toggle only
+/// when the current state differs from the desired one.
+#[tauri::command]
+pub async fn torrent_rss_toggle(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    label: String,
+    enabled: bool,
+) -> Result<()> {
+    require_torrent_armed(&state.db)?;
+    let client = torrent::TorrentClient::from_db(&state.db)?;
+    let current = client
+        .rss_list(&state.db)
+        .await?
+        .into_iter()
+        .find(|f| f.label == label)
+        .ok_or_else(|| {
+            crate::error::AppError::Parse(format!("unknown rss feed '{label}'"))
+        })?;
+    if current.enabled != enabled {
+        client.rss_toggle(&label).await?;
+        let _ = app.emit("torrent-changed", ());
+    }
+    Ok(())
+}
+
+/// Remove a subscription (config-only server-side; downloaded files are never touched)
+/// and forget the local label.
+#[tauri::command]
+pub async fn torrent_rss_remove(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    label: String,
+) -> Result<()> {
+    require_torrent_armed(&state.db)?;
+    torrent::TorrentClient::from_db(&state.db)?
+        .rss_remove(&label)
+        .await?;
+    state.db.remove_rss_feed(&label)?;
+    let _ = app.emit("torrent-changed", ());
+    Ok(())
 }
 
 /// Model ids offered by whatever provider is configured right now.
@@ -893,6 +1205,15 @@ mod tests {
         maybe_invalidate_test(&db, "llm_delay_ms", "700").unwrap();
         assert!(Llm::test_ok(&db), "non-identity key untouched");
         assert_eq!(db.get_setting("llm_delay_ms").unwrap(), None);
+    }
+
+    #[test]
+    fn torrent_test_disarms_on_url_change() {
+        let db = Db::open_memory().unwrap();
+        db.set_setting(torrent::BASE_URL_KEY, "http://x").unwrap();
+        torrent::mark_tested(&db, true).unwrap();
+        maybe_invalidate_torrent_test(&db, "torrent_base_url", "http://y").unwrap();
+        assert!(!torrent::test_ok(&db));
     }
 
     #[test]

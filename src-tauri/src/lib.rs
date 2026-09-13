@@ -107,6 +107,17 @@ pub fn run() {
             commands::dlna_status,
             commands::dlna_set_enabled,
             commands::dlna_set_options,
+            commands::torrent_discover,
+            commands::torrent_test,
+            commands::torrent_list,
+            commands::torrent_add,
+            commands::torrent_control,
+            commands::torrent_prefs_get,
+            commands::torrent_prefs_set,
+            commands::torrent_rss_subscribe,
+            commands::torrent_rss_list,
+            commands::torrent_rss_toggle,
+            commands::torrent_rss_remove,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
