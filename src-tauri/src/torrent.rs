@@ -242,7 +242,7 @@ impl TorrentClient {
                     .text("save_path", save_path.to_owned())
                     .text("category", category.to_owned())
                     .part(
-                        "file",
+                        "torrent",
                         reqwest::multipart::Part::bytes(bytes.clone())
                             .file_name(filename.to_owned()),
                     );
@@ -280,13 +280,7 @@ impl TorrentClient {
                 Self::check_ok(self.post_action_resp(hash, "pause").await?, "pause").await
             }
             ControlOp::Recheck => {
-                // Builds disagree on the verification endpoint name.
-                let resp = self.post_action_resp(hash, "recheck").await?;
-                if resp.status().as_u16() == 404 {
-                    Self::check_ok(self.post_action_resp(hash, "verify").await?, "verify").await
-                } else {
-                    Self::check_ok(resp, "recheck").await
-                }
+                Self::check_ok(self.post_action_resp(hash, "recheck").await?, "recheck").await
             }
             ControlOp::Remove { delete_files } => {
                 let url = format!("{}/api/torrents/{hash}", self.base_url);
@@ -438,6 +432,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/torrents"))
             .and(body_string_contains("show.torrent"))
+            .and(body_string_contains("name=\"torrent\""))
             .and(body_string_contains("save_path"))
             .and(body_string_contains("/downloads/anime"))
             .and(body_string_contains("category"))
