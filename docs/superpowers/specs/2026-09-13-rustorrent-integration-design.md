@@ -199,7 +199,10 @@ cross-session touchpoint.
   `.*`, so minor separator differences still match without loosening
   identity.
   `exclude_batch=true` reproduces the strict no-packs rule.
-  Known limitation: sequel seasons sharing a title core share the feed.
+  Known limitation, deferred to Phase 2: sequel seasons sharing a title
+  core share the feed. Revisit when the subscribe UI grows a season
+  selector (Phase 2 sketch) — before then there is no per-season feed to
+  build.
 - The subscribe confirmation shows exactly where files will land
   (`<download_dir>/<category>/`, download dir resolved via
   `GET /api/config` which returns the full `AppConfig`) and warns when
@@ -209,7 +212,10 @@ cross-session touchpoint.
   different mechanisms — the UI never conflates them.
 - Monitor-liveness is stated, not solved: "Registered — the rustorrent
   RSS monitor picks this up on its next poll (monitor must be running)."
-  No liveness probe exists; recorded as a known limitation.
+  No liveness probe exists. Deferred to Phase 2: rustorrent exposes no
+  "monitor alive" endpoint today; add the probe when one exists, or when
+  a user reports a silent non-download (the trigger to treat it as
+  blocking rather than a caveat).
 - Per-torrent failure isolation differs deliberately from Nyaa's
   abort-the-whole-hunt: one failing torrent never blanks a list.
 

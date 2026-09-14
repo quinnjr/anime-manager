@@ -23,6 +23,12 @@ pub fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Torrent info hashes are case-insensitive hex, and callers may hand over either form:
+/// normalize once at the persistence boundary so a mixed-case write and lookup still meet.
+fn normalize_hash(info_hash: &str) -> String {
+    info_hash.trim().to_lowercase()
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS roots (
   id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, added_at INTEGER NOT NULL,
@@ -1063,14 +1069,16 @@ impl Db {
     /// `show_id`, never by title strings, so there is no interaction with parsed_title
     /// identity or parse_overrides.
     pub fn add_torrent_link(&self, link: &TorrentLink) -> Result<()> {
+        let info_hash = normalize_hash(&link.info_hash);
         self.with(|c| {
             c.execute("INSERT OR REPLACE INTO torrent_links(info_hash, show_id, season, number, added_at) VALUES (?1,?2,?3,?4,?5)",
-                params![link.info_hash, link.show_id, link.season, link.number, link.added_at])?;
+                params![info_hash, link.show_id, link.season, link.number, link.added_at])?;
             Ok(())
         })
     }
 
     pub fn torrent_link(&self, info_hash: &str) -> Result<Option<TorrentLink>> {
+        let info_hash = normalize_hash(info_hash);
         self.with(|c| Ok(c.query_row(
             "SELECT info_hash, show_id, season, number, added_at FROM torrent_links WHERE info_hash = ?1", params![info_hash],
             |r| Ok(TorrentLink { info_hash: r.get(0)?, show_id: r.get(1)?, season: r.get::<_, i64>(2)? as u32, number: r.get::<_, i64>(3)? as u32, added_at: r.get(4)? }))
@@ -1080,17 +1088,10 @@ impl Db {
     /// Forget a pin after its torrent leaves the server, so a stale pin can
     /// never shadow a later re-add of the same hash.
     pub fn remove_torrent_link(&self, info_hash: &str) -> Result<()> {
+        let info_hash = normalize_hash(info_hash);
         self.with(|c| {
             c.execute("DELETE FROM torrent_links WHERE info_hash = ?1", params![info_hash])?;
             Ok(())
-        })
-    }
-
-    pub fn links_for_show(&self, show_id: i64) -> Result<Vec<TorrentLink>> {
-        self.with(|c| {
-            let mut st = c.prepare("SELECT info_hash, show_id, season, number, added_at FROM torrent_links WHERE show_id = ?1 ORDER BY rowid")?;
-            let rows = st.query_map(params![show_id], |r| Ok(TorrentLink { info_hash: r.get(0)?, show_id: r.get(1)?, season: r.get::<_, i64>(2)? as u32, number: r.get::<_, i64>(3)? as u32, added_at: r.get(4)? }))?;
-            Ok(rows.collect::<std::result::Result<_, _>>()?)
         })
     }
 
@@ -1142,14 +1143,6 @@ impl Db {
         self.with(|c| {
             c.execute("DELETE FROM rss_feeds WHERE label = ?1", params![label])?;
             Ok(())
-        })
-    }
-
-    pub fn rss_feeds(&self) -> Result<Vec<RssFeedLink>> {
-        self.with(|c| {
-            let mut st = c.prepare("SELECT label, show_id, added_at FROM rss_feeds ORDER BY label")?;
-            let rows = st.query_map([], |r| Ok(RssFeedLink { label: r.get(0)?, show_id: r.get(1)?, added_at: r.get(2)? }))?;
-            Ok(rows.collect::<std::result::Result<_, _>>()?)
         })
     }
 }
@@ -2109,14 +2102,16 @@ mod tests {
 
         assert_eq!(db.merge_duplicate_shows().unwrap(), 2);
 
-        for (h, loser) in [("aaa", small_a), ("bbb", small_b)] {
-            let got = db.torrent_link(h).unwrap().expect("link survives the fold");
-            assert!(got.show_id == big_a || got.show_id == big_b);
-            assert!(db.links_for_show(loser).unwrap().is_empty(), "loser rows gone");
-            assert!(db.get_show(loser).is_err(), "the folded row is gone");
-        }
-        assert_eq!(db.links_for_show(big_a).unwrap().len(), 1);
-        assert_eq!(db.links_for_show(big_b).unwrap().len(), 1);
+        assert_eq!(
+            db.torrent_link("aaa").unwrap().expect("link survives the fold").show_id,
+            big_a
+        );
+        assert_eq!(
+            db.torrent_link("bbb").unwrap().expect("link survives the fold").show_id,
+            big_b
+        );
+        assert!(db.get_show(small_a).is_err(), "the folded row is gone");
+        assert!(db.get_show(small_b).is_err(), "the folded row is gone");
         let prefs_a = db.get_prefs(big_a).unwrap();
         assert_eq!(
             (prefs_a.save_path.as_deref(), prefs_a.category.as_deref()),
@@ -2131,10 +2126,6 @@ mod tests {
         );
         assert_eq!(db.rss_feed_show("animemgr:pair-a").unwrap(), Some(big_a));
         assert_eq!(db.rss_feed_show("animemgr:pair-b").unwrap(), Some(big_b));
-        assert!(
-            db.rss_feeds().unwrap().iter().all(|f| f.show_id == big_a || f.show_id == big_b),
-            "no feed still points at a folded row"
-        );
     }
 
     #[test]
@@ -2537,13 +2528,18 @@ mod tests {
             Ok(c.last_insert_rowid())
         }).unwrap();
         db.add_torrent_link(&TorrentLink {
-            info_hash: "abc123".into(), show_id, season: 1, number: 6,
+            info_hash: "  ABC123 ".into(), show_id, season: 1, number: 6,
             added_at: 0,
         }).unwrap();
         let got = db.torrent_link("abc123").unwrap().expect("link stored");
+        assert_eq!(got.info_hash, "abc123", "hash normalized on write");
         assert_eq!(got.number, 6);
+        assert!(
+            db.torrent_link("  AbC123  ").unwrap().is_some(),
+            "hash normalized on lookup"
+        );
         assert!(db.torrent_link("nope").unwrap().is_none());
-        db.remove_torrent_link("abc123").unwrap();
+        db.remove_torrent_link("ABC123").unwrap();
         assert!(db.torrent_link("abc123").unwrap().is_none());
         let prefs = db.get_prefs(show_id).unwrap();
         assert_eq!(prefs, TorrentPrefs { show_id: 1, save_path: None, category: None });
@@ -2553,6 +2549,48 @@ mod tests {
         assert_eq!(db.rss_feed_show("animemgr:Frieren").unwrap(), Some(1));
         db.remove_rss_feed("animemgr:Frieren").unwrap();
         assert_eq!(db.rss_feed_show("animemgr:Frieren").unwrap(), None);
+    }
+
+    #[test]
+    fn v6_db_upgrades_to_v7_without_data_loss() {
+        // A v6 database predates the three torrent tables. The in-place upgrade must
+        // create them and bump the version without touching shows or episodes.
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Legacy", 1, 1), &rf("/legacy/01.mkv", 1, 1))
+            .unwrap();
+        db.with(|c| {
+            c.execute_batch(
+                "DROP TABLE torrent_links;
+                 DROP TABLE torrent_prefs;
+                 DROP TABLE rss_feeds;
+                 PRAGMA user_version = 6;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        db.with(migrate).unwrap();
+        let version: i64 = db
+            .with(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(version, 7);
+        for table in ["torrent_links", "torrent_prefs", "rss_feeds"] {
+            let n: i64 = db
+                .with(|c| {
+                    Ok(c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?)
+                })
+                .unwrap();
+            assert_eq!(n, 0, "{table} exists and starts empty");
+        }
+        let (shows, episodes): (i64, i64) = db
+            .with(|c| {
+                Ok((
+                    c.query_row("SELECT COUNT(*) FROM shows", [], |r| r.get(0))?,
+                    c.query_row("SELECT COUNT(*) FROM episodes", [], |r| r.get(0))?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(shows, 1, "the show survives the upgrade");
+        assert_eq!(episodes, 1, "the episode survives the upgrade");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isSavePathInsideRoots, sendButtonState, torrentBadge } from './torrentDisplay';
+import { formatEta, formatSpeed, isSavePathInsideRoots, sendButtonState, torrentBadge } from './torrentDisplay';
 
 describe('torrentBadge', () => {
   it('shows download progress with the linked episode', () => {
@@ -69,5 +69,52 @@ describe('isSavePathInsideRoots', () => {
   it('ignores trailing slashes on roots', () => {
     expect(isSavePathInsideRoots('/media/anime', ['/media/anime/'])).toBe(true);
     expect(isSavePathInsideRoots('/media/anime/Frieren', ['/media/anime//'])).toBe(true);
+  });
+
+  it('treats an empty save path as inside (nothing to warn about)', () => {
+    expect(isSavePathInsideRoots(null, ['/r1'])).toBe(true);
+    expect(isSavePathInsideRoots('', ['/r1'])).toBe(true);
+  });
+
+  it('treats the filesystem root as owning every absolute path', () => {
+    expect(isSavePathInsideRoots('/anything', ['/'])).toBe(true);
+  });
+
+  it('ignores a blank root rather than matching everything', () => {
+    expect(isSavePathInsideRoots('/r1/x', [''])).toBe(false);
+  });
+
+  it('has no root to match against when the list is empty', () => {
+    expect(isSavePathInsideRoots('/r1/x', [])).toBe(false);
+  });
+});
+
+describe('formatSpeed', () => {
+  it('reads an idle rate as a dash', () => {
+    expect(formatSpeed(0)).toBe('—');
+  });
+
+  it('renders kilobytes without a decimal below a MiB/s', () => {
+    expect(formatSpeed(2048)).toBe('2 KB/s');
+  });
+
+  it('renders megabytes with one decimal above a MiB/s', () => {
+    expect(formatSpeed(2097152)).toBe('2.0 MB/s');
+  });
+});
+
+describe('formatEta', () => {
+  it('reads no estimate or a negative one as a dash', () => {
+    expect(formatEta(null)).toBe('—');
+    expect(formatEta(-1)).toBe('—');
+  });
+
+  it('renders seconds, then minutes and seconds', () => {
+    expect(formatEta(45)).toBe('45s');
+    expect(formatEta(90)).toBe('1m 30s');
+  });
+
+  it('renders hours and minutes past an hour', () => {
+    expect(formatEta(3700)).toBe('1h 1m');
   });
 });

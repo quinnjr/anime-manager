@@ -491,10 +491,15 @@ pub fn apply_settings_defaults(mut m: HashMap<String, String>) -> HashMap<String
     m
 }
 
+/// An armed flag as the settings page reads it.
+fn flag(v: bool) -> &'static str {
+    if v { "true" } else { "false" }
+}
+
 /// The armed flag as the settings page reads it: "true" only after a successful Test
 /// connection against the current config, "false" otherwise (including a fresh database).
 fn test_ok_flag(db: &Db) -> &'static str {
-    if Llm::test_ok(db) { "true" } else { "false" }
+    flag(Llm::test_ok(db))
 }
 
 #[tauri::command]
@@ -576,6 +581,15 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String
         torrent::TEST_OK_KEY.into(),
         torrent_test_ok_flag(&state.db).into(),
     );
+    // Opt-in acknowledgement for sending a password over plain http; default off.
+    m.insert(
+        torrent::ALLOW_CLEARTEXT_KEY.into(),
+        state
+            .db
+            .get_setting(torrent::ALLOW_CLEARTEXT_KEY)?
+            .filter(|v| v == "true")
+            .unwrap_or_else(|| "false".into()),
+    );
     m.insert(
         SETTING_DLNA_NAME.into(),
         state
@@ -593,42 +607,63 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String
     Ok(apply_settings_defaults(m))
 }
 
-/// Read-compare-write for settings that invalidate the LLM connection test: the write
-/// always lands, but the worker is disarmed only when the value actually changed, so
-/// re-saving an identical key does not stand a working config down.
-pub fn maybe_invalidate_test(db: &Db, key: &str, value: &str) -> Result<()> {
-    if !Llm::invalidates_test(key) {
+/// Read-compare-write for settings that invalidate a connection test: the write always
+/// lands, but the armed flag is cleared only when the value actually changed, so re-saving
+/// an identical value does not stand a working config down. A key that does not invalidate
+/// the test is a no-op (the caller owns that write).
+fn maybe_invalidate(
+    db: &Db,
+    key: &str,
+    value: &str,
+    invalidates: fn(&str) -> bool,
+    mark: fn(&Db, bool) -> Result<()>,
+) -> Result<()> {
+    if !invalidates(key) {
         return Ok(());
     }
     let old = db.get_setting(key)?;
     db.set_setting(key, value)?;
     if old.as_deref() != Some(value) {
-        Llm::mark_tested(db, false)?;
+        mark(db, false)?;
     }
     Ok(())
+}
+
+/// LLM connection-test wrapper: a new key, endpoint or model disarms the assist worker.
+pub fn maybe_invalidate_test(db: &Db, key: &str, value: &str) -> Result<()> {
+    maybe_invalidate(db, key, value, Llm::invalidates_test, Llm::mark_tested)
 }
 
 /// The torrent armed flag as the settings page reads it: "true" only after a successful
 /// Test connection against the current config, "false" otherwise (including fresh).
 fn torrent_test_ok_flag(db: &Db) -> &'static str {
-    if torrent::test_ok(db) {
-        "true"
-    } else {
-        "false"
-    }
+    flag(torrent::test_ok(db))
 }
 
-/// Read-compare-write mirroring `maybe_invalidate_test`: a new base URL or password
-/// un-proves the last successful connection test, so control/add/RSS paths refuse
-/// until it tests clean again.
+/// Torrent connection-test wrapper: a new base URL or password un-proves the last
+/// successful test, so control/add/RSS paths refuse until it tests clean again.
 pub fn maybe_invalidate_torrent_test(db: &Db, key: &str, value: &str) -> Result<()> {
-    if !torrent::invalidates_test(key) {
-        return Ok(());
+    maybe_invalidate(
+        db,
+        key,
+        value,
+        torrent::invalidates_test,
+        torrent::mark_tested,
+    )
+}
+
+/// Rules a raw Settings write must satisfy before it lands. The armed flags are
+/// machine-managed, and a malformed path map is rejected loudly (leaving the stored
+/// value alone) rather than saved. A blank torrent base URL is allowed: blank means
+/// unconfigured, matching `TorrentClient::from_db`.
+fn validate_setting(_db: &Db, key: &str, value: &str) -> Result<()> {
+    if key == torrent::TEST_OK_KEY {
+        return Err(crate::error::AppError::Parse(
+            "torrent_test_ok is managed by Test connection".into(),
+        ));
     }
-    let old = db.get_setting(key)?;
-    db.set_setting(key, value)?;
-    if old.as_deref() != Some(value) {
-        torrent::mark_tested(db, false)?;
+    if key == torrent::PATH_MAP_KEY {
+        torrent::parse_path_map(value)?;
     }
     Ok(())
 }
@@ -640,21 +675,7 @@ pub fn set_setting(state: State<'_, AppState>, key: String, value: String) -> Re
             "llm_test_ok is managed by Test connection".into(),
         ));
     }
-    if key == torrent::TEST_OK_KEY {
-        return Err(crate::error::AppError::Parse(
-            "torrent_test_ok is managed by Test connection".into(),
-        ));
-    }
-    if key == torrent::BASE_URL_KEY && value.trim().is_empty() {
-        return Err(crate::error::AppError::Parse(
-            "torrent base URL cannot be blank".into(),
-        ));
-    }
-    // A bad mapping pair never lands: the parse error names the pair and the
-    // stored value is left alone, so the Settings save fails loudly.
-    if key == torrent::PATH_MAP_KEY {
-        torrent::parse_path_map(&value)?;
-    }
+    validate_setting(&state.db, &key, &value)?;
     // DLNA keys bypass `dlna_set_options`, so validate here too. No restart:
     // the running server keeps its port until the next enable or option save.
     if key == SETTING_DLNA_NAME && value.trim().is_empty() {
@@ -822,336 +843,6 @@ pub async fn find_missing(
     nyaa::find_missing(&state.db, &Nyaa::with_endpoint(nyaa::NYAA_BASE.into())?, show_id).await
 }
 
-/// Control/add/RSS paths refuse while the connection test is disarmed, with a toast
-/// pointing at Settings. Discover and test are always allowed.
-fn require_torrent_armed(db: &Db) -> Result<()> {
-    if torrent::test_ok(db) {
-        return Ok(());
-    }
-    Err(crate::error::AppError::Parse(
-        "rustorrent is not connected — set the base URL in Settings and run Test connection"
-            .into(),
-    ))
-}
-
-/// Candidate rustorrent base URLs on the LAN. Empty when nothing answers; manual entry
-/// is always available. Blocking mDNS browse, so off the async thread (scan precedent).
-#[tauri::command]
-pub async fn torrent_discover() -> Vec<String> {
-    tauri::async_runtime::spawn_blocking(|| torrent::discover(3000))
-        .await
-        .unwrap_or_default()
-}
-
-/// Prove the connection (login + `GET /api/stats`) and arm `torrent_test_ok` on
-/// success, disarm on failure. A failed write is logged and the reply still returned.
-#[tauri::command]
-pub async fn torrent_test(state: State<'_, AppState>) -> Result<String> {
-    let reply = torrent::TorrentClient::from_db(&state.db)?
-        .test()
-        .await;
-    match &reply {
-        Ok(_) => {
-            if let Err(e) = torrent::mark_tested(&state.db, true) {
-                eprintln!("torrent_test: flag not persisted: {e}");
-            }
-        }
-        Err(_) => {
-            if let Err(e) = torrent::mark_tested(&state.db, false) {
-                eprintln!("torrent_test: flag not persisted: {e}");
-            }
-        }
-    }
-    reply
-}
-
-/// Every torrent with the episode it belongs to (add-time pin, else path backfill).
-/// Pure query: writes nothing, emits nothing. One bad row never fails the view.
-#[tauri::command]
-pub async fn torrent_list(state: State<'_, AppState>) -> Result<Vec<LinkedTorrent>> {
-    require_torrent_armed(&state.db)?;
-    let client = torrent::TorrentClient::from_db(&state.db)?;
-    let torrents = client.list().await?;
-    Ok(client.attribute(&state.db, torrents).await)
-}
-
-/// Send one strict Nyaa hit to rustorrent and pin the result to its episode.
-/// The server list is the source of truth: a given `info_hash` (trimmed and
-/// lowercased once) present on the server is linked to the requested episode
-/// with no double add, whether or not a pin exists. Absent from the server →
-/// download → add → pin, so a stale pin can never shadow a re-add. Returns
-/// the server's info_hash.
-// Arity is the IPC contract (flat args per the design spec), not a refactor target.
-#[allow(clippy::too_many_arguments)]
-#[tauri::command]
-pub async fn torrent_add(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    torrent_url: Option<String>,
-    info_hash: Option<String>,
-    show_id: i64,
-    season: u32,
-    number: u32,
-    save_path: Option<String>,
-    category: Option<String>,
-) -> Result<String> {
-    require_torrent_armed(&state.db)?;
-    let client = torrent::TorrentClient::from_db(&state.db)?;
-    let clean = |o: Option<String>| o.filter(|v| !v.trim().is_empty());
-    let given = clean(info_hash)
-        .map(|h| h.trim().to_lowercase())
-        .filter(|h| !h.is_empty());
-    // Server list first, single call: a failing list() is loud, so a blind
-    // duplicate add can never follow. Pins are only (re-)written here.
-    if let Some(hash) = given
-        && client
-            .list()
-            .await?
-            .iter()
-            .any(|t| t.info_hash.trim().to_lowercase() == hash)
-    {
-        state.db.add_torrent_link(&TorrentLink {
-            info_hash: hash.clone(),
-            show_id,
-            season,
-            number,
-            added_at: db::now(),
-        })?;
-        let _ = app.emit("torrent-changed", ());
-        let _ = app.emit("show-updated", show_id);
-        return Ok(hash);
-    }
-    let url = clean(torrent_url).ok_or_else(|| {
-        crate::error::AppError::Parse("no .torrent URL to send".into())
-    })?;
-    let bytes = client.fetch_bytes(&url).await?;
-    let filename = url
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("download.torrent")
-        .to_string();
-    let prefs = state.db.get_prefs(show_id)?;
-    let dest = match clean(save_path).or_else(|| clean(prefs.save_path.clone())) {
-        Some(p) => p,
-        None => torrent::default_save_path(&state.db, show_id)?,
-    };
-    let cat = clean(category)
-        .or_else(|| clean(prefs.category.clone()))
-        .unwrap_or_else(|| "anime".into());
-    // Prefs and defaults are local form; the server needs its own form.
-    let map = state
-        .db
-        .get_setting(torrent::PATH_MAP_KEY)
-        .ok()
-        .flatten()
-        .and_then(|raw| torrent::parse_path_map(&raw).ok())
-        .unwrap_or_default();
-    let hash = client
-        .add_torrent_mapped(bytes, &filename, &dest, &cat, &map)
-        .await?;
-    state.db.add_torrent_link(&TorrentLink {
-        info_hash: hash.clone(),
-        show_id,
-        season,
-        number,
-        added_at: db::now(),
-    })?;
-    let _ = app.emit("torrent-changed", ());
-    let _ = app.emit("show-updated", show_id);
-    Ok(hash)
-}
-
-/// Start / pause / recheck / remove one torrent.
-#[tauri::command]
-pub async fn torrent_control(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    info_hash: String,
-    op: torrent::ControlOp,
-) -> Result<()> {
-    require_torrent_armed(&state.db)?;
-    torrent::TorrentClient::from_db(&state.db)?
-        .control(&info_hash, &op)
-        .await?;
-    // Forget semantics: the pin dies only after the server removal succeeded,
-    // so a failed remove keeps the link and a later re-add is never shadowed.
-    if matches!(op, torrent::ControlOp::Remove { .. }) {
-        let key = info_hash.trim().to_lowercase();
-        if !key.is_empty() {
-            state.db.remove_torrent_link(&key)?;
-        }
-    }
-    let _ = app.emit("torrent-changed", ());
-    Ok(())
-}
-
-#[tauri::command]
-pub fn torrent_prefs_get(state: State<'_, AppState>, show_id: i64) -> Result<TorrentPrefs> {
-    state.db.get_prefs(show_id)
-}
-
-#[tauri::command]
-pub fn torrent_prefs_set(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    show_id: i64,
-    save_path: Option<String>,
-    category: Option<String>,
-) -> Result<TorrentPrefs> {
-    state.db.set_prefs(show_id, save_path.as_deref(), category.as_deref())?;
-    let _ = app.emit("torrent-changed", ());
-    state.db.get_prefs(show_id)
-}
-
-/// What `torrent_rss_subscribe` reports: the deterministic label, the feed URL,
-/// and where the server will actually put files (`resolved_path`, server truth
-/// via `GET /api/config`) plus whether that sits outside the library roots.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct RssSubscribeResult {
-    pub label: String,
-    pub url: String,
-    pub resolved_path: Option<String>,
-    pub outside_roots: bool,
-}
-
-/// True when `path` sits under one of `roots` (exact match or `root/` prefix
-/// after trimming trailing slashes), so completions scan back in. Thin alias
-/// over the shared torrent helper so the subscribe check and the attribute
-/// prefilter agree; pure so the subscribe placement check is unit-testable
-/// without a database.
-fn path_inside_roots(path: &str, roots: &[String]) -> bool {
-    torrent::path_under_roots(path, roots)
-}
-
-/// One-click subscribe: derive the feed URL and group/resolution preferences from the
-/// show's owned episodes, register the deterministic `animemgr:<parsed_title>` label
-/// server-side, and remember it for Downloads attribution.
-#[tauri::command]
-pub async fn torrent_rss_subscribe(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    show_id: i64,
-) -> Result<RssSubscribeResult> {
-    require_torrent_armed(&state.db)?;
-    let show = state.db.get_show(show_id)?;
-    let derivation = nyaa::subscribe_derivation(&state.db, show_id)?;
-    let search = torrent::build_search_regex(
-        &show.display_title,
-        derivation.group.as_deref(),
-        derivation.resolution.as_deref(),
-    )?;
-    let prefs = state.db.get_prefs(show_id)?;
-    let category = prefs
-        .category
-        .filter(|c| !c.trim().is_empty())
-        .unwrap_or_else(|| "anime".into());
-    let client = torrent::TorrentClient::from_db(&state.db)?;
-    let label = client
-        .rss_add(&RssFeedConfig {
-            label: torrent::feed_label(&show.parsed_title),
-            url: derivation.feed_url.clone(),
-            search,
-            category: category.clone(),
-            enabled: true,
-            exclude_batch: true,
-        })
-        .await?;
-    state.db.add_rss_feed(&label, show_id)?;
-    // Server-truth placement: a config fetch failure never blocks the subscribe.
-    // The displayed path stays server form (server truth); the outside-roots
-    // warning is driven by the server path translated to local form, or a
-    // NAS-backed server would warn on every subscribe.
-    let (resolved_path, outside_roots) = match client.server_config().await {
-        Ok(cfg) => {
-            let path = torrent::resolve_category_path(&cfg, &category);
-            let map = state
-                .db
-                .get_setting(torrent::PATH_MAP_KEY)
-                .ok()
-                .flatten()
-                .and_then(|raw| torrent::parse_path_map(&raw).ok())
-                .unwrap_or_default();
-            let outside = match state.db.list_roots() {
-                Ok(roots) => !path_inside_roots(
-                    &torrent::map_to_local(&path, &map),
-                    &roots.into_iter().map(|r| r.path).collect::<Vec<_>>(),
-                ),
-                Err(e) => {
-                    eprintln!("torrent_rss_subscribe: roots unreadable, no placement check: {e}");
-                    false
-                }
-            };
-            (Some(path), outside)
-        }
-        Err(e) => {
-            eprintln!("torrent_rss_subscribe: server config unreadable, no placement: {e}");
-            (None, false)
-        }
-    };
-    let _ = app.emit("torrent-changed", ());
-    let _ = app.emit("show-updated", show_id);
-    Ok(RssSubscribeResult {
-        label,
-        url: derivation.feed_url,
-        resolved_path,
-        outside_roots,
-    })
-}
-
-/// Every server-side feed joined to the local show it was registered for, if any.
-/// Pure query: writes nothing, emits nothing.
-#[tauri::command]
-pub async fn torrent_rss_list(state: State<'_, AppState>) -> Result<Vec<RssFeedView>> {
-    require_torrent_armed(&state.db)?;
-    torrent::TorrentClient::from_db(&state.db)?
-        .rss_list(&state.db)
-        .await
-}
-
-/// Idempotent enable/disable: the server only flips, so list first and toggle only
-/// when the current state differs from the desired one.
-#[tauri::command]
-pub async fn torrent_rss_toggle(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    label: String,
-    enabled: bool,
-) -> Result<()> {
-    require_torrent_armed(&state.db)?;
-    let client = torrent::TorrentClient::from_db(&state.db)?;
-    let current = client
-        .rss_list(&state.db)
-        .await?
-        .into_iter()
-        .find(|f| f.label == label)
-        .ok_or_else(|| {
-            crate::error::AppError::Parse(format!("unknown rss feed '{label}'"))
-        })?;
-    if current.enabled != enabled {
-        client.rss_toggle(&label).await?;
-        let _ = app.emit("torrent-changed", ());
-    }
-    Ok(())
-}
-
-/// Remove a subscription (config-only server-side; downloaded files are never touched)
-/// and forget the local label.
-#[tauri::command]
-pub async fn torrent_rss_remove(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    label: String,
-) -> Result<()> {
-    require_torrent_armed(&state.db)?;
-    torrent::TorrentClient::from_db(&state.db)?
-        .rss_remove(&label)
-        .await?;
-    state.db.remove_rss_feed(&label)?;
-    let _ = app.emit("torrent-changed", ());
-    Ok(())
-}
-
 /// Model ids offered by whatever provider is configured right now.
 #[tauri::command]
 pub async fn llm_models(state: State<'_, AppState>) -> Result<Vec<String>> {
@@ -1298,21 +989,50 @@ mod tests {
     }
 
     #[test]
-    fn path_inside_roots_matches_prefix_only() {
-        let roots = vec!["/r1".to_string(), "/media/anime/".to_string()];
-        assert!(path_inside_roots("/r1/Owned/01.mkv", &roots));
-        assert!(path_inside_roots("/media/anime/Frieren", &roots));
-        assert!(!path_inside_roots("/dl/anime/Frieren", &roots));
-        assert!(!path_inside_roots("/r10/lookalike", &roots));
-    }
-
-    #[test]
     fn torrent_test_disarms_on_url_change() {
         let db = Db::open_memory().unwrap();
         db.set_setting(torrent::BASE_URL_KEY, "http://x").unwrap();
+        db.set_setting(torrent::PASSWORD_KEY, "pw1").unwrap();
         torrent::mark_tested(&db, true).unwrap();
-        maybe_invalidate_torrent_test(&db, "torrent_base_url", "http://y").unwrap();
-        assert!(!torrent::test_ok(&db));
+        // A changed password disarms too.
+        maybe_invalidate_torrent_test(&db, torrent::PASSWORD_KEY, "pw2").unwrap();
+        assert!(!torrent::test_ok(&db), "changed password disarms");
+        // Re-saving the identical value keeps it armed AND still writes.
+        torrent::mark_tested(&db, true).unwrap();
+        maybe_invalidate_torrent_test(&db, torrent::PASSWORD_KEY, "pw2").unwrap();
+        assert!(torrent::test_ok(&db), "same value stays armed");
+        assert_eq!(
+            db.get_setting(torrent::PASSWORD_KEY).unwrap().as_deref(),
+            Some("pw2")
+        );
+        // A changed base URL disarms AND writes.
+        maybe_invalidate_torrent_test(&db, torrent::BASE_URL_KEY, "http://y").unwrap();
+        assert!(!torrent::test_ok(&db), "changed base URL disarms");
+        assert_eq!(
+            db.get_setting(torrent::BASE_URL_KEY).unwrap().as_deref(),
+            Some("http://y")
+        );
+        // A non-identity key is a no-op: the flag stays armed and nothing is written.
+        torrent::mark_tested(&db, true).unwrap();
+        maybe_invalidate_torrent_test(&db, torrent::PATH_MAP_KEY, "/a=/b").unwrap();
+        assert!(torrent::test_ok(&db), "non-identity key untouched");
+        assert_eq!(db.get_setting(torrent::PATH_MAP_KEY).unwrap(), None);
+    }
+
+    #[test]
+    fn validate_setting_rejects_managed_flags_and_bad_maps() {
+        let db = Db::open_memory().unwrap();
+        db.set_setting(torrent::PATH_MAP_KEY, "/downloads=/mnt/nas/Downloads")
+            .unwrap();
+        assert!(validate_setting(&db, torrent::TEST_OK_KEY, "true").is_err());
+        assert!(validate_setting(&db, torrent::PATH_MAP_KEY, "bad").is_err());
+        assert_eq!(
+            db.get_setting(torrent::PATH_MAP_KEY).unwrap().as_deref(),
+            Some("/downloads=/mnt/nas/Downloads"),
+            "a bad map is rejected before it lands, so the stored value survives"
+        );
+        // Blank base URL is allowed: blank means unconfigured.
+        assert!(validate_setting(&db, torrent::BASE_URL_KEY, "").is_ok());
     }
 
     #[test]

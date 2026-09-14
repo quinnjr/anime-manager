@@ -35,10 +35,20 @@
   let torrentBaseUrl = $state('');
   let torrentPassword = $state('');
   let torrentPathMap = $state('');
+  let torrentAllowCleartext = $state(false);
   let torrentTested = $state(false);
   let torrentTesting = $state(false);
   let torrentDiscovering = $state(false);
+  let torrentClearing = $state(false);
   let torrentCandidates = $state<string[]>([]);
+
+  // Warn only while credentials would actually travel unacknowledged:
+  // a password set over plain http and the opt-in not yet ticked.
+  const insecureTorrent = $derived(
+    torrentPassword.trim() !== '' &&
+      torrentBaseUrl.trim().toLowerCase().startsWith('http://') &&
+      !torrentAllowCleartext
+  );
 
   let dlnaRunning = $state(false);
   let dlnaPort = $state(0);
@@ -79,6 +89,7 @@
       torrentBaseUrl = s.torrent_base_url ?? '';
       torrentPassword = s.torrent_password ?? '';
       torrentPathMap = s.torrent_path_map ?? '';
+      torrentAllowCleartext = s.torrent_allow_cleartext === 'true';
       torrentTested = isTestedFlag(s.torrent_test_ok);
       provider = LLM_PROVIDERS.find((p) => p.baseUrl === llmBaseUrl)?.id ?? 'custom';
       dlnaName = s.dlna_name ?? '';
@@ -181,13 +192,14 @@
       await api.setSetting('llm_base_url', llmBaseUrl.trim());
       await api.setSetting('llm_assist_on_scan', llmOnScan ? 'true' : 'false');
       await api.setSetting('llm_delay_ms', String(Math.max(0, Number(llmDelay) || 0)));
-      // The backend rejects a blank base URL, so an untouched field leaves the
-      // stored one alone rather than failing the whole save for non-users.
+      // A blank field leaves the stored URL alone so an ordinary Save never
+      // disconnects a configured instance; Disconnect clears the pair explicitly.
       const torrentUrl = torrentBaseUrl.trim();
       if (torrentUrl) await api.setSetting('torrent_base_url', torrentUrl);
       await api.setSetting('torrent_password', torrentPassword.trim());
       // A bad pair fails loudly here and the stored mapping is left alone.
       await api.setSetting('torrent_path_map', torrentPathMap.trim());
+      await api.setSetting('torrent_allow_cleartext', torrentAllowCleartext ? 'true' : 'false');
       await refreshTestFlag();
       await refreshTorrentFlag();
       toasts.push('success', 'Settings saved');
@@ -240,6 +252,19 @@
       }
     } catch (e) { toasts.error(e); }
     finally { torrentDiscovering = false; }
+  }
+
+  async function disconnectTorrent() {
+    torrentClearing = true;
+    try {
+      await api.setSetting('torrent_base_url', '');
+      await api.setSetting('torrent_password', '');
+      torrentBaseUrl = '';
+      torrentPassword = '';
+      await refreshTorrentFlag();
+      toasts.push('success', 'Disconnected from rustorrent.');
+    } catch (e) { toasts.error(e); }
+    finally { torrentClearing = false; }
   }
 
   async function toggleDlna(next: boolean) {
@@ -516,8 +541,16 @@
     <div class="mt-3 flex flex-wrap items-center gap-3">
       <button class="btn" disabled={torrentDiscovering} onclick={discoverTorrent}>{torrentDiscovering ? 'Discovering…' : 'Discover'}</button>
       <button class="btn" disabled={torrentTesting || !torrentBaseUrl.trim()} onclick={testTorrent}>{torrentTesting ? 'Testing…' : 'Test connection'}</button>
+      <button class="btn" disabled={torrentClearing} onclick={disconnectTorrent}>{torrentClearing ? 'Disconnecting…' : 'Disconnect'}</button>
       <span class="tag">{torrentTested ? 'tested — torrent actions armed' : 'untested — torrent actions stand down until a test succeeds'}</span>
     </div>
+    {#if insecureTorrent}
+      <p class="tag mt-3 text-[var(--color-alarm)]">Credentials are sent without TLS; anyone on this network can read them. Tick the box below to allow it, or use an https URL.</p>
+    {/if}
+    <label class="mt-3 flex items-center gap-2 text-sm">
+      <input bind:checked={torrentAllowCleartext} type="checkbox" />
+      <span>Allow unencrypted credentials over http (needed for a plain-LAN instance)</span>
+    </label>
   </section>
 
   <!-- Destructive-ish maintenance, kept last and apart -->

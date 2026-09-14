@@ -1,10 +1,12 @@
 use crate::db::Db;
 use crate::error::{AppError, Result};
+use crate::http::{read_capped, send_with_retry, snippet};
 use crate::models::{
     LinkedTo, LinkedTorrent, RssFeedConfig, RssFeedView, ShowSort, TorrentDetail, TorrentFile,
     TorrentInfo,
 };
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 
 pub const BASE_URL_KEY: &str = "torrent_base_url";
 pub const PASSWORD_KEY: &str = "torrent_password";
@@ -13,6 +15,10 @@ pub const TEST_OK_KEY: &str = "torrent_test_ok";
 /// `/downloads=/mnt/nas/Downloads`. The server and this machine see the same
 /// files under different roots; every comparison translates first.
 pub const PATH_MAP_KEY: &str = "torrent_path_map";
+/// Opt-in acknowledgement that a password may cross a plain-`http` LAN link.
+/// Without it, a configured password over `http://` is refused before it is
+/// sent, so credentials never go out unencrypted by default.
+pub const ALLOW_CLEARTEXT_KEY: &str = "torrent_allow_cleartext";
 
 /// What `control` asks the server to do to one torrent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,12 +26,18 @@ pub enum ControlOp {
     Start,
     Pause,
     Recheck,
-    Remove { delete_files: bool },
+    Remove {
+        #[serde(default)]
+        delete_files: bool,
+    },
 }
 
 pub struct TorrentClient {
     base_url: String,
     password: Option<String>,
+    /// Whether a password is permitted over a plain-`http` base URL. Read from
+    /// `ALLOW_CLEARTEXT_KEY` in production; `new` defaults it on for tests.
+    allow_cleartext: bool,
     /// Cached session: `None` = not logged in yet, `Some(None)` = no-auth
     /// server, `Some(Some(cookie))` = session cookie value.
     cookie: std::sync::Mutex<Option<Option<String>>>,
@@ -34,6 +46,14 @@ pub struct TorrentClient {
 
 impl TorrentClient {
     pub fn new(base_url: String, password: Option<String>) -> Self {
+        Self::with_cleartext(base_url, password, true)
+    }
+
+    pub fn with_cleartext(
+        base_url: String,
+        password: Option<String>,
+        allow_cleartext: bool,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .user_agent("anime-manager")
             .timeout(std::time::Duration::from_secs(20))
@@ -42,6 +62,7 @@ impl TorrentClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             password: password.filter(|p| !p.is_empty()),
+            allow_cleartext,
             cookie: std::sync::Mutex::new(None),
             http,
         }
@@ -53,11 +74,11 @@ impl TorrentClient {
             return Err(AppError::Parse("not configured".into()));
         }
         let password = db.get_setting(PASSWORD_KEY)?.filter(|s| !s.is_empty());
-        Ok(Self::new(base_url, password))
-    }
-
-    pub fn configured(&self) -> bool {
-        !self.base_url.trim().is_empty()
+        let allow = db
+            .get_setting(ALLOW_CLEARTEXT_KEY)?
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        Ok(Self::with_cleartext(base_url, password, allow))
     }
 
     /// First `rustorrent_token=…` segment across every Set-Cookie header.
@@ -79,10 +100,23 @@ impl TorrentClient {
     /// POST {base}/api/login {"password"} → session cookie, or `None` when
     /// the server has no password configured (login 404s/401s: no auth needed).
     async fn login(&self) -> Result<Option<String>> {
+        // Refuse to send a password over plain http unless the user has
+        // explicitly acknowledged it. Checked here too, not only in Settings,
+        // so no code path can leak the credential by omission.
+        if self.password.is_some()
+            && self.base_url.starts_with("http://")
+            && !self.allow_cleartext
+        {
+            return Err(AppError::Parse(
+                "rustorrent password would cross http:// unencrypted — use https or enable \
+                 \"Allow unencrypted credentials\" in Settings"
+                    .into(),
+            ));
+        }
         let url = format!("{}/api/login", self.base_url);
         let password = self.password.clone().unwrap_or_default();
         let resp = self
-            .send_with_backoff(|| {
+            .send_with_backoff(true, || {
                 self.http
                     .post(&url)
                     .json(&serde_json::json!({"password": password}))
@@ -93,9 +127,12 @@ impl TorrentClient {
             return Ok(None);
         }
         if !status.is_success() {
-            let snippet = snippet(resp).await;
+            // Never echo a login body into an error: it may carry the server's
+            // own auth material. Log it, keep the returned error to the status.
+            let body = snippet(resp, 200).await;
+            eprintln!("rustorrent login returned {status}: {body}");
             return Err(AppError::Network(format!(
-                "rustorrent login returned {status}: {snippet}"
+                "rustorrent login returned {status}"
             )));
         }
         Ok(Self::parse_cookie(resp.headers()))
@@ -124,19 +161,22 @@ impl TorrentClient {
 
     /// One request with the session cookie attached; on 401 exactly once,
     /// re-login and retry once (the token may have expired), else Err(Network).
+    /// `retry_on_timeout` is forwarded: false for creates the server may have
+    /// already accepted before the timeout.
     async fn send_authed(
         &self,
+        retry_on_timeout: bool,
         mk: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response> {
         let cookie = self.cookie().await?;
         let resp = self
-            .send_with_backoff(|| Self::attach(&cookie, mk()))
+            .send_with_backoff(retry_on_timeout, || Self::attach(&cookie, mk()))
             .await?;
         if resp.status().as_u16() == 401 {
             self.clear_cookie();
             let cookie = self.cookie().await?;
             let resp = self
-                .send_with_backoff(|| Self::attach(&cookie, mk()))
+                .send_with_backoff(retry_on_timeout, || Self::attach(&cookie, mk()))
                 .await?;
             if resp.status().as_u16() == 401 {
                 return Err(AppError::Network("rustorrent: unauthorized".into()));
@@ -146,37 +186,13 @@ impl TorrentClient {
         Ok(resp)
     }
 
-    /// Run one request, retrying 429/5xx twice with 200ms/800ms backoff plus
-    /// jitter and honouring Retry-After (capped at 30s) — the nyaa search shape.
+    /// The nyaa search shape: 3 attempts, 429/5xx/timeout retried.
     async fn send_with_backoff(
         &self,
+        retry_on_timeout: bool,
         mk: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response> {
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            let sent = mk().send().await;
-            let resp = match sent {
-                Ok(resp) => resp,
-                Err(e) if e.is_timeout() && attempt < 3 => {
-                    tokio::time::sleep(retry_wait(attempt)).await;
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            };
-            let status = resp.status();
-            if (status.as_u16() == 429 || status.is_server_error()) && attempt < 3 {
-                let asked = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|h| h.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .map(|s| std::time::Duration::from_secs(s.min(30)));
-                tokio::time::sleep(asked.unwrap_or_else(|| retry_wait(attempt))).await;
-                continue;
-            }
-            return Ok(resp);
-        }
+        send_with_retry(3, retry_on_timeout, || mk().send()).await
     }
 
     async fn check_ok(resp: reqwest::Response, what: &str) -> Result<()> {
@@ -184,30 +200,34 @@ impl TorrentClient {
             return Ok(());
         }
         let status = resp.status();
-        let body = snippet(resp).await;
+        let body = snippet(resp, 200).await;
         Err(AppError::Network(format!(
             "rustorrent {what} returned {status}: {body}"
         )))
     }
 
     async fn post_action_resp(&self, hash: &str, action: &str) -> Result<reqwest::Response> {
-        let url = format!("{}/api/torrents/{hash}/{action}", self.base_url);
-        self.send_authed(|| self.http.post(&url)).await
+        let url = format!(
+            "{}/api/torrents/{}/{action}",
+            self.base_url,
+            encode_path_segment(hash)
+        );
+        self.send_authed(true, || self.http.post(&url)).await
     }
 
     pub async fn test(&self) -> Result<String> {
         let url = format!("{}/api/stats", self.base_url);
-        let resp = self.send_authed(|| self.http.get(&url)).await?;
+        let resp = self.send_authed(true, || self.http.get(&url)).await?;
         Self::check_ok(resp, "stats").await?;
         Ok("ok".to_string())
     }
 
     pub async fn list(&self) -> Result<Vec<TorrentInfo>> {
         let url = format!("{}/api/torrents", self.base_url);
-        let resp = self.send_authed(|| self.http.get(&url)).await?;
+        let resp = self.send_authed(true, || self.http.get(&url)).await?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = snippet(resp).await;
+            let body = snippet(resp, 200).await;
             return Err(AppError::Network(format!(
                 "rustorrent list returned {status}: {body}"
             )));
@@ -218,14 +238,18 @@ impl TorrentClient {
     }
 
     pub async fn detail(&self, hash: &str) -> Result<TorrentDetail> {
-        let url = format!("{}/api/torrents/{hash}", self.base_url);
-        let resp = self.send_authed(|| self.http.get(&url)).await?;
+        let url = format!(
+            "{}/api/torrents/{}",
+            self.base_url,
+            encode_path_segment(hash)
+        );
+        let resp = self.send_authed(true, || self.http.get(&url)).await?;
         if resp.status().as_u16() == 404 {
             return Err(AppError::Network(format!("unknown torrent {hash}")));
         }
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = snippet(resp).await;
+            let body = snippet(resp, 200).await;
             return Err(AppError::Network(format!(
                 "rustorrent detail returned {status}: {body}"
             )));
@@ -244,7 +268,9 @@ impl TorrentClient {
     ) -> Result<String> {
         let url = format!("{}/api/torrents", self.base_url);
         let resp = self
-            .send_authed(|| {
+            // A create the server may have accepted before a timeout must not
+            // be re-sent; 429/5xx are still retried inside the ladder.
+            .send_authed(false, || {
                 let form = reqwest::multipart::Form::new()
                     .text("save_path", save_path.to_owned())
                     .text("category", category.to_owned())
@@ -258,7 +284,7 @@ impl TorrentClient {
             .await?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = snippet(resp).await;
+            let body = snippet(resp, 200).await;
             return Err(AppError::Network(format!(
                 "rustorrent add returned {status}: {body}"
             )));
@@ -305,9 +331,13 @@ impl TorrentClient {
                 Self::check_ok(self.post_action_resp(hash, "recheck").await?, "recheck").await
             }
             ControlOp::Remove { delete_files } => {
-                let url = format!("{}/api/torrents/{hash}", self.base_url);
+                let url = format!(
+                    "{}/api/torrents/{}",
+                    self.base_url,
+                    encode_path_segment(hash)
+                );
                 let resp = self
-                    .send_authed(|| {
+                    .send_authed(true, || {
                         self.http
                             .delete(&url)
                             .query(&[("delete_files", delete_files.to_string())])
@@ -331,11 +361,18 @@ impl TorrentClient {
         }
         let url = format!("{}/api/rss/feeds", self.base_url);
         let resp = self
-            .send_authed(|| self.http.post(&url).json(config))
+            // Same create rule as torrent add: never re-send on timeout.
+            .send_authed(false, || self.http.post(&url).json(config))
             .await?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = snippet(resp).await;
+            let body = snippet(resp, 200).await;
+            // A re-subscribe is not an error: if the server says the label is
+            // already registered, report the desired label as success.
+            let lower = body.to_lowercase();
+            if lower.contains("already") || lower.contains("duplicate") || lower.contains("exists") {
+                return Ok(config.label.clone());
+            }
             return Err(AppError::Network(format!(
                 "rustorrent rss add returned {status}: {body}"
             )));
@@ -360,10 +397,10 @@ impl TorrentClient {
     /// for, if any (a feed the app did not create has `show_id: None`).
     pub async fn rss_list(&self, db: &Db) -> Result<Vec<RssFeedView>> {
         let url = format!("{}/api/rss/feeds", self.base_url);
-        let resp = self.send_authed(|| self.http.get(&url)).await?;
+        let resp = self.send_authed(true, || self.http.get(&url)).await?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = snippet(resp).await;
+            let body = snippet(resp, 200).await;
             return Err(AppError::Network(format!(
                 "rustorrent rss list returned {status}: {body}"
             )));
@@ -386,7 +423,7 @@ impl TorrentClient {
             self.base_url,
             encode_path_segment(label)
         );
-        let resp = self.send_authed(|| self.http.post(&url)).await?;
+        let resp = self.send_authed(true, || self.http.post(&url)).await?;
         Self::check_ok(resp, "rss toggle").await
     }
 
@@ -396,7 +433,7 @@ impl TorrentClient {
             self.base_url,
             encode_path_segment(label)
         );
-        let resp = self.send_authed(|| self.http.delete(&url)).await?;
+        let resp = self.send_authed(true, || self.http.delete(&url)).await?;
         Self::check_ok(resp, "rss remove").await
     }
 
@@ -404,10 +441,10 @@ impl TorrentClient {
     /// Failures are the caller's to tolerate: subscribe proceeds with no placement.
     pub async fn server_config(&self) -> Result<ServerConfig> {
         let url = format!("{}/api/config", self.base_url);
-        let resp = self.send_authed(|| self.http.get(&url)).await?;
+        let resp = self.send_authed(true, || self.http.get(&url)).await?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = snippet(resp).await;
+            let body = snippet(resp, 200).await;
             return Err(AppError::Network(format!(
                 "rustorrent config returned {status}: {body}"
             )));
@@ -424,7 +461,7 @@ impl TorrentClient {
     /// torrent (gone from the server, unreachable detail) resolves to
     /// `linked: None` and never fails the list.
     pub async fn attribute(&self, db: &Db, torrents: Vec<TorrentInfo>) -> Vec<LinkedTorrent> {
-        let mut index: Option<Vec<(i64, String)>> = None;
+        let mut index: Option<Vec<(i64, u32, u32, String)>> = None;
         // The NAS map is stored, so read it once here — never per torrent —
         // and translate every server save_path to local form before comparing.
         // A stored value that no longer parses is treated as no mapping: the
@@ -449,7 +486,20 @@ impl TorrentClient {
                     season: link.season,
                     number: link.number,
                 }),
-                _ => self.backfill(db, &info, &mut index, &map, roots.as_deref()).await,
+                Ok(None) => {
+                    self.backfill(db, &info, &mut index, &map, roots.as_deref())
+                        .await
+                }
+                Err(e) => {
+                    // A pin-read failure is not evidence the torrent is
+                    // unpinned; do not fall through to a backfill that could
+                    // mis-attribute (or duplicate) the pin.
+                    eprintln!(
+                        "torrent attribute: link lookup failed for {}: {e}",
+                        info.info_hash
+                    );
+                    None
+                }
             };
             out.push(LinkedTorrent { info, linked });
         }
@@ -457,16 +507,16 @@ impl TorrentClient {
     }
 
     /// Backfill one unpinned torrent: fetch its file list and test every
-    /// library episode path with `episode_in_torrent`. The `(show_id, path)`
-    /// index is built once, lazily, from the existing `Db` getters — the
-    /// same `episode_paths_for_show` accessor `default_save_path` uses, so
-    /// no second query fn. Any failure (no candidates, gone torrent,
-    /// unresolvable path) yields `None`.
+    /// library episode path with `episode_in_torrent`. The
+    /// `(show_id, season, number, path)` index is built once, lazily, so the
+    /// match already names the episode and no second `get_show` is needed.
+    /// Any failure (no candidates, gone torrent, unresolvable path) yields
+    /// `None`.
     async fn backfill(
         &self,
         db: &Db,
         info: &TorrentInfo,
-        index: &mut Option<Vec<(i64, String)>>,
+        index: &mut Option<Vec<(i64, u32, u32, String)>>,
         map: &[(String, String)],
         roots: Option<&[String]>,
     ) -> Option<LinkedTo> {
@@ -482,21 +532,54 @@ impl TorrentClient {
             return None;
         }
         if index.is_none() {
-            let mut built = Vec::new();
-            if let Ok(shows) = db.list_shows("", ShowSort::Title) {
-                for show in shows {
-                    if let Ok(paths) = db.episode_paths_for_show(show.id) {
-                        built.extend(paths.into_iter().map(|path| (show.id, path)));
+            let built = match db.list_shows("", ShowSort::Title) {
+                Ok(shows) => {
+                    let mut built = Vec::new();
+                    for show in shows {
+                        match db.get_show(show.id) {
+                            Ok(detail) => {
+                                for season in &detail.seasons {
+                                    for episode in &season.episodes {
+                                        built.push((
+                                            show.id,
+                                            season.number,
+                                            episode.number,
+                                            episode.path.clone(),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => eprintln!(
+                                "torrent attribute: show {} detail failed, skipped: {e}",
+                                show.id
+                            ),
+                        }
                     }
+                    built
                 }
-            }
+                Err(e) => {
+                    // Do not cache Some(empty) on a failed read: that would
+                    // make every later torrent skip backfill for this call.
+                    eprintln!("torrent attribute: list_shows failed, no backfill index: {e}");
+                    return None;
+                }
+            };
             *index = Some(built);
         }
         let candidates = index.as_ref().expect("index just built");
         if candidates.is_empty() {
             return None;
         }
-        let detail = self.detail(&info.info_hash).await.ok()?;
+        let detail = match self.detail(&info.info_hash).await {
+            Ok(detail) => detail,
+            Err(e) => {
+                eprintln!(
+                    "torrent attribute: detail failed for {}: {e}",
+                    info.info_hash
+                );
+                return None;
+            }
+        };
         // Server truth translated to local form before the join: without
         // this a NAS-backed server never backfills.
         let local_save = map_to_local(&detail.info.save_path, map);
@@ -505,42 +588,28 @@ impl TorrentClient {
         if save_path_excluded(&local_save, roots) {
             return None;
         }
-        let hit = candidates
+        let (show_id, season, number, _) = candidates
             .iter()
-            .find(|(_, path)| episode_in_torrent(&local_save, &detail.files, path))?;
-        // The path came from this show's episode list; resolve which
-        // season/episode it is so the badge can name it.
-        let show = db.get_show(hit.0).ok()?;
-        for season in &show.seasons {
-            for episode in &season.episodes {
-                if episode.path == hit.1 {
-                    return Some(LinkedTo {
-                        show_id: hit.0,
-                        season: season.number,
-                        number: episode.number,
-                    });
-                }
-            }
-        }
-        None
+            .find(|(_, _, _, path)| episode_in_torrent(&local_save, &detail.files, path))?;
+        Some(LinkedTo {
+            show_id: *show_id,
+            season: *season,
+            number: *number,
+        })
     }
 
     /// GET an external URL (a .torrent file) with the client's timeout/UA/backoff.
-    /// Same 4MB cap as the Nyaa search client: oversized bodies are rejected.
+    /// Same 4MB cap as the Nyaa search client, enforced while streaming.
     pub async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        let resp = self.send_with_backoff(|| self.http.get(url)).await?;
+        let resp = self.send_with_backoff(true, || self.http.get(url)).await?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = snippet(resp).await;
+            let body = snippet(resp, 200).await;
             return Err(AppError::Network(format!(
                 "fetch {url} returned {status}: {body}"
             )));
         }
-        let bytes = resp.bytes().await?;
-        if bytes.len() > 4_000_000 {
-            return Err(AppError::Network("torrent file too large".into()));
-        }
-        Ok(bytes.to_vec())
+        read_capped(resp, 4_000_000).await
     }
 }
 
@@ -721,21 +790,6 @@ fn save_path_excluded(local_save: &str, roots: Option<&[String]>) -> bool {
     }
 }
 
-/// Backoff before retry `attempt` (1-based): 200ms, then 800ms, plus
-/// a sub-100ms jitter so concurrent hunts do not march in step.
-fn retry_wait(attempt: u32) -> std::time::Duration {
-    let base = if attempt <= 1 { 200 } else { 800 };
-    let jitter = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.subsec_nanos() % 100) as u64)
-        .unwrap_or(0);
-    std::time::Duration::from_millis(base + jitter)
-}
-
-async fn snippet(resp: reqwest::Response) -> String {
-    resp.text().await.unwrap_or_default().chars().take(200).collect()
-}
-
 /// Percent-encode one URL path segment (feed labels read
 /// `animemgr:Sousou no Frieren`). Byte-wise, so non-ASCII UTF-8 encodes
 /// correctly; only RFC 3986 unreserved bytes pass through.
@@ -765,6 +819,15 @@ pub fn feed_label(parsed_title: &str) -> String {
     format!("animemgr:{parsed_title}")
 }
 
+/// Format one resolved address as a base URL. Brackets wrap an IPv6 literal
+/// so the port is unambiguous. Pure so `discover`'s formatting is unit-tested.
+pub fn base_urls(addr: &IpAddr, port: u16) -> Vec<String> {
+    vec![match addr {
+        IpAddr::V4(v4) => format!("http://{v4}:{port}"),
+        IpAddr::V6(v6) => format!("http://[{v6}]:{port}"),
+    }]
+}
+
 /// Browse for rustorrent servers over mDNS (`_rustorrent._tcp.local.`) and
 /// collect `http://ip:port` base URLs for `timeout_ms`. Any failure — no
 /// daemon, no network, no responders — yields an empty vec, never an Err,
@@ -790,11 +853,7 @@ pub fn discover(timeout_ms: u64) -> Vec<String> {
             Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
                 let port = info.get_port();
                 for addr in info.get_addresses() {
-                    let host = match addr.to_ip_addr() {
-                        std::net::IpAddr::V4(v4) => v4.to_string(),
-                        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
-                    };
-                    out.push(format!("http://{host}:{port}"));
+                    out.extend(base_urls(&addr.to_ip_addr(), port));
                 }
             }
             Ok(_) => {}
@@ -822,6 +881,60 @@ pub fn episode_in_torrent(
     })
 }
 
+/// End offset (exclusive) of the bencoded value starting at `i`, or None when
+/// the buffer is truncated or not bencode. Handles ints, strings, lists, dicts.
+fn bencode_value_end(b: &[u8], i: usize) -> Option<usize> {
+    match *b.get(i)? {
+        b'i' => b[i..].iter().position(|&c| c == b'e').map(|p| i + p + 1),
+        b'l' | b'd' => {
+            let mut j = i + 1;
+            loop {
+                match *b.get(j)? {
+                    b'e' => return Some(j + 1),
+                    _ => j = bencode_value_end(b, j)?,
+                }
+            }
+        }
+        b'0'..=b'9' => {
+            let colon = b[i..].iter().position(|&c| c == b':')? + i;
+            let len: usize = std::str::from_utf8(&b[i..colon]).ok()?.parse().ok()?;
+            Some(colon + 1 + len)
+        }
+        _ => None,
+    }
+}
+
+/// SHA-1 of a torrent's `info` dictionary, hex-encoded — the torrent's
+/// info-hash. Used to dedup an add whose Nyaa hit carried no `<nyaa:infoHash>`
+/// (or a URL that did not come from Nyaa). None when the bytes are not a
+/// bencoded dict with a string-keyed `info` value.
+pub fn info_hash_of_torrent(bytes: &[u8]) -> Option<String> {
+    if bytes.first() != Some(&b'd') {
+        return None;
+    }
+    let mut j = 1;
+    loop {
+        match *bytes.get(j)? {
+            b'e' => return None, // dict ended without an `info` key
+            b'0'..=b'9' => {
+                let colon = bytes[j..].iter().position(|&c| c == b':')? + j;
+                let klen: usize = std::str::from_utf8(&bytes[j..colon]).ok()?.parse().ok()?;
+                let key_start = colon + 1;
+                let key_end = key_start + klen;
+                let val_end = bencode_value_end(bytes, key_end)?;
+                if &bytes[key_start..key_end] == b"info" {
+                    use sha1::{Digest, Sha1};
+                    let mut h = Sha1::new();
+                    h.update(&bytes[key_end..val_end]);
+                    return Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect());
+                }
+                j = val_end;
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// Where a new download for `show_id` should land: the first root (in
 /// `list_roots` order) that already holds one of the show's episodes, else
 /// the first readable root. A never-scanned root counts as readable — there
@@ -830,13 +943,13 @@ pub fn episode_in_torrent(
 pub fn default_save_path(db: &Db, show_id: i64) -> Result<String> {
     let roots = db.list_roots()?;
     let owned = db.episode_paths_for_show(show_id)?;
-    if let Some(root) = roots.iter().find(|r| {
-        let prefix = format!("{}/", r.path.trim_end_matches('/'));
-        owned.iter().any(|p| p.starts_with(&prefix))
-    }) {
-        let trimmed = root.path.trim_end_matches('/');
-        let trimmed = if trimmed.is_empty() { "/" } else { trimmed };
-        return Ok(trimmed.to_string());
+    // Same root rule as the rest of the backend: `/` matches every absolute
+    // path, a blank root matches nothing, and `root` does not match `root2`.
+    if let Some(root) = roots
+        .iter()
+        .find(|r| owned.iter().any(|p| path_under_roots(p, std::slice::from_ref(&r.path))))
+    {
+        return Ok(normalize_prefix(root.path.trim()).to_string());
     }
     roots
         .iter()
@@ -862,10 +975,17 @@ pub fn build_search_regex(
     if let Some(g) = group.filter(|g| !g.is_empty()) {
         re.push_str(&format!("\\[{}\\].*", regex::escape(g)));
     }
-    let words: Vec<String> = title
+    let mut words: Vec<String> = title
         .split_whitespace()
         .map(regex::escape)
         .collect();
+    // A very long title must not explode into an unbounded `.*` chain:
+    // keep the first and last six words, dropping the ambiguous middle.
+    if words.len() > 12 {
+        let mut capped = words[..6].to_vec();
+        capped.extend_from_slice(&words[words.len() - 6..]);
+        words = capped;
+    }
     re.push_str(&words.join(".*"));
     if let Some(r) = resolution.filter(|r| !r.is_empty()) {
         re.push_str(".*");
@@ -1097,11 +1217,12 @@ mod tests {
     fn from_db_needs_a_base_url() {
         let db = Db::open_memory().unwrap();
         assert!(TorrentClient::from_db(&db).is_err(), "empty url is not configured");
-        assert!(!TorrentClient::new(String::new(), None).configured());
         db.set_setting(BASE_URL_KEY, "http://box:8080/").unwrap();
         db.set_setting(PASSWORD_KEY, "pw").unwrap();
-        let c = TorrentClient::from_db(&db).unwrap();
-        assert!(c.configured());
+        assert!(
+            TorrentClient::from_db(&db).is_ok(),
+            "a non-empty url is configured"
+        );
         db.set_setting(BASE_URL_KEY, "   ").unwrap();
         assert!(TorrentClient::from_db(&db).is_err(), "blank url is not configured");
     }
@@ -1125,7 +1246,7 @@ mod tests {
 
     #[test]
     fn helpers() {
-        let files = vec![TorrentFile { index: 0, path: "Frieren/[Group] Frieren - 06 [1080p].mkv".into(), size: 1 }];
+        let files = vec![TorrentFile { path: "Frieren/[Group] Frieren - 06 [1080p].mkv".into(), size: 1 }];
         assert!(episode_in_torrent("/dl", &files, "/dl/Frieren/[Group] Frieren - 06 [1080p].mkv"));
         assert!(!episode_in_torrent("/dl", &files, "/dl/Other/07.mkv"));
         let re = build_search_regex("Sousou no Frieren", Some("Gumamish"), Some("1080p")).unwrap();
@@ -1650,5 +1771,313 @@ mod tests {
             !bodies.iter().any(|b| b.contains("/mnt/nas")),
             "local save_path leaked to the server"
         );
+    }
+
+    #[tokio::test]
+    async fn retry_engine_retries_429_then_succeeds() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        Mock::given(method("GET"))
+            .and(path("/api/torrents"))
+            .respond_with(move |_: &wiremock::Request| {
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    ResponseTemplate::new(429).insert_header("retry-after", "0")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!([]))
+                }
+            })
+            .expect(3)
+            .mount(&s)
+            .await;
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        assert!(c.list().await.unwrap().is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "two retries then success");
+    }
+
+    #[tokio::test]
+    async fn retry_engine_gives_up_after_three_server_errors() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/api/torrents"))
+            .respond_with(ResponseTemplate::new(500).insert_header("retry-after", "0"))
+            .expect(3)
+            .mount(&s)
+            .await;
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        assert!(matches!(c.list().await.unwrap_err(), AppError::Network(_)));
+    }
+
+    #[tokio::test]
+    async fn retry_engine_does_not_retry_400() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/api/torrents"))
+            .respond_with(ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        assert!(c.list().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn second_unauthorized_relogin_gives_up() {
+        let s = MockServer::start().await;
+        let logins = Arc::new(AtomicUsize::new(0));
+        let seen = logins.clone();
+        Mock::given(method("POST"))
+            .and(path("/api/login"))
+            .respond_with(move |_: &wiremock::Request| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .insert_header("set-cookie", "rustorrent_token=jwt; Path=/; HttpOnly")
+                    .set_body_json(serde_json::json!({"ok": true}))
+            })
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/torrents"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&s)
+            .await;
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        let err = c.list().await.unwrap_err();
+        assert!(err.to_string().contains("unauthorized"), "{err}");
+        assert_eq!(logins.load(Ordering::SeqCst), 2, "login, then one refresh");
+    }
+
+    #[tokio::test]
+    async fn stats_failure_names_stats_and_status() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/api/stats"))
+            .respond_with(ResponseTemplate::new(500).insert_header("retry-after", "0"))
+            .mount(&s)
+            .await;
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        let msg = c.test().await.unwrap_err().to_string();
+        assert!(msg.contains("stats"), "{msg}");
+        assert!(msg.contains("500"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn login_generic_failure_names_status_without_body() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/login"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .insert_header("retry-after", "0")
+                    .set_body_string("secret-inner-token"),
+            )
+            .mount(&s)
+            .await;
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        let msg = c.list().await.unwrap_err().to_string();
+        assert!(msg.contains("login returned 500"), "{msg}");
+        assert!(!msg.contains("secret-inner-token"), "login body leaked: {msg}");
+    }
+
+    #[tokio::test]
+    async fn rss_add_non_duplicate_rejection_errors() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/api/rss/feeds"))
+            .respond_with(ResponseTemplate::new(409).set_body_string("nope"))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        let err = c.rss_add(&rss_config("animemgr:Frieren")).await.unwrap_err();
+        assert!(err.to_string().contains("rss add"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rss_add_duplicate_label_is_success() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/api/rss/feeds"))
+            .respond_with(ResponseTemplate::new(409).set_body_string("feed already exists"))
+            .mount(&s)
+            .await;
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        assert_eq!(
+            c.rss_add(&rss_config("animemgr:Frieren")).await.unwrap(),
+            "animemgr:Frieren"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_endpoints_report_non_success_status() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        for p in [
+            "/api/torrents/bad",
+            "/api/torrents",
+            "/api/rss/feeds",
+            "/api/config",
+            "/missing.torrent",
+        ] {
+            Mock::given(method("GET"))
+                .and(path(p))
+                .respond_with(ResponseTemplate::new(500).insert_header("retry-after", "0"))
+                .mount(&s)
+                .await;
+        }
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        assert!(c.detail("bad").await.unwrap_err().to_string().contains("detail"));
+        assert!(c.list().await.unwrap_err().to_string().contains("list"));
+        assert!(
+            c.rss_list(&Db::open_memory().unwrap())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("rss list")
+        );
+        assert!(c.server_config().await.unwrap_err().to_string().contains("config"));
+        assert!(
+            c.fetch_bytes(&format!("{}/missing.torrent", s.uri()))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("fetch")
+        );
+    }
+
+    #[tokio::test]
+    async fn add_torrent_reports_missing_hash_and_status() {
+        let empty = MockServer::start().await;
+        login_mock("jwt123").mount(&empty).await;
+        Mock::given(method("POST"))
+            .and(path("/api/torrents"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&empty)
+            .await;
+        let c = TorrentClient::new(empty.uri(), Some("pw".into()));
+        let err = c
+            .add_torrent(b"x".to_vec(), "s.torrent", "/dl", "anime")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no info_hash"), "{err}");
+
+        let down = MockServer::start().await;
+        login_mock("jwt123").mount(&down).await;
+        Mock::given(method("POST"))
+            .and(path("/api/torrents"))
+            .respond_with(ResponseTemplate::new(500).insert_header("retry-after", "0"))
+            .mount(&down)
+            .await;
+        let c = TorrentClient::new(down.uri(), Some("pw".into()));
+        let err = c
+            .add_torrent(b"x".to_vec(), "s.torrent", "/dl", "anime")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("500"), "{err}");
+    }
+
+    #[test]
+    fn base_urls_formats_ipv4_and_ipv6() {
+        let v4: IpAddr = "1.2.3.4".parse().unwrap();
+        assert_eq!(base_urls(&v4, 8080), vec!["http://1.2.3.4:8080"]);
+        let v6: IpAddr = "::1".parse().unwrap();
+        assert_eq!(base_urls(&v6, 8080), vec!["http://[::1]:8080"]);
+        // discover collects then sorts and dedups, so repeated addresses collapse.
+        let mut urls: Vec<String> = ["1.2.3.4", "::1", "1.2.3.4"]
+            .iter()
+            .flat_map(|a| {
+                let ip: IpAddr = a.parse().unwrap();
+                base_urls(&ip, 8080)
+            })
+            .collect();
+        urls.sort();
+        urls.dedup();
+        assert_eq!(urls, vec!["http://1.2.3.4:8080", "http://[::1]:8080"]);
+    }
+
+    #[test]
+    fn control_op_remove_defaults_delete_files() {
+        let op: ControlOp = serde_json::from_value(serde_json::json!({"Remove": {}})).unwrap();
+        assert_eq!(op, ControlOp::Remove { delete_files: false });
+    }
+
+    #[test]
+    fn default_save_path_with_filesystem_root() {
+        let db = Db::open_memory().unwrap();
+        db.add_root("/").unwrap();
+        db.upsert_episode(&pn("Anywhere", 1), &rf("/anything/Anywhere/01.mkv", 20))
+            .unwrap();
+        assert_eq!(default_save_path(&db, show_id(&db, "Anywhere")).unwrap(), "/");
+    }
+
+    #[test]
+    fn build_search_regex_caps_very_long_titles() {
+        let title = (1..=20).map(|n| format!("w{n}")).collect::<Vec<_>>().join(" ");
+        let re = build_search_regex(&title, None, None).unwrap();
+        assert!(re.contains("w1") && re.contains("w20"), "keeps first/last: {re}");
+        assert!(!re.contains("w10"), "drops the middle: {re}");
+        regex::Regex::new(&re).unwrap();
+    }
+
+    #[test]
+    fn resolve_category_path_real_config_shape() {
+        let raw = serde_json::json!({
+            "default_save_path": "/downloads",
+            "web_port": 8080,
+            "theme": "Dark",
+            "categories": [
+                {"name": "anime", "save_subpath": "Anime"},
+                {"name": "movies", "save_subpath": "Movies", "default_save_path": "/media/movies"}
+            ],
+            "download_dir": "/tmp"
+        });
+        let cfg: ServerConfig = serde_json::from_value(raw).unwrap();
+        assert_eq!(resolve_category_path(&cfg, "anime"), "/downloads/Anime");
+        assert_eq!(resolve_category_path(&cfg, "movies"), "/media/movies");
+        assert_eq!(resolve_category_path(&cfg, "unknown"), "/downloads/unknown");
+    }
+
+    #[test]
+    fn info_hash_of_torrent_hashes_the_info_dict() {
+        // d 4:info d4:name3:foo e e  — the info dict is `d4:name3:fooe`.
+        let torrent = b"d4:infod4:name3:fooee";
+        use sha1::{Digest, Sha1};
+        let mut h = Sha1::new();
+        h.update(b"d4:name3:fooe");
+        let expected: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(info_hash_of_torrent(torrent).as_deref(), Some(expected.as_str()));
+        // Info not first: extra key before it must be skipped.
+        let torrent2 = b"d8:announce3:abc4:infod4:name3:fooee";
+        assert!(info_hash_of_torrent(torrent2).is_some());
+    }
+
+    #[test]
+    fn info_hash_of_torrent_rejects_non_torrents() {
+        assert!(info_hash_of_torrent(b"").is_none());
+        assert!(info_hash_of_torrent(b"not bencode").is_none());
+        assert!(info_hash_of_torrent(b"d4:name3:fooe").is_none()); // no info key
+        assert!(info_hash_of_torrent(b"d4:infod4:name3:foo").is_none()); // truncated
+    }
+
+    #[tokio::test]
+    async fn cleartext_password_is_refused_without_acknowledgement() {
+        let refused =
+            TorrentClient::with_cleartext("http://127.0.0.1:1".into(), Some("pw".into()), false);
+        let err = refused.list().await.unwrap_err();
+        assert!(err.to_string().contains("unencrypted"), "got: {err}");
+
+        // With the acknowledgement, the gate is skipped and the failure is the
+        // (unreachable) network, not the credential policy.
+        let allowed =
+            TorrentClient::with_cleartext("http://127.0.0.1:1".into(), Some("pw".into()), true);
+        let err2 = allowed.list().await.unwrap_err();
+        assert!(!err2.to_string().contains("unencrypted"), "got: {err2}");
     }
 }

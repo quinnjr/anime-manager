@@ -111,6 +111,7 @@ export type SettingsMap = Record<string, string> & {
   torrent_password?: string;
   torrent_test_ok?: string;
   torrent_path_map?: string;
+  torrent_allow_cleartext?: string;
 };
 
 export const api = {
@@ -148,7 +149,7 @@ export const api = {
   torrentDiscover: () => invoke<string[]>('torrent_discover'),
   torrentTest: () => invoke<string>('torrent_test'),
   torrentList: () => invoke<TorrentEntry[]>('torrent_list'),
-  torrentAdd: (args: TorrentAddArgs) => invoke<string>('torrent_add', { ...args }),
+  torrentAdd: (args: TorrentAddArgs) => invoke<string>('torrent_add', { args }),
   torrentControl: (infoHash: string, op: TorrentControlOp) => invoke<void>('torrent_control', { infoHash, op }),
   torrentPrefsGet: (showId: number) => invoke<TorrentPrefs>('torrent_prefs_get', { showId }),
   torrentPrefsSet: (showId: number, savePath: string | null, category: string | null) =>

@@ -49,12 +49,30 @@ export function sendButtonState(h: SendCandidate): SendButtonState {
 /** True when `savePath` sits under one of `roots` — exact match or `root/`
  *  prefix after trimming trailing slashes. Mirrors the backend rule
  *  (`commands::path_inside_roots`): a save path equal to a root is inside
- *  and must not warn. */
+ *  and must not warn. Blank roots are ignored, and a `/` root owns every
+ *  absolute path. */
 export function isSavePathInsideRoots(savePath: string | null | undefined, roots: string[]): boolean {
   if (!savePath) return true;
-  return roots.some((r) => {
-    let root = r.replace(/\/+$/, '');
-    if (!root) root = '/';
-    return savePath === root || savePath.startsWith(root + '/');
-  });
+  return roots
+    .filter((r) => r.trim() !== '')
+    .some((r) => {
+      const root = r.trim().replace(/\/+$/, '') || '/';
+      if (root === '/') return savePath.startsWith('/');
+      return savePath === root || savePath.startsWith(root + '/');
+    });
+}
+
+/** Transfer rate as a row label: `—` when idle, one decimal above a MiB/s. */
+export function formatSpeed(bytesPerSec: number): string {
+  if (bytesPerSec <= 0) return '—';
+  if (bytesPerSec >= 1_048_576) return `${(bytesPerSec / 1_048_576).toFixed(1)} MB/s`;
+  return `${Math.max(1, Math.round(bytesPerSec / 1024))} KB/s`;
+}
+
+/** Countdown as `45s`, `1m 30s` or `1h 1m`; `—` for no estimate or a negative one. */
+export function formatEta(secs: number | null): string {
+  if (secs == null || secs < 0) return '—';
+  if (secs < 60) return `${Math.round(secs)}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ${Math.round(secs % 60)}s`;
+  return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
 }

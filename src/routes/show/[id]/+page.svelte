@@ -12,8 +12,10 @@
   import Cover from '$lib/components/Cover.svelte';
   import { flatten } from '$lib/episodes';
   import { formatSize, summariseWanted } from '$lib/nyaaDisplay';
-  import { isSavePathInsideRoots, sendButtonState, torrentBadge } from '$lib/torrentDisplay';
+  import { isSavePathInsideRoots, sendButtonState } from '$lib/torrentDisplay';
+  import { errMessage } from '$lib/errors';
   import SeasonList from '$lib/components/SeasonList.svelte';
+  import TorrentRow from '$lib/components/TorrentRow.svelte';
 
   const id = $derived(Number(page.params.id));
   let show = $state<ShowDetail | null>(null);
@@ -35,12 +37,12 @@
   let prefsSaving = $state(false);
   let sendingKey = $state<string | null>(null);
   let busyHash = $state<string | null>(null);
-  let removeArmed = $state<string | null>(null);
   let followBusy = $state(false);
   let followResult = $state<RssSubscribeResult | null>(null);
   let torrentsError = $state<string | null>(null);
   let feedsError = $state<string | null>(null);
   let rootPaths = $state<string[]>([]);
+  let rootsError = $state<string | null>(null);
 
   // The feed this show was subscribed under, if any — the subscribed state of Follow.
   const subscribedFeed = $derived(feeds.find((f) => f.show_id === id));
@@ -67,9 +69,6 @@
 
   // Background refresh: failures render in the missing-episodes section (Settings
   // link + retry) rather than failing silently; only user-initiated actions toast.
-  function errMessage(e: unknown): string {
-    return e && typeof e === 'object' && 'message' in e ? String((e as { message: unknown }).message) : String(e);
-  }
   function isDisarmed(msg: string): boolean {
     return msg.includes('not connected');
   }
@@ -83,10 +82,11 @@
   async function loadPrefs() {
     const forId = id;
     try {
-      prefs = await api.torrentPrefsGet(forId);
+      const next = await api.torrentPrefsGet(forId);
       if (forId !== id) return;
-      saveDraft = prefs.save_path ?? '';
-      catDraft = prefs.category ?? '';
+      prefs = next;
+      saveDraft = next.save_path ?? '';
+      catDraft = next.category ?? '';
     } catch (e) { if (forId === id) toasts.error(e); }
   }
 
@@ -120,7 +120,6 @@
     busyHash = t.info_hash;
     try {
       await api.torrentControl(t.info_hash, op);
-      removeArmed = null;
       await loadTorrentState();
     } catch (e) { toasts.error(e); } finally { if (busyHash === t.info_hash) busyHash = null; }
   }
@@ -171,7 +170,7 @@
       if (highlight >= len) highlight = Math.max(0, len - 1);
     } catch (e) {
       if (mine !== generation) return;
-      const msg = e && typeof e === 'object' && 'message' in e ? String((e as { message: unknown }).message) : String(e);
+      const msg = errMessage(e);
       if (msg.includes('no rows') || msg.includes('not found')) {
         toasts.push('info', 'That show was merged into another and no longer exists.');
         await goto('/');
@@ -273,7 +272,6 @@
     busyHash = null;
     followBusy = false;
     prefsSaving = false;
-    removeArmed = null;
     followResult = null;
     torrentsError = null;
     feedsError = null;
@@ -281,7 +279,11 @@
     load();
     loadPrefs();
     loadTorrentState();
-    api.listRoots().then((rs) => { rootPaths = rs.map((r) => r.path); }).catch(() => { rootPaths = []; });
+    // A failed roots read leaves the inside check unknown, so warn rather than
+    // let an empty list silently claim the save path scans back in.
+    api.listRoots()
+      .then((rs) => { rootPaths = rs.map((r) => r.path); rootsError = null; })
+      .catch((e) => { rootPaths = []; rootsError = errMessage(e); toasts.error(e); });
   });
 
   onMount(() => {
@@ -374,6 +376,8 @@
         </form>
         {#if outsideRoots}
           <p class="tag text-[var(--color-alarm)]">Save path is outside your library roots — completed files will not scan in until moved.</p>
+        {:else if rootsError && prefs?.save_path}
+          <p class="tag text-[var(--color-alarm)]">Could not read library roots — cannot verify this save path scans back in.</p>
         {/if}
         {#if torrentsError || feedsError}
           {@const listMsg = torrentsError ?? feedsError ?? ''}
@@ -434,23 +438,9 @@
                     {sendingKey === key ? 'Sending…' : 'Send to rustorrent'}
                   </button>
                 {:else if t && (st === 'downloading' || st === 'seeding')}
-                  <span class="tag shrink-0">{torrentBadge(t)}</span>
-                  {#if removeArmed === t.info_hash}
-                    <span class="tag shrink-0 font-mono text-xs">{t.save_path}</span>
-                    <button class="btn shrink-0" disabled={busyHash === t.info_hash}
-                      onclick={() => void control(t, { Remove: { delete_files: false } })}>Remove, keep files</button>
-                    <button class="btn shrink-0" disabled={busyHash === t.info_hash}
-                      title="Also deletes the downloaded files"
-                      onclick={() => void control(t, { Remove: { delete_files: true } })}>Delete files too</button>
-                    <button class="btn shrink-0" onclick={() => (removeArmed = null)}>Cancel</button>
-                  {:else}
-                    <button class="btn shrink-0" disabled={busyHash === t.info_hash}
-                      onclick={() => void control(t, 'Start')}>Start</button>
-                    <button class="btn shrink-0" disabled={busyHash === t.info_hash}
-                      onclick={() => void control(t, 'Pause')}>Pause</button>
-                    <button class="btn shrink-0" disabled={busyHash === t.info_hash}
-                      onclick={() => (removeArmed = t.info_hash)}>Remove</button>
-                  {/if}
+                  <div class="w-full">
+                    <TorrentRow entry={t} busy={busyHash === t.info_hash} onControl={(op) => void control(t, op)} />
+                  </div>
                 {/if}
               {:else}
                 <span class="tag">no strict match</span>

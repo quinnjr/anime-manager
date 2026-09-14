@@ -8,6 +8,7 @@ use regex::Regex;
 
 use crate::db::Db;
 use crate::error::{AppError, Result};
+use crate::http::{read_capped, send_with_retry, snippet};
 use crate::models::{EpisodeStatus, ShowDetail};
 use serde::{Deserialize, Serialize};
 
@@ -237,62 +238,25 @@ impl Nyaa {
     /// 30s). Anything else fails fast naming the query, status and a
     /// body snippet; transport errors propagate as-is.
     async fn search(&self, query: &str) -> Result<Vec<NyaaHit>> {
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            let sent = self
-                .client
-                .get(format!("{}/", self.base_url))
+        let url = format!("{}/", self.base_url);
+        let resp = send_with_retry(3, true, || {
+            self.client
+                .get(&url)
                 .query(&[("page", "rss"), ("q", query), ("c", "1_2"), ("f", "0")])
                 .send()
-                .await;
-            let resp = match sent {
-                Ok(resp) => resp,
-                Err(e) if e.is_timeout() && attempt < 3 => {
-                    tokio::time::sleep(retry_wait(attempt)).await;
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            };
-            let status = resp.status();
-            if status.is_success() {
-                let bytes = resp.bytes().await?;
-                if bytes.len() > 4_000_000 {
-                    return Err(AppError::Network("nyaa response too large".into()));
-                }
-                let body =
-                    std::str::from_utf8(&bytes).map_err(|e| AppError::Parse(e.to_string()))?;
-                return parse_rss(body);
-            }
-            let retryable = status.as_u16() == 429 || status.is_server_error();
-            if retryable && attempt < 3 {
-                let asked = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|h| h.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .map(|s| std::time::Duration::from_secs(s.min(30)));
-                tokio::time::sleep(asked.unwrap_or_else(|| retry_wait(attempt))).await;
-                continue;
-            }
-            let body = resp.text().await.unwrap_or_default();
-            let snippet: String = body.chars().take(200).collect();
-            return Err(AppError::Network(format!(
-                "nyaa search {query:?} returned {status}: {snippet}"
-            )));
+        })
+        .await?;
+        if resp.status().is_success() {
+            let bytes = read_capped(resp, 4_000_000).await?;
+            let body = std::str::from_utf8(&bytes).map_err(|e| AppError::Parse(e.to_string()))?;
+            return parse_rss(body);
         }
+        let status = resp.status();
+        let snippet = snippet(resp, 200).await;
+        Err(AppError::Network(format!(
+            "nyaa search {query:?} returned {status}: {snippet}"
+        )))
     }
-}
-
-/// Backoff before Nyaa retry `attempt` (1-based): 200ms, then 800ms, plus
-/// a sub-100ms jitter so concurrent hunts do not march in step.
-fn retry_wait(attempt: u32) -> std::time::Duration {
-    let base = if attempt <= 1 { 200 } else { 800 };
-    let jitter = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.subsec_nanos() % 100) as u64)
-        .unwrap_or(0);
-    std::time::Duration::from_millis(base + jitter)
 }
 
 /// RSS envelope: `<rss><channel><item>…`. Every field defaults so one
@@ -1261,5 +1225,36 @@ mod tests {
         assert_eq!(wanted.len(), 1, "gap only, no continuation past max");
         assert_eq!((wanted[0].season, wanted[0].number), (1, 3));
         assert_eq!(wanted[0].hits.len(), 1);
+    }
+
+    #[test]
+    fn subscribe_derivation_unknown_show_errors() {
+        let db = Db::open_memory().unwrap();
+        assert!(subscribe_derivation(&db, 9999).is_err());
+    }
+
+    #[test]
+    fn subscribe_derivation_carries_group_and_resolution() {
+        let db = Db::open_memory().unwrap();
+        for (e, p) in [(1u32, "/lib/G/01.mkv"), (2, "/lib/G/02.mkv")] {
+            db.upsert_episode(&pn("Grouped", 1, e, Some("G"), Some("1080p")), &rf(p))
+                .unwrap();
+        }
+        let show_id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+        let d = subscribe_derivation(&db, show_id).unwrap();
+        assert_eq!(d.group.as_deref(), Some("g"), "modal group lowercased");
+        assert_eq!(d.resolution.as_deref(), Some("1080p"));
+    }
+
+    #[test]
+    fn parse_rss_without_link_or_info_hash_yields_none() {
+        let rss = rss_wrap(
+            "<item><title>[G] Show - 01 [1080p]</title><guid>https://nyaa.si/view/1</guid><nyaa:size>1.4 GiB</nyaa:size></item>",
+        );
+        let hits = parse_rss(&rss).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].page_url, "https://nyaa.si/view/1");
+        assert!(hits[0].torrent_url.is_none(), "no <link> means no torrent URL");
+        assert!(hits[0].info_hash.is_none(), "no nyaa:infoHash means None");
     }
 }

@@ -39,7 +39,7 @@ describe('torrent api', () => {
     invokeMock.mockResolvedValueOnce('abc123');
     await api.torrentAdd({ torrentUrl: 'http://x/y.torrent', infoHash: null, showId: 3, season: 1, number: 6, savePath: null, category: null });
     expect(invokeMock).toHaveBeenCalledWith('torrent_add', {
-      torrentUrl: 'http://x/y.torrent', infoHash: null, showId: 3, season: 1, number: 6, savePath: null, category: null
+      args: { torrentUrl: 'http://x/y.torrent', infoHash: null, showId: 3, season: 1, number: 6, savePath: null, category: null }
     });
   });
 

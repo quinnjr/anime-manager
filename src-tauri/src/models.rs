@@ -318,13 +318,9 @@ pub struct TorrentLink {
 pub struct TorrentPrefs {
     pub show_id: i64, pub save_path: Option<String>, pub category: Option<String>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RssFeedLink {
-    pub label: String, pub show_id: i64, pub added_at: i64,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct TorrentFile { pub index: usize, #[serde(default)] pub path: String, #[serde(default)] pub size: u64 }
+pub struct TorrentFile { #[serde(default)] pub path: String, #[serde(default)] pub size: u64 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TorrentInfo {
     pub info_hash: String, #[serde(default)] pub name: String,
@@ -356,4 +352,28 @@ pub struct RssFeedView {
     pub label: String, #[serde(default)] pub url: String, #[serde(default)] pub search: String,
     #[serde(default)] pub category: String, #[serde(default)] pub enabled: bool,
     #[serde(default)] pub show_id: Option<i64>,
+}
+/// What `torrent_rss_subscribe` reports: the deterministic label, the feed URL,
+/// and where the server will actually put files (`resolved_path`, server truth
+/// via `GET /api/config`) plus whether that sits outside the library roots.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RssSubscribeResult {
+    pub label: String,
+    pub url: String,
+    pub resolved_path: Option<String>,
+    pub outside_roots: bool,
+}
+/// Flat `torrent_add` payload from the Downloads view. Tauri keys the invoke
+/// under `args`; the inner fields arrive camelCase from the frontend, so serde
+/// maps them onto these snake_case members.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TorrentAddArgs {
+    pub torrent_url: Option<String>,
+    pub info_hash: Option<String>,
+    pub show_id: i64,
+    pub season: u32,
+    pub number: u32,
+    pub save_path: Option<String>,
+    pub category: Option<String>,
 }
