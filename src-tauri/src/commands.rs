@@ -4,8 +4,10 @@ use crate::error::Result;
 use crate::llm::{self, AssistQueue, Llm};
 use crate::metadata::{self, Providers};
 use crate::models::*;
+use crate::nyaa::{self, Nyaa, WantedEpisode};
 use crate::player::{self, Player};
 use crate::rename;
+use crate::torrent;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
@@ -489,10 +491,15 @@ pub fn apply_settings_defaults(mut m: HashMap<String, String>) -> HashMap<String
     m
 }
 
+/// An armed flag as the settings page reads it.
+fn flag(v: bool) -> &'static str {
+    if v { "true" } else { "false" }
+}
+
 /// The armed flag as the settings page reads it: "true" only after a successful Test
 /// connection against the current config, "false" otherwise (including a fresh database).
 fn test_ok_flag(db: &Db) -> &'static str {
-    if Llm::test_ok(db) { "true" } else { "false" }
+    flag(Llm::test_ok(db))
 }
 
 #[tauri::command]
@@ -548,6 +555,42 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String
     // config says so instead of silently never assisting.
     m.insert(llm::TEST_OK_KEY.into(), test_ok_flag(&state.db).into());
     m.insert(
+        torrent::BASE_URL_KEY.into(),
+        state
+            .db
+            .get_setting(torrent::BASE_URL_KEY)?
+            .unwrap_or_default(),
+    );
+    m.insert(
+        torrent::PASSWORD_KEY.into(),
+        state
+            .db
+            .get_setting(torrent::PASSWORD_KEY)?
+            .unwrap_or_default(),
+    );
+    // NAS prefix pairs (`server_prefix=local_prefix,…`); "" is no mapping.
+    m.insert(
+        torrent::PATH_MAP_KEY.into(),
+        state
+            .db
+            .get_setting(torrent::PATH_MAP_KEY)?
+            .unwrap_or_default(),
+    );
+    // Read-only like its LLM counterpart: managed by Test connection.
+    m.insert(
+        torrent::TEST_OK_KEY.into(),
+        torrent_test_ok_flag(&state.db).into(),
+    );
+    // Opt-in acknowledgement for sending a password over plain http; default off.
+    m.insert(
+        torrent::ALLOW_CLEARTEXT_KEY.into(),
+        state
+            .db
+            .get_setting(torrent::ALLOW_CLEARTEXT_KEY)?
+            .filter(|v| v == "true")
+            .unwrap_or_else(|| "false".into()),
+    );
+    m.insert(
         SETTING_DLNA_NAME.into(),
         state
             .db
@@ -564,17 +607,63 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String
     Ok(apply_settings_defaults(m))
 }
 
-/// Read-compare-write for settings that invalidate the LLM connection test: the write
-/// always lands, but the worker is disarmed only when the value actually changed, so
-/// re-saving an identical key does not stand a working config down.
-pub fn maybe_invalidate_test(db: &Db, key: &str, value: &str) -> Result<()> {
-    if !Llm::invalidates_test(key) {
+/// Read-compare-write for settings that invalidate a connection test: the write always
+/// lands, but the armed flag is cleared only when the value actually changed, so re-saving
+/// an identical value does not stand a working config down. A key that does not invalidate
+/// the test is a no-op (the caller owns that write).
+fn maybe_invalidate(
+    db: &Db,
+    key: &str,
+    value: &str,
+    invalidates: fn(&str) -> bool,
+    mark: fn(&Db, bool) -> Result<()>,
+) -> Result<()> {
+    if !invalidates(key) {
         return Ok(());
     }
     let old = db.get_setting(key)?;
     db.set_setting(key, value)?;
     if old.as_deref() != Some(value) {
-        Llm::mark_tested(db, false)?;
+        mark(db, false)?;
+    }
+    Ok(())
+}
+
+/// LLM connection-test wrapper: a new key, endpoint or model disarms the assist worker.
+pub fn maybe_invalidate_test(db: &Db, key: &str, value: &str) -> Result<()> {
+    maybe_invalidate(db, key, value, Llm::invalidates_test, Llm::mark_tested)
+}
+
+/// The torrent armed flag as the settings page reads it: "true" only after a successful
+/// Test connection against the current config, "false" otherwise (including fresh).
+fn torrent_test_ok_flag(db: &Db) -> &'static str {
+    flag(torrent::test_ok(db))
+}
+
+/// Torrent connection-test wrapper: a new base URL or password un-proves the last
+/// successful test, so control/add/RSS paths refuse until it tests clean again.
+pub fn maybe_invalidate_torrent_test(db: &Db, key: &str, value: &str) -> Result<()> {
+    maybe_invalidate(
+        db,
+        key,
+        value,
+        torrent::invalidates_test,
+        torrent::mark_tested,
+    )
+}
+
+/// Rules a raw Settings write must satisfy before it lands. The armed flags are
+/// machine-managed, and a malformed path map is rejected loudly (leaving the stored
+/// value alone) rather than saved. A blank torrent base URL is allowed: blank means
+/// unconfigured, matching `TorrentClient::from_db`.
+fn validate_setting(_db: &Db, key: &str, value: &str) -> Result<()> {
+    if key == torrent::TEST_OK_KEY {
+        return Err(crate::error::AppError::Parse(
+            "torrent_test_ok is managed by Test connection".into(),
+        ));
+    }
+    if key == torrent::PATH_MAP_KEY {
+        torrent::parse_path_map(value)?;
     }
     Ok(())
 }
@@ -586,6 +675,7 @@ pub fn set_setting(state: State<'_, AppState>, key: String, value: String) -> Re
             "llm_test_ok is managed by Test connection".into(),
         ));
     }
+    validate_setting(&state.db, &key, &value)?;
     // DLNA keys bypass `dlna_set_options`, so validate here too. No restart:
     // the running server keeps its port until the next enable or option save.
     if key == SETTING_DLNA_NAME && value.trim().is_empty() {
@@ -605,6 +695,10 @@ pub fn set_setting(state: State<'_, AppState>, key: String, value: String) -> Re
     // background worker stands down until it tests clean again.
     if Llm::invalidates_test(&key) {
         return maybe_invalidate_test(&state.db, &key, &value);
+    }
+    // Same for the torrent connection: control/add/RSS paths refuse while disarmed.
+    if torrent::invalidates_test(&key) {
+        return maybe_invalidate_torrent_test(&state.db, &key, &value);
     }
     state.db.set_setting(&key, &value)
 }
@@ -737,6 +831,16 @@ pub async fn inspect_show(
         let _ = app.emit("show-updated", id);
     }
     Ok(report)
+}
+
+/// Missing episodes for a show and their strict Nyaa matches, best seeders first.
+/// Pure query: writes nothing, emits nothing.
+#[tauri::command]
+pub async fn find_missing(
+    state: State<'_, AppState>,
+    show_id: i64,
+) -> Result<Vec<WantedEpisode>> {
+    nyaa::find_missing(&state.db, &Nyaa::with_endpoint(nyaa::NYAA_BASE.into())?, show_id).await
 }
 
 /// Model ids offered by whatever provider is configured right now.
@@ -882,6 +986,53 @@ mod tests {
         maybe_invalidate_test(&db, "llm_delay_ms", "700").unwrap();
         assert!(Llm::test_ok(&db), "non-identity key untouched");
         assert_eq!(db.get_setting("llm_delay_ms").unwrap(), None);
+    }
+
+    #[test]
+    fn torrent_test_disarms_on_url_change() {
+        let db = Db::open_memory().unwrap();
+        db.set_setting(torrent::BASE_URL_KEY, "http://x").unwrap();
+        db.set_setting(torrent::PASSWORD_KEY, "pw1").unwrap();
+        torrent::mark_tested(&db, true).unwrap();
+        // A changed password disarms too.
+        maybe_invalidate_torrent_test(&db, torrent::PASSWORD_KEY, "pw2").unwrap();
+        assert!(!torrent::test_ok(&db), "changed password disarms");
+        // Re-saving the identical value keeps it armed AND still writes.
+        torrent::mark_tested(&db, true).unwrap();
+        maybe_invalidate_torrent_test(&db, torrent::PASSWORD_KEY, "pw2").unwrap();
+        assert!(torrent::test_ok(&db), "same value stays armed");
+        assert_eq!(
+            db.get_setting(torrent::PASSWORD_KEY).unwrap().as_deref(),
+            Some("pw2")
+        );
+        // A changed base URL disarms AND writes.
+        maybe_invalidate_torrent_test(&db, torrent::BASE_URL_KEY, "http://y").unwrap();
+        assert!(!torrent::test_ok(&db), "changed base URL disarms");
+        assert_eq!(
+            db.get_setting(torrent::BASE_URL_KEY).unwrap().as_deref(),
+            Some("http://y")
+        );
+        // A non-identity key is a no-op: the flag stays armed and nothing is written.
+        torrent::mark_tested(&db, true).unwrap();
+        maybe_invalidate_torrent_test(&db, torrent::PATH_MAP_KEY, "/a=/b").unwrap();
+        assert!(torrent::test_ok(&db), "non-identity key untouched");
+        assert_eq!(db.get_setting(torrent::PATH_MAP_KEY).unwrap(), None);
+    }
+
+    #[test]
+    fn validate_setting_rejects_managed_flags_and_bad_maps() {
+        let db = Db::open_memory().unwrap();
+        db.set_setting(torrent::PATH_MAP_KEY, "/downloads=/mnt/nas/Downloads")
+            .unwrap();
+        assert!(validate_setting(&db, torrent::TEST_OK_KEY, "true").is_err());
+        assert!(validate_setting(&db, torrent::PATH_MAP_KEY, "bad").is_err());
+        assert_eq!(
+            db.get_setting(torrent::PATH_MAP_KEY).unwrap().as_deref(),
+            Some("/downloads=/mnt/nas/Downloads"),
+            "a bad map is rejected before it lands, so the stored value survives"
+        );
+        // Blank base URL is allowed: blank means unconfigured.
+        assert!(validate_setting(&db, torrent::BASE_URL_KEY, "").is_ok());
     }
 
     #[test]

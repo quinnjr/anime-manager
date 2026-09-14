@@ -57,6 +57,8 @@ export interface MatchProgress { done: number; total: number; title: string; pha
 export interface AssistProgress { done: number; total: number; folder: string; running: boolean }
 export interface InspectReport { folders: number; ignored: number; changes: InspectChange[]; notes: string[]; show_id: number | null }
 export interface ScanProgress { done: number; total: number; current_path: string }
+export interface WantedHit { title: string; page_url: string; size_bytes: number; seeders: number; torrent_url: string | null; info_hash: string | null }
+export interface WantedEpisode { season: number; number: number; hits: WantedHit[] }
 export interface DlnaStatus { running: boolean; port: number; clients_seen: number; dlna_warning?: string; }
 export interface PlaybackChanged { episode_id: number; status: EpisodeStatus; position_secs: number; duration_secs: number | null }
 export type MetadataSource = 'anilist' | 'kitsu';
@@ -70,6 +72,29 @@ export interface RenamePlan { entries: RenameEntry[] }
 export interface RenameResult { renamed: number; skipped: string[] }
 export type RenameTarget = { type: 'show'; id: number } | { type: 'episode'; id: number };
 
+/** One torrent as rustorrent reports it, plus the episode it is pinned to, if any. */
+export interface TorrentInfo {
+  info_hash: string; name: string; status: string; progress: number;
+  total_size: number; downloaded: number; download_speed: number; upload_speed: number;
+  peers: number; seeds: number; save_path: string; category: string | null;
+  ratio: number; eta: number | null; error_message: string | null;
+}
+export interface LinkedTo { show_id: number; season: number; number: number }
+export interface TorrentEntry extends TorrentInfo { linked: LinkedTo | null }
+export interface TorrentPrefs { show_id: number; save_path: string | null; category: string | null }
+export interface RssFeedView {
+  label: string; url: string; search: string; category: string; enabled: boolean; show_id: number | null;
+}
+export interface RssSubscribeResult { label: string; url: string; resolved_path: string | null; outside_roots: boolean }
+/** Mirrors the Rust ControlOp enum: unit variants serialise as bare strings, so
+ *  Remove keeps its snake_case payload field exactly as serde expects it. */
+export type TorrentControlOp = 'Start' | 'Pause' | 'Recheck' | { Remove: { delete_files: boolean } };
+export interface TorrentAddArgs {
+  torrentUrl?: string | null; infoHash?: string | null;
+  showId: number; season: number; number: number;
+  savePath?: string | null; category?: string | null;
+}
+
 /** Known settings keys on top of the free-form string map, so a typo fails loudly. */
 export type SettingsMap = Record<string, string> & {
   auto_scan_interval_mins?: string;
@@ -82,6 +107,11 @@ export type SettingsMap = Record<string, string> & {
   llm_assist_on_scan?: string;
   llm_delay_ms?: string;
   llm_test_ok?: string;
+  torrent_base_url?: string;
+  torrent_password?: string;
+  torrent_test_ok?: string;
+  torrent_path_map?: string;
+  torrent_allow_cleartext?: string;
 };
 
 export const api = {
@@ -103,6 +133,7 @@ export const api = {
   setSetting: (key: string, value: string) => invoke<void>('set_setting', { key, value }),
   purgeMissing: () => invoke<number>('purge_missing'),
   inspectShow: (showId: number) => invoke<InspectReport>('inspect_show', { showId }),
+  findMissing: (showId: number) => invoke<WantedEpisode[]>('find_missing', { showId }),
   llmTest: () => invoke<string>('llm_test'),
   llmModels: () => invoke<string[]>('llm_models'),
   llmModelsFor: (key: string, baseUrl: string) => invoke<string[]>('llm_models_for', { key, baseUrl }),
@@ -114,7 +145,19 @@ export const api = {
   setShowTitle: (showId: number, title: string | null) => invoke<ShowDetail>('set_show_title', { showId, title }),
   dlnaStatus: () => invoke<DlnaStatus>('dlna_status'),
   dlnaSetEnabled: (enabled: boolean) => invoke<void>('dlna_set_enabled', { enabled }),
-  dlnaSetOptions: (name: string, port: number) => invoke<void>('dlna_set_options', { name, port })
+  dlnaSetOptions: (name: string, port: number) => invoke<void>('dlna_set_options', { name, port }),
+  torrentDiscover: () => invoke<string[]>('torrent_discover'),
+  torrentTest: () => invoke<string>('torrent_test'),
+  torrentList: () => invoke<TorrentEntry[]>('torrent_list'),
+  torrentAdd: (args: TorrentAddArgs) => invoke<string>('torrent_add', { args }),
+  torrentControl: (infoHash: string, op: TorrentControlOp) => invoke<void>('torrent_control', { infoHash, op }),
+  torrentPrefsGet: (showId: number) => invoke<TorrentPrefs>('torrent_prefs_get', { showId }),
+  torrentPrefsSet: (showId: number, savePath: string | null, category: string | null) =>
+    invoke<TorrentPrefs>('torrent_prefs_set', { showId, savePath, category }),
+  torrentRssSubscribe: (showId: number) => invoke<RssSubscribeResult>('torrent_rss_subscribe', { showId }),
+  torrentRssList: () => invoke<RssFeedView[]>('torrent_rss_list'),
+  torrentRssToggle: (label: string, enabled: boolean) => invoke<void>('torrent_rss_toggle', { label, enabled }),
+  torrentRssRemove: (label: string) => invoke<void>('torrent_rss_remove', { label })
 };
 
 export function onEvent<T>(name: string, cb: (payload: T) => void): Promise<UnlistenFn> {

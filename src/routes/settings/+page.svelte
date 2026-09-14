@@ -32,6 +32,24 @@
   let llmTested = $state(false);
   let testing = $state(false);
 
+  let torrentBaseUrl = $state('');
+  let torrentPassword = $state('');
+  let torrentPathMap = $state('');
+  let torrentAllowCleartext = $state(false);
+  let torrentTested = $state(false);
+  let torrentTesting = $state(false);
+  let torrentDiscovering = $state(false);
+  let torrentClearing = $state(false);
+  let torrentCandidates = $state<string[]>([]);
+
+  // Warn only while credentials would actually travel unacknowledged:
+  // a password set over plain http and the opt-in not yet ticked.
+  const insecureTorrent = $derived(
+    torrentPassword.trim() !== '' &&
+      torrentBaseUrl.trim().toLowerCase().startsWith('http://') &&
+      !torrentAllowCleartext
+  );
+
   let dlnaRunning = $state(false);
   let dlnaPort = $state(0);
   let dlnaName = $state('');
@@ -68,6 +86,11 @@
       autoScanMins = s.auto_scan_interval_mins ?? String(DEFAULT_AUTO_SCAN_MINS);
       llmDelay = s.llm_delay_ms ?? '500';
       llmTested = isTestedFlag(s.llm_test_ok);
+      torrentBaseUrl = s.torrent_base_url ?? '';
+      torrentPassword = s.torrent_password ?? '';
+      torrentPathMap = s.torrent_path_map ?? '';
+      torrentAllowCleartext = s.torrent_allow_cleartext === 'true';
+      torrentTested = isTestedFlag(s.torrent_test_ok);
       provider = LLM_PROVIDERS.find((p) => p.baseUrl === llmBaseUrl)?.id ?? 'custom';
       dlnaName = s.dlna_name ?? '';
       dlnaPortField = s.dlna_port ?? '28987';
@@ -169,7 +192,16 @@
       await api.setSetting('llm_base_url', llmBaseUrl.trim());
       await api.setSetting('llm_assist_on_scan', llmOnScan ? 'true' : 'false');
       await api.setSetting('llm_delay_ms', String(Math.max(0, Number(llmDelay) || 0)));
+      // A blank field leaves the stored URL alone so an ordinary Save never
+      // disconnects a configured instance; Disconnect clears the pair explicitly.
+      const torrentUrl = torrentBaseUrl.trim();
+      if (torrentUrl) await api.setSetting('torrent_base_url', torrentUrl);
+      await api.setSetting('torrent_password', torrentPassword.trim());
+      // A bad pair fails loudly here and the stored mapping is left alone.
+      await api.setSetting('torrent_path_map', torrentPathMap.trim());
+      await api.setSetting('torrent_allow_cleartext', torrentAllowCleartext ? 'true' : 'false');
       await refreshTestFlag();
+      await refreshTorrentFlag();
       toasts.push('success', 'Settings saved');
       return true;
     } catch (e) { toasts.error(e); return false; }
@@ -190,6 +222,49 @@
       await refreshTestFlag();
     } catch (e) { toasts.error(e); await refreshTestFlag(); }
     finally { testing = false; }
+  }
+
+  async function refreshTorrentFlag() {
+    // Only the flag is re-read, never the fields, so unsaved edits above it survive.
+    try { torrentTested = isTestedFlag((await api.getSettings()).torrent_test_ok); }
+    catch (e) { toasts.error(e); }
+  }
+
+  async function testTorrent() {
+    torrentTesting = true;
+    try {
+      if (!(await saveAll())) { torrentTesting = false; return; }
+      toasts.push('success', await api.torrentTest());
+      await refreshTorrentFlag();
+    } catch (e) { toasts.error(e); await refreshTorrentFlag(); }
+    finally { torrentTesting = false; }
+  }
+
+  async function discoverTorrent() {
+    torrentDiscovering = true;
+    try {
+      torrentCandidates = await api.torrentDiscover();
+      if (torrentCandidates.length === 0) {
+        toasts.push('info', 'No rustorrent instances answered on the local network — type the URL by hand.');
+      } else {
+        if (!torrentBaseUrl.trim()) torrentBaseUrl = torrentCandidates[0];
+        toasts.push('success', `Found ${torrentCandidates.length} rustorrent instance${torrentCandidates.length === 1 ? '' : 's'}.`);
+      }
+    } catch (e) { toasts.error(e); }
+    finally { torrentDiscovering = false; }
+  }
+
+  async function disconnectTorrent() {
+    torrentClearing = true;
+    try {
+      await api.setSetting('torrent_base_url', '');
+      await api.setSetting('torrent_password', '');
+      torrentBaseUrl = '';
+      torrentPassword = '';
+      await refreshTorrentFlag();
+      toasts.push('success', 'Disconnected from rustorrent.');
+    } catch (e) { toasts.error(e); }
+    finally { torrentClearing = false; }
   }
 
   async function toggleDlna(next: boolean) {
@@ -429,6 +504,53 @@
       <button class="btn" disabled={testing || !llmKey.trim()} onclick={testLlm}>{testing ? 'Testing…' : 'Test connection'}</button>
       <span class="tag">{llmTested ? 'tested — background assist armed' : 'untested — background assist stands down until a test succeeds'}</span>
     </div>
+  </section>
+
+  <!-- Torrents (rustorrent) -->
+  <section class="mb-10">
+    <h2 class="eyebrow mb-3">Torrents</h2>
+    <p class="mb-3 max-w-prose text-sm text-muted">
+      Optional. Send missing episodes to a rustorrent instance on the local network.
+      Discover fills the picker below; the URL stays editable by hand either way.
+    </p>
+    <div class="grid gap-3 sm:grid-cols-2">
+      <label class="block text-sm">
+        <span class="text-muted">Instance</span>
+        <select class="field mt-1 w-full" value={torrentBaseUrl} onchange={(e) => (torrentBaseUrl = e.currentTarget.value)}>
+          {#if !torrentCandidates.includes(torrentBaseUrl)}
+            <option value={torrentBaseUrl}>{torrentBaseUrl ? torrentBaseUrl : 'Discover first, or type below'}</option>
+          {/if}
+          {#each torrentCandidates as c (c)}<option value={c}>{c}</option>{/each}
+        </select>
+      </label>
+      <label class="block text-sm">
+        <span class="text-muted">Password</span>
+        <input bind:value={torrentPassword} type="password" autocomplete="off" class="field mt-1 w-full" />
+        <span class="tag mt-1 block">Leave blank if the instance needs none.</span>
+      </label>
+      <label class="block text-sm sm:col-span-2">
+        <span class="text-muted">Base URL</span>
+        <input bind:value={torrentBaseUrl} class="field mt-1 w-full" placeholder="http://nas:8080/" />
+      </label>
+      <label class="block text-sm sm:col-span-2">
+        <span class="text-muted">Path mapping (NAS)</span>
+        <input bind:value={torrentPathMap} class="field mt-1 w-full" placeholder="/downloads=/mnt/nas/Downloads" />
+        <span class="tag mt-1 block">Comma-separated server=local pairs, e.g. /downloads=/mnt/nas/Downloads — the server sees NAS paths differently than this machine. A bad pair fails the save loudly and keeps the old value.</span>
+      </label>
+    </div>
+    <div class="mt-3 flex flex-wrap items-center gap-3">
+      <button class="btn" disabled={torrentDiscovering} onclick={discoverTorrent}>{torrentDiscovering ? 'Discovering…' : 'Discover'}</button>
+      <button class="btn" disabled={torrentTesting || !torrentBaseUrl.trim()} onclick={testTorrent}>{torrentTesting ? 'Testing…' : 'Test connection'}</button>
+      <button class="btn" disabled={torrentClearing} onclick={disconnectTorrent}>{torrentClearing ? 'Disconnecting…' : 'Disconnect'}</button>
+      <span class="tag">{torrentTested ? 'tested — torrent actions armed' : 'untested — torrent actions stand down until a test succeeds'}</span>
+    </div>
+    {#if insecureTorrent}
+      <p class="tag mt-3 text-[var(--color-alarm)]">Credentials are sent without TLS; anyone on this network can read them. Tick the box below to allow it, or use an https URL.</p>
+    {/if}
+    <label class="mt-3 flex items-center gap-2 text-sm">
+      <input bind:checked={torrentAllowCleartext} type="checkbox" />
+      <span>Allow unencrypted credentials over http (needed for a plain-LAN instance)</span>
+    </label>
   </section>
 
   <!-- Destructive-ish maintenance, kept last and apart -->

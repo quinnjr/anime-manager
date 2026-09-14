@@ -23,6 +23,12 @@ pub fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Torrent info hashes are case-insensitive hex, and callers may hand over either form:
+/// normalize once at the persistence boundary so a mixed-case write and lookup still meet.
+fn normalize_hash(info_hash: &str) -> String {
+    info_hash.trim().to_lowercase()
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS roots (
   id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, added_at INTEGER NOT NULL,
@@ -38,7 +44,11 @@ CREATE TABLE IF NOT EXISTS shows (
   cover_path TEXT,
   -- which provider supplied the match: 'anilist' or 'kitsu'. anilist_id holds that
   -- provider's id, so it is only an AniList id when match_source = 'anilist'.
-  match_source TEXT);
+  match_source TEXT,
+  -- last mpv volume and window state for this show, restored on the next play. player_volume
+  -- NULL means nothing has been recorded yet, so mpv's own defaults still apply.
+  player_volume REAL, window_width INTEGER, window_height INTEGER,
+  window_maximized INTEGER, window_fullscreen INTEGER);
 CREATE TABLE IF NOT EXISTS seasons (
   id INTEGER PRIMARY KEY, show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
   number INTEGER NOT NULL,
@@ -67,9 +77,25 @@ CREATE TABLE IF NOT EXISTS parse_overrides (
   source TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_episodes_season ON episodes(season_id);
 CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status);
+-- Torrent state (schema v7).
+CREATE TABLE IF NOT EXISTS torrent_links (
+  info_hash TEXT PRIMARY KEY,
+  show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
+  season INTEGER NOT NULL, number INTEGER NOT NULL,
+  added_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS torrent_prefs (
+  show_id INTEGER PRIMARY KEY REFERENCES shows(id) ON DELETE CASCADE,
+  save_path TEXT, category TEXT);
+CREATE TABLE IF NOT EXISTS rss_feeds (
+  label TEXT PRIMARY KEY, show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
+  added_at INTEGER NOT NULL);
 "#;
 
-const SCHEMA_VERSION: i64 = 6;
+// v7 belongs to the torrent migration already merged on develop (torrent_links, torrent_prefs,
+// rss_feeds, gated on `v < 7`). This migration must not reuse it: a v7 database would hit the
+// early return above, never add the player-state columns, and break playback with
+// "no such column: player_volume". This is the v7 -> v8 step on top of develop.
+const SCHEMA_VERSION: i64 = 8;
 
 /// Bring an existing database up to `SCHEMA_VERSION`. Fresh databases get the current shape
 /// from SCHEMA directly; older ones are altered in place so no user data is lost.
@@ -106,6 +132,17 @@ fn upgrade(conn: &Connection) -> Result<()> {
     if !has("shows", "cover_path")? {
         conn.execute_batch("ALTER TABLE shows ADD COLUMN cover_path TEXT;")?;
     }
+    for (col, ty) in [
+        ("player_volume", "REAL"),
+        ("window_width", "INTEGER"),
+        ("window_height", "INTEGER"),
+        ("window_maximized", "INTEGER"),
+        ("window_fullscreen", "INTEGER"),
+    ] {
+        if !has("shows", col)? {
+            conn.execute_batch(&format!("ALTER TABLE shows ADD COLUMN {col} {ty};"))?;
+        }
+    }
     if !has("seasons", "title")? {
         conn.execute_batch("ALTER TABLE seasons ADD COLUMN title TEXT;")?;
     }
@@ -121,6 +158,21 @@ fn upgrade(conn: &Connection) -> Result<()> {
         if !has("roots", col)? {
             conn.execute_batch(&format!("ALTER TABLE roots ADD COLUMN {col} INTEGER;"))?;
         }
+    }
+    if v < 7 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS torrent_links (
+               info_hash TEXT PRIMARY KEY,
+               show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
+               season INTEGER NOT NULL, number INTEGER NOT NULL,
+               added_at INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS torrent_prefs (
+               show_id INTEGER PRIMARY KEY REFERENCES shows(id) ON DELETE CASCADE,
+               save_path TEXT, category TEXT);
+             CREATE TABLE IF NOT EXISTS rss_feeds (
+               label TEXT PRIMARY KEY, show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
+               added_at INTEGER NOT NULL);",
+        )?;
     }
     // rename_log's foreign key cannot be altered in place; rebuild the table when it still
     // carries the old NOT NULL / ON DELETE CASCADE definition.
@@ -214,6 +266,8 @@ fn row_to_root(r: &rusqlite::Row) -> rusqlite::Result<Root> {
 }
 
 const DISPLAY_TITLE_SQL: &str = "COALESCE(user_title_override, canonical_title, parsed_title)";
+const SHOW_ID_QUERY: &str =
+    "SELECT se.show_id FROM episodes e JOIN seasons se ON e.season_id = se.id WHERE ";
 
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
@@ -531,8 +585,25 @@ impl Db {
     }
 
     pub fn show_id_for_path(&self, path: &str) -> Result<Option<i64>> {
-        self.with(|c| Ok(c.query_row(
-            "SELECT se.show_id FROM episodes e JOIN seasons se ON e.season_id = se.id WHERE e.path = ?1", params![path], |r| r.get(0)).optional()?))
+        self.with(|c| {
+            Ok(c.query_row(
+                &format!("{SHOW_ID_QUERY} e.path = ?1"),
+                params![path],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+    }
+
+    pub fn show_id_for_episode(&self, episode_id: i64) -> Result<Option<i64>> {
+        self.with(|c| {
+            Ok(c.query_row(
+                &format!("{SHOW_ID_QUERY} e.id = ?1"),
+                params![episode_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
     }
 
     /// (path, show parsed_title, season number, episode number) for files directly inside `folder`.
@@ -687,6 +758,58 @@ impl Db {
             c.execute("UPDATE episodes SET position_secs=?2, duration_secs=COALESCE(?3, duration_secs), last_played_at=?4 WHERE id=?1",
                 params![id, position_secs, duration_secs, now()])?;
             Ok(())
+        })
+    }
+
+    /// The show's last recorded mpv state, or None if it has never been played since this was
+    /// added. A NULL `player_volume` is the unrecorded marker, so an untouched show keeps mpv's
+    /// own defaults rather than being forced to some stored value.
+    pub fn show_player_state(&self, show_id: i64) -> Result<Option<ShowPlayerState>> {
+        self.with(|c| {
+            let row = c
+                .query_row(
+                    "SELECT player_volume, window_width, window_height, window_maximized, window_fullscreen
+                     FROM shows WHERE id = ?1",
+                    params![show_id],
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<f64>>(0)?,
+                            r.get::<_, Option<i64>>(1)?,
+                            r.get::<_, Option<i64>>(2)?,
+                            r.get::<_, Option<i64>>(3)?,
+                            r.get::<_, Option<i64>>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            Ok(match row {
+                Some((Some(volume), w, h, max, full)) => Some(ShowPlayerState {
+                    volume,
+                    window_width: w,
+                    window_height: h,
+                    window_maximized: max.unwrap_or(0) != 0,
+                    window_fullscreen: full.unwrap_or(0) != 0,
+                }),
+                _ => None,
+            })
+        })
+    }
+
+    pub fn set_show_player_state(&self, show_id: i64, s: &ShowPlayerState) -> Result<bool> {
+        self.with(|c| {
+            let updated = c.execute(
+                "UPDATE shows SET player_volume=?2, window_width=?3, window_height=?4,
+                 window_maximized=?5, window_fullscreen=?6 WHERE id=?1",
+                params![
+                    show_id,
+                    s.volume,
+                    s.window_width,
+                    s.window_height,
+                    s.window_maximized as i64,
+                    s.window_fullscreen as i64
+                ],
+            )?;
+            Ok(updated > 0)
         })
     }
 
@@ -873,6 +996,31 @@ impl Db {
                            total_episodes      = COALESCE(total_episodes,      (SELECT total_episodes      FROM shows WHERE id = ?2))
                          WHERE id = ?1",
                         params![keep, loser])?;
+                    // Torrent state is keyed by show_id with ON DELETE CASCADE, so without a
+                    // re-point the loser's links, prefs and feed labels vanish with its row.
+                    // Links move; a keeper-side pin wins on the same info_hash. Prefs are
+                    // keep-wins (copied only when the keeper has none). Feed labels move.
+                    tx.execute("UPDATE OR IGNORE torrent_links SET show_id = ?1 WHERE show_id = ?2",
+                        params![keep, loser])?;
+                    tx.execute("DELETE FROM torrent_links WHERE show_id = ?1", params![loser])?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO torrent_prefs(show_id, save_path, category)
+                         SELECT ?1, save_path, category FROM torrent_prefs WHERE show_id = ?2",
+                        params![keep, loser])?;
+                    tx.execute("UPDATE rss_feeds SET show_id = ?1 WHERE show_id = ?2",
+                        params![keep, loser])?;
+                    // Player state is one preference set, not five independent columns, so it
+                    // moves as a unit and only when the survivor has none of its own. Copying
+                    // column by column could mix two shows' volume and window together.
+                    tx.execute(
+                        "UPDATE shows SET
+                           player_volume     = (SELECT player_volume     FROM shows WHERE id = ?2),
+                           window_width      = (SELECT window_width      FROM shows WHERE id = ?2),
+                           window_height     = (SELECT window_height     FROM shows WHERE id = ?2),
+                           window_maximized  = (SELECT window_maximized  FROM shows WHERE id = ?2),
+                           window_fullscreen = (SELECT window_fullscreen FROM shows WHERE id = ?2)
+                         WHERE id = ?1 AND player_volume IS NULL",
+                        params![keep, loser])?;
                     tx.execute("DELETE FROM shows WHERE id = ?1", params![loser])?;
                     folded += 1;
                 }
@@ -1014,6 +1162,88 @@ impl Db {
                 "UPDATE rename_log SET reverted_at=?2 WHERE id=?1",
                 params![log_id, now()],
             )?;
+            Ok(())
+        })
+    }
+
+    // ---- torrents (schema v7) ----
+    /// Pin an info_hash to the episode it was added for. Pinned at add time and keyed by
+    /// `show_id`, never by title strings, so there is no interaction with parsed_title
+    /// identity or parse_overrides.
+    pub fn add_torrent_link(&self, link: &TorrentLink) -> Result<()> {
+        let info_hash = normalize_hash(&link.info_hash);
+        self.with(|c| {
+            c.execute("INSERT OR REPLACE INTO torrent_links(info_hash, show_id, season, number, added_at) VALUES (?1,?2,?3,?4,?5)",
+                params![info_hash, link.show_id, link.season, link.number, link.added_at])?;
+            Ok(())
+        })
+    }
+
+    pub fn torrent_link(&self, info_hash: &str) -> Result<Option<TorrentLink>> {
+        let info_hash = normalize_hash(info_hash);
+        self.with(|c| Ok(c.query_row(
+            "SELECT info_hash, show_id, season, number, added_at FROM torrent_links WHERE info_hash = ?1", params![info_hash],
+            |r| Ok(TorrentLink { info_hash: r.get(0)?, show_id: r.get(1)?, season: r.get::<_, i64>(2)? as u32, number: r.get::<_, i64>(3)? as u32, added_at: r.get(4)? }))
+            .optional()?))
+    }
+
+    /// Forget a pin after its torrent leaves the server, so a stale pin can
+    /// never shadow a later re-add of the same hash.
+    pub fn remove_torrent_link(&self, info_hash: &str) -> Result<()> {
+        let info_hash = normalize_hash(info_hash);
+        self.with(|c| {
+            c.execute("DELETE FROM torrent_links WHERE info_hash = ?1", params![info_hash])?;
+            Ok(())
+        })
+    }
+
+    /// A show's save path and category. A show with no row yet reports defaults rather
+    /// than an error, so callers never special-case "never configured".
+    pub fn get_prefs(&self, show_id: i64) -> Result<TorrentPrefs> {
+        self.with(|c| {
+            let row: Option<(Option<String>, Option<String>)> = c.query_row(
+                "SELECT save_path, category FROM torrent_prefs WHERE show_id = ?1",
+                params![show_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ).optional()?;
+            Ok(match row {
+                Some((save_path, category)) => TorrentPrefs { show_id, save_path, category },
+                None => TorrentPrefs { show_id, save_path: None, category: None },
+            })
+        })
+    }
+
+    pub fn set_prefs(
+        &self,
+        show_id: i64,
+        save_path: Option<&str>,
+        category: Option<&str>,
+    ) -> Result<()> {
+        self.with(|c| {
+            c.execute("INSERT OR REPLACE INTO torrent_prefs(show_id, save_path, category) VALUES (?1,?2,?3)",
+                params![show_id, save_path, category])?;
+            Ok(())
+        })
+    }
+
+    /// Record the subscription label registered for a show, so monitor-added torrents
+    /// (which carry no add-time pin) can be attributed in the Downloads view.
+    pub fn add_rss_feed(&self, label: &str, show_id: i64) -> Result<()> {
+        self.with(|c| {
+            c.execute("INSERT OR REPLACE INTO rss_feeds(label, show_id, added_at) VALUES (?1,?2,?3)",
+                params![label, show_id, now()])?;
+            Ok(())
+        })
+    }
+
+    pub fn rss_feed_show(&self, label: &str) -> Result<Option<i64>> {
+        self.with(|c| Ok(c.query_row(
+            "SELECT show_id FROM rss_feeds WHERE label = ?1", params![label], |r| r.get(0)).optional()?))
+    }
+
+    pub fn remove_rss_feed(&self, label: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute("DELETE FROM rss_feeds WHERE label = ?1", params![label])?;
             Ok(())
         })
     }
@@ -1212,6 +1442,103 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn upgrade_from_v6_recreates_player_state_columns() {
+        // A v6 database predates the per-show player state. Build that exact `shows` shape, roll
+        // the version back and migrate: `CREATE TABLE IF NOT EXISTS` leaves the existing table
+        // alone, so only an ALTER in upgrade() can add the columns the SELECT below needs.
+        // `player_volume` is pre-added to exercise the loop's "column already exists" skip arm;
+        // the row seeded into it proves the skip arm leaves existing data intact. This simulates
+        // a partially-migrated table and must land at v8.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE shows (
+               id INTEGER PRIMARY KEY, parsed_title TEXT NOT NULL UNIQUE,
+               anilist_id INTEGER, canonical_title TEXT, cover_url TEXT, total_episodes INTEGER,
+               user_title_override TEXT, created_at INTEGER NOT NULL,
+               anilist_cleared INTEGER NOT NULL DEFAULT 0, cover_path TEXT, match_source TEXT,
+               player_volume REAL);
+             INSERT INTO shows (id, parsed_title, created_at, player_volume) VALUES (1, 'Legacy', 0, 12.5);
+             PRAGMA user_version = 6;",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let (volume, version): (f64, i64) = conn
+            .query_row(
+                "SELECT player_volume, (SELECT * FROM pragma_user_version) FROM shows WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(volume, 12.5, "the pre-existing column's data must survive");
+        assert_eq!(version, 8);
+        conn.prepare(
+            "SELECT player_volume, window_width, window_height, window_maximized, window_fullscreen FROM shows",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn player_state_roundtrips_per_show() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/a/a1.mkv", 1, 1))
+            .unwrap();
+        db.upsert_episode(&pn("Beta", 1, 1), &rf("/b/b1.mkv", 1, 1))
+            .unwrap();
+        let shows = db.list_shows("", ShowSort::Title).unwrap();
+        let alpha = shows
+            .iter()
+            .find(|s| s.display_title == "Alpha")
+            .unwrap()
+            .id;
+        let beta = shows.iter().find(|s| s.display_title == "Beta").unwrap().id;
+        let ep = db.get_show(alpha).unwrap().seasons[0].episodes[0].id;
+        assert_eq!(db.show_id_for_episode(ep).unwrap(), Some(alpha));
+
+        db.set_show_player_state(
+            alpha,
+            &ShowPlayerState {
+                volume: 42.5,
+                window_width: Some(1600),
+                window_height: Some(900),
+                window_maximized: true,
+                window_fullscreen: false,
+            },
+        )
+        .unwrap();
+
+        let got = db.show_player_state(alpha).unwrap().unwrap();
+        assert_eq!(got.volume, 42.5);
+        assert_eq!(got.window_width, Some(1600));
+        assert_eq!(got.window_height, Some(900));
+        assert!(got.window_maximized);
+        assert!(!got.window_fullscreen);
+        // The other show was never played, so it must stay unrecorded.
+        assert!(db.show_player_state(beta).unwrap().is_none());
+    }
+
+    #[test]
+    fn set_show_player_state_reports_a_missing_show() {
+        let db = Db::open_memory().unwrap();
+        let s = ShowPlayerState {
+            volume: 50.0,
+            window_width: None,
+            window_height: None,
+            window_maximized: false,
+            window_fullscreen: false,
+        };
+        assert!(
+            !db.set_show_player_state(999_999, &s).unwrap(),
+            "an UPDATE that matches no row must report false"
+        );
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/a/a1.mkv", 1, 1))
+            .unwrap();
+        let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+        assert!(db.set_show_player_state(id, &s).unwrap());
     }
 
     use crate::parser::ParsedName;
@@ -1814,6 +2141,93 @@ mod tests {
         );
     }
 
+    /// Two shows matched to the same provider id, ready to fold: `big` (2 episodes) survives,
+    /// `small` (1 episode) is folded away.
+    fn folded_pair() -> (Db, i64, i64) {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Bloom Into You", 1, 1), &rf("/a/1.mkv", 1, 1))
+            .unwrap();
+        db.upsert_episode(&pn("Bloom Into You", 1, 2), &rf("/a/2.mkv", 1, 1))
+            .unwrap();
+        db.upsert_episode(&pn("Yagate Kimi ni Naru", 1, 1), &rf("/b/1.mkv", 1, 1))
+            .unwrap();
+        let id = |t: &str| db.list_shows(t, ShowSort::Title).unwrap()[0].id;
+        let (big, small) = (id("Bloom"), id("Yagate"));
+        let hit = |n: &str| MetadataHit {
+            id: 41240,
+            source: "kitsu".into(),
+            title_romaji: n.into(),
+            title_english: None,
+            cover_url: None,
+            episodes: None,
+        };
+        db.set_anilist(big, &hit("Yagate Kimi ni Naru")).unwrap();
+        db.set_anilist(small, &hit("Yagate Kimi ni Naru")).unwrap();
+        (db, big, small)
+    }
+
+    #[test]
+    fn a_fold_keeps_player_state_only_one_row_had() {
+        let (db, big, small) = folded_pair();
+        // Only the row that is about to be folded was ever played, so its saved volume and
+        // window must not disappear with it.
+        db.set_show_player_state(
+            small,
+            &ShowPlayerState {
+                volume: 62.5,
+                window_width: Some(1024),
+                window_height: Some(768),
+                window_maximized: true,
+                window_fullscreen: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+
+        let got = db.show_player_state(big).unwrap().unwrap();
+        assert_eq!(got.volume, 62.5);
+        assert_eq!(got.window_width, Some(1024));
+        assert_eq!(got.window_height, Some(768));
+        assert!(got.window_maximized);
+    }
+
+    #[test]
+    fn a_fold_keeps_the_survivors_own_player_state() {
+        let (db, big, small) = folded_pair();
+        // Both rows have state; the survivor (more episodes) must keep its own.
+        db.set_show_player_state(
+            big,
+            &ShowPlayerState {
+                volume: 11.0,
+                window_width: Some(1920),
+                window_height: Some(1080),
+                window_maximized: true,
+                window_fullscreen: false,
+            },
+        )
+        .unwrap();
+        db.set_show_player_state(
+            small,
+            &ShowPlayerState {
+                volume: 62.5,
+                window_width: Some(1024),
+                window_height: Some(768),
+                window_maximized: false,
+                window_fullscreen: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+
+        let got = db.show_player_state(big).unwrap().unwrap();
+        assert_eq!(got.volume, 11.0, "{got:?}");
+        assert_eq!(got.window_width, Some(1920), "{got:?}");
+        assert!(got.window_maximized);
+        assert!(!got.window_fullscreen);
+    }
+
     #[test]
     fn a_fold_survives_the_next_scan() {
         // Without an override the fold lasts until the next scan: the files still parse to the
@@ -1924,6 +2338,80 @@ mod tests {
             Some("Canon Big"),
             "the survivor's own value is not overwritten"
         );
+    }
+
+    #[test]
+    fn a_fold_carries_torrent_state_to_the_survivor() {
+        // Links, prefs and feed labels are keyed by show_id with ON DELETE CASCADE:
+        // without a re-point the fold would silently wipe the loser's torrent state.
+        let db = Db::open_memory().unwrap();
+        let seed = |big: &str, small: &str, dir: &str| {
+            db.upsert_episode(&pn(big, 1, 1), &rf(&format!("/{dir}/a1.mkv"), 1, 1))
+                .unwrap();
+            db.upsert_episode(&pn(big, 1, 2), &rf(&format!("/{dir}/a2.mkv"), 1, 1))
+                .unwrap();
+            db.upsert_episode(&pn(small, 1, 1), &rf(&format!("/{dir}/b1.mkv"), 1, 1))
+                .unwrap();
+        };
+        seed("BigA", "SmallA", "a");
+        seed("BigB", "SmallB", "b");
+        let id = |t: &str| db.list_shows(t, ShowSort::Title).unwrap()[0].id;
+        let (big_a, small_a) = (id("BigA"), id("SmallA"));
+        let (big_b, small_b) = (id("BigB"), id("SmallB"));
+        let hit = |ext: i64| MetadataHit {
+            id: ext,
+            source: "kitsu".into(),
+            title_romaji: "Canon".into(),
+            title_english: None,
+            cover_url: None,
+            episodes: None,
+        };
+        db.set_anilist(big_a, &hit(101)).unwrap();
+        db.set_anilist(small_a, &hit(101)).unwrap();
+        db.set_anilist(big_b, &hit(202)).unwrap();
+        db.set_anilist(small_b, &hit(202)).unwrap();
+        // Pair A exercises keep-wins: both rows carry prefs. Pair B exercises the
+        // copy path: only the loser has prefs.
+        db.add_torrent_link(&TorrentLink {
+            info_hash: "aaa".into(), show_id: small_a, season: 1, number: 1,
+            added_at: 1,
+        }).unwrap();
+        db.add_torrent_link(&TorrentLink {
+            info_hash: "bbb".into(), show_id: small_b, season: 1, number: 1,
+            added_at: 1,
+        }).unwrap();
+        db.set_prefs(big_a, Some("/tv/BigA"), Some("catA")).unwrap();
+        db.set_prefs(small_a, Some("/tv/SmallA"), Some("catSmallA")).unwrap();
+        db.set_prefs(small_b, Some("/tv/SmallB"), Some("catB")).unwrap();
+        db.add_rss_feed("animemgr:pair-a", small_a).unwrap();
+        db.add_rss_feed("animemgr:pair-b", small_b).unwrap();
+
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 2);
+
+        assert_eq!(
+            db.torrent_link("aaa").unwrap().expect("link survives the fold").show_id,
+            big_a
+        );
+        assert_eq!(
+            db.torrent_link("bbb").unwrap().expect("link survives the fold").show_id,
+            big_b
+        );
+        assert!(db.get_show(small_a).is_err(), "the folded row is gone");
+        assert!(db.get_show(small_b).is_err(), "the folded row is gone");
+        let prefs_a = db.get_prefs(big_a).unwrap();
+        assert_eq!(
+            (prefs_a.save_path.as_deref(), prefs_a.category.as_deref()),
+            (Some("/tv/BigA"), Some("catA")),
+            "keeper's own prefs win"
+        );
+        let prefs_b = db.get_prefs(big_b).unwrap();
+        assert_eq!(
+            (prefs_b.save_path.as_deref(), prefs_b.category.as_deref()),
+            (Some("/tv/SmallB"), Some("catB")),
+            "loser's prefs carry over when the keeper has none"
+        );
+        assert_eq!(db.rss_feed_show("animemgr:pair-a").unwrap(), Some(big_a));
+        assert_eq!(db.rss_feed_show("animemgr:pair-b").unwrap(), Some(big_b));
     }
 
     #[test]
@@ -2316,6 +2804,107 @@ mod tests {
             "nested root is not absorbed by its parent"
         );
         assert_eq!(s.episodes_missing, 2);
+    }
+
+    #[test]
+    fn torrent_link_roundtrip_and_prefs_defaults() {
+        let db = Db::open_memory().unwrap();
+        let show_id: i64 = db.with(|c| {
+            c.execute("INSERT INTO shows (parsed_title, created_at) VALUES ('t', 0)", [])?;
+            Ok(c.last_insert_rowid())
+        }).unwrap();
+        db.add_torrent_link(&TorrentLink {
+            info_hash: "  ABC123 ".into(), show_id, season: 1, number: 6,
+            added_at: 0,
+        }).unwrap();
+        let got = db.torrent_link("abc123").unwrap().expect("link stored");
+        assert_eq!(got.info_hash, "abc123", "hash normalized on write");
+        assert_eq!(got.number, 6);
+        assert!(
+            db.torrent_link("  AbC123  ").unwrap().is_some(),
+            "hash normalized on lookup"
+        );
+        assert!(db.torrent_link("nope").unwrap().is_none());
+        db.remove_torrent_link("ABC123").unwrap();
+        assert!(db.torrent_link("abc123").unwrap().is_none());
+        let prefs = db.get_prefs(show_id).unwrap();
+        assert_eq!(prefs, TorrentPrefs { show_id: 1, save_path: None, category: None });
+        db.set_prefs(show_id, Some("/tv/Frieren"), Some("anime")).unwrap();
+        assert_eq!(db.get_prefs(1).unwrap().category.as_deref(), Some("anime"));
+        db.add_rss_feed("animemgr:Frieren", show_id).unwrap();
+        assert_eq!(db.rss_feed_show("animemgr:Frieren").unwrap(), Some(1));
+        db.remove_rss_feed("animemgr:Frieren").unwrap();
+        assert_eq!(db.rss_feed_show("animemgr:Frieren").unwrap(), None);
+    }
+
+    #[test]
+    fn v6_db_upgrades_without_data_loss() {
+        // A v6 database predates the three torrent tables and the player-state columns. The
+        // in-place upgrade must create/add both and bump to the current version without
+        // touching shows or episodes.
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Legacy", 1, 1), &rf("/legacy/01.mkv", 1, 1))
+            .unwrap();
+        db.with(|c| {
+            c.execute_batch(
+                "DROP TABLE torrent_links;
+                 DROP TABLE torrent_prefs;
+                 DROP TABLE rss_feeds;
+                 PRAGMA user_version = 6;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        db.with(migrate).unwrap();
+        let version: i64 = db
+            .with(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(version, 8);
+        for table in ["torrent_links", "torrent_prefs", "rss_feeds"] {
+            let n: i64 = db
+                .with(|c| {
+                    Ok(c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?)
+                })
+                .unwrap();
+            assert_eq!(n, 0, "{table} exists and starts empty");
+        }
+        let (shows, episodes): (i64, i64) = db
+            .with(|c| {
+                Ok((
+                    c.query_row("SELECT COUNT(*) FROM shows", [], |r| r.get(0))?,
+                    c.query_row("SELECT COUNT(*) FROM episodes", [], |r| r.get(0))?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(shows, 1, "the show survives the upgrade");
+        assert_eq!(episodes, 1, "the episode survives the upgrade");
+    }
+
+    #[test]
+    fn v7_db_gains_player_state_columns() {
+        // The realistic collision path: a database already migrated by develop's v7 torrent
+        // step has no player-state columns, and must not early-return past the v7 -> v8 ALTERs.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE shows (
+               id INTEGER PRIMARY KEY, parsed_title TEXT NOT NULL UNIQUE,
+               anilist_id INTEGER, canonical_title TEXT, cover_url TEXT, total_episodes INTEGER,
+               user_title_override TEXT, created_at INTEGER NOT NULL,
+               anilist_cleared INTEGER NOT NULL DEFAULT 0, cover_path TEXT, match_source TEXT);
+             PRAGMA user_version = 7;",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 8, "a v7 database advances to v8");
+        conn.prepare(
+            "SELECT player_volume, window_width, window_height, window_maximized, window_fullscreen FROM shows",
+        )
+        .unwrap();
     }
 
     #[test]

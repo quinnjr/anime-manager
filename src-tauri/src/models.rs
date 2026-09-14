@@ -69,6 +69,18 @@ pub struct Episode {
     pub last_played_at: Option<i64>,
 }
 
+/// The mpv volume and window state to restore the next time a show is played. Recorded from
+/// the running player and stored per show, so a quiet dialogue-heavy series does not inherit
+/// the volume of an action one. The window fields are NULL when no play has recorded them yet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowPlayerState {
+    pub volume: f64,
+    pub window_width: Option<i64>,
+    pub window_height: Option<i64>,
+    pub window_maximized: bool,
+    pub window_fullscreen: bool,
+}
+
 /// The four values `parse_overrides.kind` and an LLM file decision may carry. They are a stored
 /// protocol - the CHECK constraint on `parse_overrides` rejects anything else - so they are named
 /// once here rather than spelled as literals at each of the dozen places that compare them.
@@ -307,4 +319,73 @@ pub struct DlnaStatus {
     /// decoding.
     #[serde(default)]
     pub dlna_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TorrentLink {
+    pub info_hash: String, pub show_id: i64,
+    pub season: u32, pub number: u32, pub added_at: i64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TorrentPrefs {
+    pub show_id: i64, pub save_path: Option<String>, pub category: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct TorrentFile { #[serde(default)] pub path: String, #[serde(default)] pub size: u64 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TorrentInfo {
+    pub info_hash: String, #[serde(default)] pub name: String,
+    #[serde(default)] pub status: String, #[serde(default)] pub progress: f64,
+    #[serde(default)] pub total_size: u64, #[serde(default)] pub downloaded: u64,
+    #[serde(default)] pub download_speed: u64, #[serde(default)] pub upload_speed: u64,
+    #[serde(default)] pub peers: usize, #[serde(default)] pub seeds: usize,
+    #[serde(default)] pub save_path: String, #[serde(default)] pub category: Option<String>,
+    #[serde(default)] pub ratio: f64, pub eta: Option<u64>,
+    pub error_message: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TorrentDetail { #[serde(flatten)] pub info: TorrentInfo, #[serde(default)] pub files: Vec<TorrentFile> }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LinkedTo { pub show_id: i64, pub season: u32, pub number: u32 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LinkedTorrent { #[serde(flatten)] pub info: TorrentInfo, pub linked: Option<LinkedTo> }
+/// POST /api/rss/feeds body: which remote feed to poll and what to grab.
+/// `exclude_batch` reproduces the strict no-packs rule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RssFeedConfig {
+    pub label: String, pub url: String, pub search: String, pub category: String,
+    pub enabled: bool, pub exclude_batch: bool,
+}
+/// One server-side feed joined to the local show it was registered for, if
+/// any — a feed the app did not create has `show_id: None`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RssFeedView {
+    pub label: String, #[serde(default)] pub url: String, #[serde(default)] pub search: String,
+    #[serde(default)] pub category: String, #[serde(default)] pub enabled: bool,
+    #[serde(default)] pub show_id: Option<i64>,
+}
+/// What `torrent_rss_subscribe` reports: the deterministic label, the feed URL,
+/// and where the server will actually put files (`resolved_path`, server truth
+/// via `GET /api/config`) plus whether that sits outside the library roots.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RssSubscribeResult {
+    pub label: String,
+    pub url: String,
+    pub resolved_path: Option<String>,
+    pub outside_roots: bool,
+}
+/// Flat `torrent_add` payload from the Downloads view. Tauri keys the invoke
+/// under `args`; the inner fields arrive camelCase from the frontend, so serde
+/// maps them onto these snake_case members.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TorrentAddArgs {
+    pub torrent_url: Option<String>,
+    pub info_hash: Option<String>,
+    pub show_id: i64,
+    pub season: u32,
+    pub number: u32,
+    pub save_path: Option<String>,
+    pub category: Option<String>,
 }

@@ -61,7 +61,22 @@ scanner::scan_dir → per file: db.get_override() → parser::parse_with_confide
 
 **Playback** (`player.rs`) spawns mpv with `--input-ipc-server` and polls position over the JSON IPC socket. If the socket never connects, the run writes nothing back and returns an error — position and duration are unknown, so any watched judgement would be made from stale values.
 
-**Frontend contract.** `src/lib/api.ts` is the only place that calls `invoke`; keep the TS interfaces in step with `models.rs`. Tauri maps camelCase JS args to snake_case Rust params automatically. Events (`scan-progress`, `library-changed`, `show-updated`, `playback-changed`, `llm-assist-progress`, `llm-assist`, `error`) are subscribed in `+layout.svelte` and the route components. Stores are Svelte 5 runes in `.svelte.ts` files.
+**Frontend contract.** `src/lib/api.ts` is the only place that calls `invoke`; keep the TS interfaces in step with `models.rs`. Tauri maps camelCase JS args to snake_case Rust params automatically; a command taking a struct arg (e.g. `torrent_add(args: TorrentAddArgs)`) is invoked as `invoke('torrent_add', { args })`, and the struct carries `#[serde(rename_all = "camelCase")]` for its inner fields. Events (`scan-progress`, `library-changed`, `show-updated`, `playback-changed`, `llm-assist-progress`, `llm-assist`, `torrent-changed`, `error`) are subscribed in `+layout.svelte` and the route components. Stores are Svelte 5 runes in `.svelte.ts` files.
+
+## rustorrent integration
+
+`torrent.rs` is a REST client for a LAN rustorrent server: list/start/pause/recheck/remove,
+add a Nyaa `.torrent` with a per-show save path and category, and subscribe a show to an
+auto-downloading RSS feed. Connection settings (`torrent_base_url`, `torrent_password`,
+`torrent_path_map`) and the `torrent_test_ok` arming flag live in the `settings` table; the
+flag gates every add/control/RSS command and is disarmed whenever the URL or password
+changes, so a broken config never mutates the server. `torrent_links` pins an added
+`info_hash` to a show/season/episode at add time (keyed on `show_id`, never on a title);
+unpinned torrents backfill by matching `save_path` + `files[]` against episode paths.
+`torrent_path_map` translates the server's view of NAS paths (`/downloads`) to the client's
+(`/mnt/nas/Downloads`) in both directions. Discovery browses `_rustorrent._tcp.local.`; the
+manual base URL is the fallback. `new` commands: `torrent_discover/test/list/add/control`,
+`torrent_prefs_get/set`, `torrent_rss_subscribe/list/toggle/remove`.
 
 ## Metadata providers
 
