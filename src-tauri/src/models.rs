@@ -69,6 +69,18 @@ pub struct Episode {
     pub last_played_at: Option<i64>,
 }
 
+/// The mpv volume and window state to restore the next time a show is played. Recorded from
+/// the running player and stored per show, so a quiet dialogue-heavy series does not inherit
+/// the volume of an action one. The window fields are NULL when no play has recorded them yet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowPlayerState {
+    pub volume: f64,
+    pub window_width: Option<i64>,
+    pub window_height: Option<i64>,
+    pub window_maximized: bool,
+    pub window_fullscreen: bool,
+}
+
 /// The four values `parse_overrides.kind` and an LLM file decision may carry. They are a stored
 /// protocol - the CHECK constraint on `parse_overrides` rejects anything else - so they are named
 /// once here rather than spelled as literals at each of the dozen places that compare them.
