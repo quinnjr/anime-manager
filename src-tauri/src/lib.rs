@@ -3,6 +3,7 @@ pub mod commands;
 pub mod db;
 pub mod dlna;
 pub mod error;
+pub mod http;
 pub mod kitsu;
 pub mod llm;
 pub mod metadata;
@@ -12,6 +13,8 @@ pub mod parser;
 pub mod player;
 pub mod rename;
 pub mod scanner;
+pub mod torrent;
+pub mod torrent_commands;
 
 use std::sync::Arc;
 
@@ -106,6 +109,17 @@ pub fn run() {
             commands::dlna_status,
             commands::dlna_set_enabled,
             commands::dlna_set_options,
+            torrent_commands::torrent_discover,
+            torrent_commands::torrent_test,
+            torrent_commands::torrent_list,
+            torrent_commands::torrent_add,
+            torrent_commands::torrent_control,
+            torrent_commands::torrent_prefs_get,
+            torrent_commands::torrent_prefs_set,
+            torrent_commands::torrent_rss_subscribe,
+            torrent_commands::torrent_rss_list,
+            torrent_commands::torrent_rss_toggle,
+            torrent_commands::torrent_rss_remove,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

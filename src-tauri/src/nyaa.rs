@@ -8,7 +8,8 @@ use regex::Regex;
 
 use crate::db::Db;
 use crate::error::{AppError, Result};
-use crate::models::EpisodeStatus;
+use crate::http::{read_capped, send_with_retry, snippet};
+use crate::models::{EpisodeStatus, ShowDetail};
 use serde::{Deserialize, Serialize};
 
 /// A single Nyaa search result row.
@@ -16,6 +17,8 @@ use serde::{Deserialize, Serialize};
 struct NyaaHit {
     pub title: String,
     pub page_url: String,
+    pub torrent_url: Option<String>,
+    pub info_hash: Option<String>,
     pub size_bytes: u64,
     pub seeders: u32,
 }
@@ -235,62 +238,25 @@ impl Nyaa {
     /// 30s). Anything else fails fast naming the query, status and a
     /// body snippet; transport errors propagate as-is.
     async fn search(&self, query: &str) -> Result<Vec<NyaaHit>> {
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            let sent = self
-                .client
-                .get(format!("{}/", self.base_url))
+        let url = format!("{}/", self.base_url);
+        let resp = send_with_retry(3, true, || {
+            self.client
+                .get(&url)
                 .query(&[("page", "rss"), ("q", query), ("c", "1_2"), ("f", "0")])
                 .send()
-                .await;
-            let resp = match sent {
-                Ok(resp) => resp,
-                Err(e) if e.is_timeout() && attempt < 3 => {
-                    tokio::time::sleep(retry_wait(attempt)).await;
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            };
-            let status = resp.status();
-            if status.is_success() {
-                let bytes = resp.bytes().await?;
-                if bytes.len() > 4_000_000 {
-                    return Err(AppError::Network("nyaa response too large".into()));
-                }
-                let body =
-                    std::str::from_utf8(&bytes).map_err(|e| AppError::Parse(e.to_string()))?;
-                return parse_rss(body);
-            }
-            let retryable = status.as_u16() == 429 || status.is_server_error();
-            if retryable && attempt < 3 {
-                let asked = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|h| h.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .map(|s| std::time::Duration::from_secs(s.min(30)));
-                tokio::time::sleep(asked.unwrap_or_else(|| retry_wait(attempt))).await;
-                continue;
-            }
-            let body = resp.text().await.unwrap_or_default();
-            let snippet: String = body.chars().take(200).collect();
-            return Err(AppError::Network(format!(
-                "nyaa search {query:?} returned {status}: {snippet}"
-            )));
+        })
+        .await?;
+        if resp.status().is_success() {
+            let bytes = read_capped(resp, 4_000_000).await?;
+            let body = std::str::from_utf8(&bytes).map_err(|e| AppError::Parse(e.to_string()))?;
+            return parse_rss(body);
         }
+        let status = resp.status();
+        let snippet = snippet(resp, 200).await;
+        Err(AppError::Network(format!(
+            "nyaa search {query:?} returned {status}: {snippet}"
+        )))
     }
-}
-
-/// Backoff before Nyaa retry `attempt` (1-based): 200ms, then 800ms, plus
-/// a sub-100ms jitter so concurrent hunts do not march in step.
-fn retry_wait(attempt: u32) -> std::time::Duration {
-    let base = if attempt <= 1 { 200 } else { 800 };
-    let jitter = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.subsec_nanos() % 100) as u64)
-        .unwrap_or(0);
-    std::time::Duration::from_millis(base + jitter)
 }
 
 /// RSS envelope: `<rss><channel><item>…`. Every field defaults so one
@@ -316,6 +282,8 @@ struct RawItem {
     link: String,
     #[serde(default)]
     guid: String,
+    #[serde(default, rename = "nyaa:infoHash")]
+    info_hash: String,
     #[serde(default, rename = "nyaa:size")]
     size: String,
     #[serde(default, rename = "nyaa:seeders")]
@@ -333,16 +301,27 @@ fn parse_rss(body: &str) -> Result<Vec<NyaaHit>> {
         let title = item.title.trim().to_string();
         let link = item.link.trim().to_string();
         let guid = item.guid.trim().to_string();
+        let info_hash = item.info_hash.trim().to_string();
         let size = item.size.trim().to_string();
         let seeders = item.seeders.trim().to_string();
         // Live shape: `<link>` is the `.torrent` file, `<guid>`
         // the view page. Prefer the view page; feeds without a
         // guid fall back to the link.
-        let page_url = if guid.is_empty() { link } else { guid };
+        let page_url = if guid.is_empty() {
+            link.clone()
+        } else {
+            guid
+        };
         if !page_url.is_empty() {
             hits.push(NyaaHit {
                 title,
                 page_url,
+                torrent_url: if link.is_empty() { None } else { Some(link) },
+                info_hash: if info_hash.is_empty() {
+                    None
+                } else {
+                    Some(info_hash)
+                },
                 size_bytes: parse_size(&size),
                 seeders: seeders.parse().unwrap_or(0),
             });
@@ -381,6 +360,8 @@ pub fn parse_size(s: &str) -> u64 {
 pub struct WantedHit {
     pub title: String,
     pub page_url: String,
+    pub torrent_url: Option<String>,
+    pub info_hash: Option<String>,
     pub size_bytes: u64,
     pub seeders: u32,
 }
@@ -402,6 +383,31 @@ struct Owned {
     number: u32,
     group: Option<String>,
     resolution: Option<String>,
+}
+
+/// Episodes on disk that vote for preferences and baseline wanted
+/// numbers. Season 0 and missing-status rows never reach this struct.
+/// Extracted verbatim from `find_missing` so `subscribe_derivation`
+/// reuses the same collector instead of duplicating its exclusions.
+fn owned_episodes(show: &ShowDetail) -> Vec<Owned> {
+    let mut owned: Vec<Owned> = Vec::new();
+    for season in &show.seasons {
+        if season.number == 0 {
+            continue;
+        }
+        for ep in &season.episodes {
+            if ep.status == EpisodeStatus::Missing {
+                continue;
+            }
+            owned.push(Owned {
+                season: season.number,
+                number: ep.number,
+                group: ep.release_group.clone(),
+                resolution: ep.resolution.clone(),
+            });
+        }
+    }
+    owned
 }
 
 /// Episode numbers to hunt, per season: gaps strictly inside the owned range,
@@ -490,24 +496,10 @@ fn size_band(sizes: &[u64]) -> Option<(u64, u64)> {
 pub async fn find_missing(db: &Db, nyaa: &Nyaa, show_id: i64) -> Result<Vec<WantedEpisode>> {
     let show = db.get_show(show_id)?;
 
-    let mut owned: Vec<Owned> = Vec::new();
+    let owned = owned_episodes(&show);
     let mut per_season: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    for season in &show.seasons {
-        if season.number == 0 {
-            continue;
-        }
-        for ep in &season.episodes {
-            if ep.status == EpisodeStatus::Missing {
-                continue;
-            }
-            owned.push(Owned {
-                season: season.number,
-                number: ep.number,
-                group: ep.release_group.clone(),
-                resolution: ep.resolution.clone(),
-            });
-            per_season.entry(season.number).or_default().push(ep.number);
-        }
+    for o in &owned {
+        per_season.entry(o.season).or_default().push(o.number);
     }
 
     let total = match show.total_episodes {
@@ -556,6 +548,8 @@ pub async fn find_missing(db: &Db, nyaa: &Nyaa, show_id: i64) -> Result<Vec<Want
                     Some(WantedHit {
                         title: h.title,
                         page_url: h.page_url,
+                        torrent_url: h.torrent_url,
+                        info_hash: h.info_hash,
                         size_bytes: h.size_bytes,
                         seeders: h.seeders,
                     })
@@ -572,6 +566,37 @@ pub async fn find_missing(db: &Db, nyaa: &Nyaa, show_id: i64) -> Result<Vec<Want
         });
     }
     Ok(wanted)
+}
+
+/// Title-only Nyaa RSS feed URL for a show (no episode number, so future
+/// episodes match). Query encoding goes through reqwest::Url — never string concat.
+pub fn feed_url(title: &str) -> String {
+    let mut u = reqwest::Url::parse(NYAA_BASE).expect("const base parses");
+    u.set_path("/");
+    u.query_pairs_mut()
+        .append_pair("page", "rss")
+        .append_pair("q", title)
+        .append_pair("c", "1_2")
+        .append_pair("f", "0");
+    u.to_string()
+}
+
+pub struct FeedDerivation {
+    pub feed_url: String,
+    pub group: Option<String>,
+    pub resolution: Option<String>,
+}
+
+/// Everything torrent_rss_subscribe needs, derived from owned episodes.
+/// Group/resolution reuse the find_missing modals (skip-when-absent, never fail).
+pub fn subscribe_derivation(db: &Db, show_id: i64) -> Result<FeedDerivation> {
+    let show = db.get_show(show_id)?;
+    let owned = owned_episodes(&show);
+    Ok(FeedDerivation {
+        feed_url: feed_url(&show.display_title),
+        group: modal_group(&owned),
+        resolution: modal_resolution(&owned),
+    })
 }
 
 #[cfg(test)]
@@ -603,6 +628,18 @@ mod tests {
         );
         assert_eq!(hits[0].seeders, 42);
         assert_eq!(hits[0].size_bytes, 1_503_238_553);
+        assert_eq!(
+            hits[0].torrent_url.as_deref(),
+            Some("https://nyaa.si/download/12345.torrent")
+        );
+        assert_eq!(
+            hits[0].info_hash.as_deref(),
+            Some("abcdef0123456789abcdef0123456789abcdef01")
+        );
+        assert_eq!(
+            feed_url("Sousou no Frieren"),
+            "https://nyaa.si/?page=rss&q=Sousou+no+Frieren&c=1_2&f=0"
+        );
         assert_eq!(
             hits[1].page_url, "https://nyaa.si/download/9.torrent",
             "link fallback when the feed omits guid"
@@ -1030,6 +1067,25 @@ mod tests {
     }
 
     #[test]
+    fn subscribe_derivation_without_group_or_resolution() {
+        // Files with no release group or resolution vote for nothing: the
+        // derivation omits those clauses rather than failing.
+        let db = Db::open_memory().unwrap();
+        for (e, p) in [(1u32, "/lib/N/01.mkv"), (2, "/lib/N/02.mkv")] {
+            db.upsert_episode(&pn("No Group Show", 1, e, None, None), &rf(p))
+                .unwrap();
+        }
+        let show_id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+        let d = subscribe_derivation(&db, show_id).unwrap();
+        assert!(d.group.is_none(), "no group on disk means no group clause");
+        assert!(d.resolution.is_none(), "no resolution on disk means no resolution clause");
+        assert_eq!(
+            d.feed_url, "https://nyaa.si/?page=rss&q=No+Group+Show&c=1_2&f=0",
+            "title-only query in the same shape as feed_url pins"
+        );
+    }
+
+    #[test]
     fn parse_size_extended() {
         assert_eq!(parse_size("1.4 gib"), 1_503_238_553, "lowercase unit");
         assert_eq!(parse_size("  700 MiB  "), 734_003_200, "surrounding spaces");
@@ -1169,5 +1225,36 @@ mod tests {
         assert_eq!(wanted.len(), 1, "gap only, no continuation past max");
         assert_eq!((wanted[0].season, wanted[0].number), (1, 3));
         assert_eq!(wanted[0].hits.len(), 1);
+    }
+
+    #[test]
+    fn subscribe_derivation_unknown_show_errors() {
+        let db = Db::open_memory().unwrap();
+        assert!(subscribe_derivation(&db, 9999).is_err());
+    }
+
+    #[test]
+    fn subscribe_derivation_carries_group_and_resolution() {
+        let db = Db::open_memory().unwrap();
+        for (e, p) in [(1u32, "/lib/G/01.mkv"), (2, "/lib/G/02.mkv")] {
+            db.upsert_episode(&pn("Grouped", 1, e, Some("G"), Some("1080p")), &rf(p))
+                .unwrap();
+        }
+        let show_id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+        let d = subscribe_derivation(&db, show_id).unwrap();
+        assert_eq!(d.group.as_deref(), Some("g"), "modal group lowercased");
+        assert_eq!(d.resolution.as_deref(), Some("1080p"));
+    }
+
+    #[test]
+    fn parse_rss_without_link_or_info_hash_yields_none() {
+        let rss = rss_wrap(
+            "<item><title>[G] Show - 01 [1080p]</title><guid>https://nyaa.si/view/1</guid><nyaa:size>1.4 GiB</nyaa:size></item>",
+        );
+        let hits = parse_rss(&rss).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].page_url, "https://nyaa.si/view/1");
+        assert!(hits[0].torrent_url.is_none(), "no <link> means no torrent URL");
+        assert!(hits[0].info_hash.is_none(), "no nyaa:infoHash means None");
     }
 }
