@@ -55,10 +55,15 @@ roots       (id, path UNIQUE, added_at,
              last_scan_at, last_files_seen, last_added, last_updated, last_missing,
              last_errors, last_readable)
 shows       (id, parsed_title UNIQUE, anilist_id, match_source, canonical_title, cover_url,
-             cover_path, total_episodes, user_title_override, created_at, anilist_cleared)
+             cover_path, total_episodes, user_title_override, created_at, anilist_cleared,
+             player_volume, window_width, window_height, window_maximized, window_fullscreen)
              -- match_source is 'anilist' or 'kitsu'; anilist_id holds THAT provider's id,
              -- so it is only an AniList id when match_source = 'anilist'.
              -- cover_path is the local copy of cover_url once downloaded.
+             -- player_volume/window_* are the last mpv state for this show, restored on its
+             -- next play. player_volume NULL means nothing recorded yet, so mpv's own
+             -- defaults still apply. A duplicate-show fold adopts the folded row's set only
+             -- when the survivor has none of its own; otherwise the survivor's is kept.
 seasons     (id, show_id → shows, number, UNIQUE(show_id, number))
 episodes    (id, season_id → seasons, number, path UNIQUE, size, mtime,
              release_group, resolution, crc,
@@ -228,13 +233,21 @@ These are load-bearing; each exists because its absence destroys user data.
 1. `play(episode_id)`: reject if another episode is `playing`. Set `playing`, emit
    `playback-changed`.
 2. Spawn `mpv --input-ipc-server=<runtime_dir>/anime-manager/<id>.sock
-   --start=<position_secs> --force-window <path>`. `runtime_dir` is `$XDG_RUNTIME_DIR`
-   or `/tmp`.
+   --start=<position_secs> --force-window [<show player state>] <path>`. The player state
+   restores the show's last `--volume`, and exactly one of `--fullscreen`,
+   `--window-maximized` or `--geometry` (fullscreen wins over maximized, which wins over
+   size). It is omitted entirely until a play has recorded it. `runtime_dir` is
+   `$XDG_RUNTIME_DIR` or `/tmp`.
 3. Background task connects to the socket (retry for 5 s), issues
-   `get_property time-pos` and `get_property duration` every 5 s, persists
-   `position_secs` / `duration_secs`.
+   `get_property time-pos`, `duration`, `volume`, `osd-width`/`osd-height`,
+   `window-maximized`, `window-minimized` and `fullscreen` every 5 s, persists
+   `position_secs` / `duration_secs`. `volume` and the window state are held for
+   step 4; a minimized window's reported size is discarded in favour of the last
+   real one.
 4. On exit: `position / duration >= played_threshold` → `played`, `position_secs = 0`.
-   Otherwise → `unplayed`, position kept for resume. Emit `playback-changed`.
+   Otherwise → `unplayed`, position kept for resume. The last valid `volume` and window
+   state are written to the show, so its next play restores them. Emit
+   `playback-changed`.
 5. On app start, any `playing` rows are reset to `unplayed` (crash recovery).
 
 `set_status(episode_id, status)` is always available for manual override.

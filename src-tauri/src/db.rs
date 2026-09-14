@@ -44,7 +44,11 @@ CREATE TABLE IF NOT EXISTS shows (
   cover_path TEXT,
   -- which provider supplied the match: 'anilist' or 'kitsu'. anilist_id holds that
   -- provider's id, so it is only an AniList id when match_source = 'anilist'.
-  match_source TEXT);
+  match_source TEXT,
+  -- last mpv volume and window state for this show, restored on the next play. player_volume
+  -- NULL means nothing has been recorded yet, so mpv's own defaults still apply.
+  player_volume REAL, window_width INTEGER, window_height INTEGER,
+  window_maximized INTEGER, window_fullscreen INTEGER);
 CREATE TABLE IF NOT EXISTS seasons (
   id INTEGER PRIMARY KEY, show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
   number INTEGER NOT NULL,
@@ -87,7 +91,11 @@ CREATE TABLE IF NOT EXISTS rss_feeds (
   added_at INTEGER NOT NULL);
 "#;
 
-const SCHEMA_VERSION: i64 = 7;
+// v7 belongs to the torrent migration already merged on develop (torrent_links, torrent_prefs,
+// rss_feeds, gated on `v < 7`). This migration must not reuse it: a v7 database would hit the
+// early return above, never add the player-state columns, and break playback with
+// "no such column: player_volume". This is the v7 -> v8 step on top of develop.
+const SCHEMA_VERSION: i64 = 8;
 
 /// Bring an existing database up to `SCHEMA_VERSION`. Fresh databases get the current shape
 /// from SCHEMA directly; older ones are altered in place so no user data is lost.
@@ -123,6 +131,17 @@ fn upgrade(conn: &Connection) -> Result<()> {
     }
     if !has("shows", "cover_path")? {
         conn.execute_batch("ALTER TABLE shows ADD COLUMN cover_path TEXT;")?;
+    }
+    for (col, ty) in [
+        ("player_volume", "REAL"),
+        ("window_width", "INTEGER"),
+        ("window_height", "INTEGER"),
+        ("window_maximized", "INTEGER"),
+        ("window_fullscreen", "INTEGER"),
+    ] {
+        if !has("shows", col)? {
+            conn.execute_batch(&format!("ALTER TABLE shows ADD COLUMN {col} {ty};"))?;
+        }
     }
     if !has("seasons", "title")? {
         conn.execute_batch("ALTER TABLE seasons ADD COLUMN title TEXT;")?;
@@ -247,6 +266,8 @@ fn row_to_root(r: &rusqlite::Row) -> rusqlite::Result<Root> {
 }
 
 const DISPLAY_TITLE_SQL: &str = "COALESCE(user_title_override, canonical_title, parsed_title)";
+const SHOW_ID_QUERY: &str =
+    "SELECT se.show_id FROM episodes e JOIN seasons se ON e.season_id = se.id WHERE ";
 
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
@@ -564,8 +585,25 @@ impl Db {
     }
 
     pub fn show_id_for_path(&self, path: &str) -> Result<Option<i64>> {
-        self.with(|c| Ok(c.query_row(
-            "SELECT se.show_id FROM episodes e JOIN seasons se ON e.season_id = se.id WHERE e.path = ?1", params![path], |r| r.get(0)).optional()?))
+        self.with(|c| {
+            Ok(c.query_row(
+                &format!("{SHOW_ID_QUERY} e.path = ?1"),
+                params![path],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+    }
+
+    pub fn show_id_for_episode(&self, episode_id: i64) -> Result<Option<i64>> {
+        self.with(|c| {
+            Ok(c.query_row(
+                &format!("{SHOW_ID_QUERY} e.id = ?1"),
+                params![episode_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
     }
 
     /// (path, show parsed_title, season number, episode number) for files directly inside `folder`.
@@ -720,6 +758,58 @@ impl Db {
             c.execute("UPDATE episodes SET position_secs=?2, duration_secs=COALESCE(?3, duration_secs), last_played_at=?4 WHERE id=?1",
                 params![id, position_secs, duration_secs, now()])?;
             Ok(())
+        })
+    }
+
+    /// The show's last recorded mpv state, or None if it has never been played since this was
+    /// added. A NULL `player_volume` is the unrecorded marker, so an untouched show keeps mpv's
+    /// own defaults rather than being forced to some stored value.
+    pub fn show_player_state(&self, show_id: i64) -> Result<Option<ShowPlayerState>> {
+        self.with(|c| {
+            let row = c
+                .query_row(
+                    "SELECT player_volume, window_width, window_height, window_maximized, window_fullscreen
+                     FROM shows WHERE id = ?1",
+                    params![show_id],
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<f64>>(0)?,
+                            r.get::<_, Option<i64>>(1)?,
+                            r.get::<_, Option<i64>>(2)?,
+                            r.get::<_, Option<i64>>(3)?,
+                            r.get::<_, Option<i64>>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            Ok(match row {
+                Some((Some(volume), w, h, max, full)) => Some(ShowPlayerState {
+                    volume,
+                    window_width: w,
+                    window_height: h,
+                    window_maximized: max.unwrap_or(0) != 0,
+                    window_fullscreen: full.unwrap_or(0) != 0,
+                }),
+                _ => None,
+            })
+        })
+    }
+
+    pub fn set_show_player_state(&self, show_id: i64, s: &ShowPlayerState) -> Result<bool> {
+        self.with(|c| {
+            let updated = c.execute(
+                "UPDATE shows SET player_volume=?2, window_width=?3, window_height=?4,
+                 window_maximized=?5, window_fullscreen=?6 WHERE id=?1",
+                params![
+                    show_id,
+                    s.volume,
+                    s.window_width,
+                    s.window_height,
+                    s.window_maximized as i64,
+                    s.window_fullscreen as i64
+                ],
+            )?;
+            Ok(updated > 0)
         })
     }
 
@@ -918,6 +1008,18 @@ impl Db {
                          SELECT ?1, save_path, category FROM torrent_prefs WHERE show_id = ?2",
                         params![keep, loser])?;
                     tx.execute("UPDATE rss_feeds SET show_id = ?1 WHERE show_id = ?2",
+                        params![keep, loser])?;
+                    // Player state is one preference set, not five independent columns, so it
+                    // moves as a unit and only when the survivor has none of its own. Copying
+                    // column by column could mix two shows' volume and window together.
+                    tx.execute(
+                        "UPDATE shows SET
+                           player_volume     = (SELECT player_volume     FROM shows WHERE id = ?2),
+                           window_width      = (SELECT window_width      FROM shows WHERE id = ?2),
+                           window_height     = (SELECT window_height     FROM shows WHERE id = ?2),
+                           window_maximized  = (SELECT window_maximized  FROM shows WHERE id = ?2),
+                           window_fullscreen = (SELECT window_fullscreen FROM shows WHERE id = ?2)
+                         WHERE id = ?1 AND player_volume IS NULL",
                         params![keep, loser])?;
                     tx.execute("DELETE FROM shows WHERE id = ?1", params![loser])?;
                     folded += 1;
@@ -1340,6 +1442,103 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn upgrade_from_v6_recreates_player_state_columns() {
+        // A v6 database predates the per-show player state. Build that exact `shows` shape, roll
+        // the version back and migrate: `CREATE TABLE IF NOT EXISTS` leaves the existing table
+        // alone, so only an ALTER in upgrade() can add the columns the SELECT below needs.
+        // `player_volume` is pre-added to exercise the loop's "column already exists" skip arm;
+        // the row seeded into it proves the skip arm leaves existing data intact. This simulates
+        // a partially-migrated table and must land at v8.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE shows (
+               id INTEGER PRIMARY KEY, parsed_title TEXT NOT NULL UNIQUE,
+               anilist_id INTEGER, canonical_title TEXT, cover_url TEXT, total_episodes INTEGER,
+               user_title_override TEXT, created_at INTEGER NOT NULL,
+               anilist_cleared INTEGER NOT NULL DEFAULT 0, cover_path TEXT, match_source TEXT,
+               player_volume REAL);
+             INSERT INTO shows (id, parsed_title, created_at, player_volume) VALUES (1, 'Legacy', 0, 12.5);
+             PRAGMA user_version = 6;",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let (volume, version): (f64, i64) = conn
+            .query_row(
+                "SELECT player_volume, (SELECT * FROM pragma_user_version) FROM shows WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(volume, 12.5, "the pre-existing column's data must survive");
+        assert_eq!(version, 8);
+        conn.prepare(
+            "SELECT player_volume, window_width, window_height, window_maximized, window_fullscreen FROM shows",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn player_state_roundtrips_per_show() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/a/a1.mkv", 1, 1))
+            .unwrap();
+        db.upsert_episode(&pn("Beta", 1, 1), &rf("/b/b1.mkv", 1, 1))
+            .unwrap();
+        let shows = db.list_shows("", ShowSort::Title).unwrap();
+        let alpha = shows
+            .iter()
+            .find(|s| s.display_title == "Alpha")
+            .unwrap()
+            .id;
+        let beta = shows.iter().find(|s| s.display_title == "Beta").unwrap().id;
+        let ep = db.get_show(alpha).unwrap().seasons[0].episodes[0].id;
+        assert_eq!(db.show_id_for_episode(ep).unwrap(), Some(alpha));
+
+        db.set_show_player_state(
+            alpha,
+            &ShowPlayerState {
+                volume: 42.5,
+                window_width: Some(1600),
+                window_height: Some(900),
+                window_maximized: true,
+                window_fullscreen: false,
+            },
+        )
+        .unwrap();
+
+        let got = db.show_player_state(alpha).unwrap().unwrap();
+        assert_eq!(got.volume, 42.5);
+        assert_eq!(got.window_width, Some(1600));
+        assert_eq!(got.window_height, Some(900));
+        assert!(got.window_maximized);
+        assert!(!got.window_fullscreen);
+        // The other show was never played, so it must stay unrecorded.
+        assert!(db.show_player_state(beta).unwrap().is_none());
+    }
+
+    #[test]
+    fn set_show_player_state_reports_a_missing_show() {
+        let db = Db::open_memory().unwrap();
+        let s = ShowPlayerState {
+            volume: 50.0,
+            window_width: None,
+            window_height: None,
+            window_maximized: false,
+            window_fullscreen: false,
+        };
+        assert!(
+            !db.set_show_player_state(999_999, &s).unwrap(),
+            "an UPDATE that matches no row must report false"
+        );
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/a/a1.mkv", 1, 1))
+            .unwrap();
+        let id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+        assert!(db.set_show_player_state(id, &s).unwrap());
     }
 
     use crate::parser::ParsedName;
@@ -1940,6 +2139,93 @@ mod tests {
             0,
             "running again is a no-op"
         );
+    }
+
+    /// Two shows matched to the same provider id, ready to fold: `big` (2 episodes) survives,
+    /// `small` (1 episode) is folded away.
+    fn folded_pair() -> (Db, i64, i64) {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Bloom Into You", 1, 1), &rf("/a/1.mkv", 1, 1))
+            .unwrap();
+        db.upsert_episode(&pn("Bloom Into You", 1, 2), &rf("/a/2.mkv", 1, 1))
+            .unwrap();
+        db.upsert_episode(&pn("Yagate Kimi ni Naru", 1, 1), &rf("/b/1.mkv", 1, 1))
+            .unwrap();
+        let id = |t: &str| db.list_shows(t, ShowSort::Title).unwrap()[0].id;
+        let (big, small) = (id("Bloom"), id("Yagate"));
+        let hit = |n: &str| MetadataHit {
+            id: 41240,
+            source: "kitsu".into(),
+            title_romaji: n.into(),
+            title_english: None,
+            cover_url: None,
+            episodes: None,
+        };
+        db.set_anilist(big, &hit("Yagate Kimi ni Naru")).unwrap();
+        db.set_anilist(small, &hit("Yagate Kimi ni Naru")).unwrap();
+        (db, big, small)
+    }
+
+    #[test]
+    fn a_fold_keeps_player_state_only_one_row_had() {
+        let (db, big, small) = folded_pair();
+        // Only the row that is about to be folded was ever played, so its saved volume and
+        // window must not disappear with it.
+        db.set_show_player_state(
+            small,
+            &ShowPlayerState {
+                volume: 62.5,
+                window_width: Some(1024),
+                window_height: Some(768),
+                window_maximized: true,
+                window_fullscreen: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+
+        let got = db.show_player_state(big).unwrap().unwrap();
+        assert_eq!(got.volume, 62.5);
+        assert_eq!(got.window_width, Some(1024));
+        assert_eq!(got.window_height, Some(768));
+        assert!(got.window_maximized);
+    }
+
+    #[test]
+    fn a_fold_keeps_the_survivors_own_player_state() {
+        let (db, big, small) = folded_pair();
+        // Both rows have state; the survivor (more episodes) must keep its own.
+        db.set_show_player_state(
+            big,
+            &ShowPlayerState {
+                volume: 11.0,
+                window_width: Some(1920),
+                window_height: Some(1080),
+                window_maximized: true,
+                window_fullscreen: false,
+            },
+        )
+        .unwrap();
+        db.set_show_player_state(
+            small,
+            &ShowPlayerState {
+                volume: 62.5,
+                window_width: Some(1024),
+                window_height: Some(768),
+                window_maximized: false,
+                window_fullscreen: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+
+        let got = db.show_player_state(big).unwrap().unwrap();
+        assert_eq!(got.volume, 11.0, "{got:?}");
+        assert_eq!(got.window_width, Some(1920), "{got:?}");
+        assert!(got.window_maximized);
+        assert!(!got.window_fullscreen);
     }
 
     #[test]
@@ -2552,9 +2838,10 @@ mod tests {
     }
 
     #[test]
-    fn v6_db_upgrades_to_v7_without_data_loss() {
-        // A v6 database predates the three torrent tables. The in-place upgrade must
-        // create them and bump the version without touching shows or episodes.
+    fn v6_db_upgrades_without_data_loss() {
+        // A v6 database predates the three torrent tables and the player-state columns. The
+        // in-place upgrade must create/add both and bump to the current version without
+        // touching shows or episodes.
         let db = Db::open_memory().unwrap();
         db.upsert_episode(&pn("Legacy", 1, 1), &rf("/legacy/01.mkv", 1, 1))
             .unwrap();
@@ -2572,7 +2859,7 @@ mod tests {
         let version: i64 = db
             .with(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         for table in ["torrent_links", "torrent_prefs", "rss_feeds"] {
             let n: i64 = db
                 .with(|c| {
@@ -2591,6 +2878,33 @@ mod tests {
             .unwrap();
         assert_eq!(shows, 1, "the show survives the upgrade");
         assert_eq!(episodes, 1, "the episode survives the upgrade");
+    }
+
+    #[test]
+    fn v7_db_gains_player_state_columns() {
+        // The realistic collision path: a database already migrated by develop's v7 torrent
+        // step has no player-state columns, and must not early-return past the v7 -> v8 ALTERs.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE shows (
+               id INTEGER PRIMARY KEY, parsed_title TEXT NOT NULL UNIQUE,
+               anilist_id INTEGER, canonical_title TEXT, cover_url TEXT, total_episodes INTEGER,
+               user_title_override TEXT, created_at INTEGER NOT NULL,
+               anilist_cleared INTEGER NOT NULL DEFAULT 0, cover_path TEXT, match_source TEXT);
+             PRAGMA user_version = 7;",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 8, "a v7 database advances to v8");
+        conn.prepare(
+            "SELECT player_volume, window_width, window_height, window_maximized, window_fullscreen FROM shows",
+        )
+        .unwrap();
     }
 
     #[test]
