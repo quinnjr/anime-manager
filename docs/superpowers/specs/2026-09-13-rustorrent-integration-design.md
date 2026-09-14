@@ -76,7 +76,7 @@ commands.
   `Set-Cookie` value in process memory, resend as `Cookie`; re-login
   transparently on 401 using the stored password. No cookie-jar crate;
   manual header handling keeps new dependencies at zero here.
-- rustorrent mDNS carries completion announcements only, no persistent server advertisement — browse candidates are opportunistic (recently-active instances); manual URL is the primary path.
+- rustorrent advertises the server persistently (`server-<instance>` instance, TXT `kind=server` carrying host/port/version) under `_rustorrent._tcp.local.`, so `torrent_discover` is reliable; manual URL remains the fallback. Requires a rustorrent build with the server advertisement (quinnjr/rustorrent#25) — and the `enable_addr_auto` fix (quinnjr/rustorrent#26) is required for *any* mdns-sd service to be published at all, completions included. Verified live: discovery resolves `http://192.168.1.15:8085` from the NAS.
 
 ## Path mapping (NAS)
 
