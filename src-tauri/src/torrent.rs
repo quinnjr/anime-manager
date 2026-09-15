@@ -2,8 +2,8 @@ use crate::db::Db;
 use crate::error::{AppError, Result};
 use crate::http::{read_capped, send_with_retry, snippet};
 use crate::models::{
-    LinkedTo, LinkedTorrent, RssFeedConfig, RssFeedView, ShowSort, TorrentDetail, TorrentFile,
-    TorrentInfo,
+    LinkedBatch, LinkedTo, LinkedTorrent, RssFeedConfig, RssFeedView, ShowSort, TorrentDetail,
+    TorrentFile, TorrentInfo,
 };
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -460,11 +460,12 @@ impl TorrentClient {
     }
 
     /// Resolve each torrent to the episode it belongs to, for the Downloads
-    /// view. The add-time pin (`torrent_links`) wins; anything without a pin
-    /// is backfilled by joining the torrent's `save_path` + `files[]`
-    /// against episode paths. Pure query: writes nothing. One failing
-    /// torrent (gone from the server, unreachable detail) resolves to
-    /// `linked: None` and never fails the list.
+    /// view. The add-time pin (`torrent_links`) wins; a pack pin
+    /// (`torrent_batches`) covers a range and is reported alongside;
+    /// anything with neither is backfilled by joining the torrent's
+    /// `save_path` + `files[]` against episode paths. Pure query: writes
+    /// nothing. One failing torrent (gone from the server, unreachable
+    /// detail) resolves to `linked: None` and never fails the list.
     pub async fn attribute(&self, db: &Db, torrents: Vec<TorrentInfo>) -> Vec<LinkedTorrent> {
         let mut index: Option<Vec<(i64, u32, u32, String)>> = None;
         // The NAS map is stored, so read it once here — never per torrent —
@@ -506,7 +507,25 @@ impl TorrentClient {
                     None
                 }
             };
-            out.push(LinkedTorrent { info, linked });
+            // Pack pins never shadow single pins and never backfill: the
+            // range names its episodes directly, and a read failure resolves
+            // to no badge rather than a wrong one.
+            let batch = match db.batch_link(&info.info_hash) {
+                Ok(b) => b.map(|link| LinkedBatch {
+                    show_id: link.show_id,
+                    season: link.season,
+                    first: link.first,
+                    last: link.last,
+                }),
+                Err(e) => {
+                    eprintln!(
+                        "torrent attribute: batch lookup failed for {}: {e}",
+                        info.info_hash
+                    );
+                    None
+                }
+            };
+            out.push(LinkedTorrent { info, linked, batch });
         }
         out
     }

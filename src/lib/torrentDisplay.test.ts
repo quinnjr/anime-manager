@@ -36,6 +36,11 @@ describe('torrentBadge', () => {
     expect(torrentBadge({ status: 'Checking', progress: 0.5, linked: null }))
       .toBe('checking');
   });
+
+  it('names the pack range when the row is batch-linked', () => {
+    expect(torrentBadge({ progress: 0.31, linked: null, batch: { show_id: 1, season: 1, first: 1, last: 12 } }))
+      .toBe('downloading 31% · S1E1–E12 batch');
+  });
 });
 
 describe('sendButtonState', () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { WantedHit } from '$lib/api';
-import { formatSize, summariseWanted } from './nyaaDisplay';
+import type { SourceComparison, WantedHit } from '$lib/api';
+import { formatSize, formatSourceComparison, parseBatchRange, summariseWanted } from './nyaaDisplay';
 
 const hit = (title: string): WantedHit => ({
   title,
@@ -48,5 +48,47 @@ describe('summariseWanted', () => {
 
   it('is has-hits when strict is empty but alts exist', () => {
     expect(summariseWanted([{ hits: [], alts: [hit('y')] }])).toBe('has-hits');
+  });
+});
+
+describe('parseBatchRange', () => {
+  it('reads parenthesised ranges', () => {
+    expect(parseBatchRange('[HorribleSubs] Konohana Kitan (01-12) [1080p] (Unofficial Batch)')).toEqual({ first: 1, last: 12 });
+  });
+
+  it('reads tilde ranges', () => {
+    expect(parseBatchRange('[Erai-raws] Konohana Kitan - 01~12 [1080p][Multiple Subtitle]')).toEqual({ first: 1, last: 12 });
+  });
+
+  it('rejects singles and quality tags', () => {
+    expect(parseBatchRange('[SubGroup] Show - 06 [1080p]')).toBeNull();
+    expect(parseBatchRange('Show - 06-1080p')).toBeNull();
+  });
+});
+
+const comparison = (over: Partial<SourceComparison> = {}): SourceComparison => ({
+  rows: [
+    { resolution: '1080p', singles: 0, singles_seeders: 0, batches: 1, best_batch_seeders: 16, best_batch_title: '[G] Show (01-12) [1080p]', best_batch_torrent_url: 'https://nyaa.si/download/1.torrent', best_batch_info_hash: null },
+    { resolution: '720p', singles: 2, singles_seeders: 3, batches: 1, best_batch_seeders: 3, best_batch_title: null, best_batch_torrent_url: null, best_batch_info_hash: null },
+  ],
+  ...over,
+});
+
+describe('formatSourceComparison', () => {
+  it('ranks 1080p first with its batch seeders', () => {
+    expect(formatSourceComparison(comparison())).toBe(
+      '1080p · 16 seeds · batch — 720p · 3 seeds · batch (3)'
+    );
+  });
+
+  it('notes a resolution with no batch', () => {
+    const c = comparison({
+      rows: [{ resolution: '480p', singles: 1, singles_seeders: 0, batches: 0, best_batch_seeders: 0, best_batch_title: null }],
+    });
+    expect(formatSourceComparison(c)).toBe('480p · 0 seeds · no batch');
+  });
+
+  it('is empty with no rows', () => {
+    expect(formatSourceComparison(comparison({ rows: [] }))).toBe('no sources compared');
   });
 });

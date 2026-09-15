@@ -89,13 +89,20 @@ CREATE TABLE IF NOT EXISTS torrent_prefs (
 CREATE TABLE IF NOT EXISTS rss_feeds (
   label TEXT PRIMARY KEY, show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
   added_at INTEGER NOT NULL);
+-- Season-pack pins (schema v9). One row per batch, unlike torrent_links'
+-- one row per episode: a pack's single info_hash covers first..=last.
+CREATE TABLE IF NOT EXISTS torrent_batches (
+  info_hash TEXT PRIMARY KEY,
+  show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
+  season INTEGER NOT NULL, first INTEGER NOT NULL, last INTEGER NOT NULL,
+  resolution TEXT, added_at INTEGER NOT NULL);
 "#;
 
 // v7 belongs to the torrent migration already merged on develop (torrent_links, torrent_prefs,
 // rss_feeds, gated on `v < 7`). This migration must not reuse it: a v7 database would hit the
 // early return above, never add the player-state columns, and break playback with
 // "no such column: player_volume". This is the v7 -> v8 step on top of develop.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// Bring an existing database up to `SCHEMA_VERSION`. Fresh databases get the current shape
 /// from SCHEMA directly; older ones are altered in place so no user data is lost.
@@ -172,6 +179,17 @@ fn upgrade(conn: &Connection) -> Result<()> {
              CREATE TABLE IF NOT EXISTS rss_feeds (
                label TEXT PRIMARY KEY, show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
                added_at INTEGER NOT NULL);",
+        )?;
+    }
+    // v9 is additive (a new table), so older databases only need the CREATE;
+    // single-episode pins and everything else are untouched.
+    if v < 9 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS torrent_batches (
+               info_hash TEXT PRIMARY KEY,
+               show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
+               season INTEGER NOT NULL, first INTEGER NOT NULL, last INTEGER NOT NULL,
+               resolution TEXT, added_at INTEGER NOT NULL);",
         )?;
     }
     // rename_log's foreign key cannot be altered in place; rebuild the table when it still
@@ -1197,6 +1215,34 @@ impl Db {
         })
     }
 
+    /// Pin a season pack: one info_hash covering `first..=last` of a season.
+    /// Keyed by show_id like single pins, never by title strings.
+    pub fn add_batch_link(&self, batch: &TorrentBatch) -> Result<()> {
+        let info_hash = normalize_hash(&batch.info_hash);
+        self.with(|c| {
+            c.execute("INSERT OR REPLACE INTO torrent_batches(info_hash, show_id, season, first, last, resolution, added_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![info_hash, batch.show_id, batch.season, batch.first, batch.last, batch.resolution, batch.added_at])?;
+            Ok(())
+        })
+    }
+
+    pub fn batch_link(&self, info_hash: &str) -> Result<Option<TorrentBatch>> {
+        let info_hash = normalize_hash(info_hash);
+        self.with(|c| Ok(c.query_row(
+            "SELECT info_hash, show_id, season, first, last, resolution, added_at FROM torrent_batches WHERE info_hash = ?1", params![info_hash],
+            |r| Ok(TorrentBatch { info_hash: r.get(0)?, show_id: r.get(1)?, season: r.get::<_, i64>(2)? as u32, first: r.get::<_, i64>(3)? as u32, last: r.get::<_, i64>(4)? as u32, resolution: r.get(5)?, added_at: r.get(6)? }))
+            .optional()?))
+    }
+
+    /// Forget a pack pin after its torrent leaves the server.
+    pub fn remove_batch_link(&self, info_hash: &str) -> Result<()> {
+        let info_hash = normalize_hash(info_hash);
+        self.with(|c| {
+            c.execute("DELETE FROM torrent_batches WHERE info_hash = ?1", params![info_hash])?;
+            Ok(())
+        })
+    }
+
     /// A show's save path and category. A show with no row yet reports defaults rather
     /// than an error, so callers never special-case "never configured".
     pub fn get_prefs(&self, show_id: i64) -> Result<TorrentPrefs> {
@@ -1451,7 +1497,7 @@ mod tests {
         // alone, so only an ALTER in upgrade() can add the columns the SELECT below needs.
         // `player_volume` is pre-added to exercise the loop's "column already exists" skip arm;
         // the row seeded into it proves the skip arm leaves existing data intact. This simulates
-        // a partially-migrated table and must land at v8.
+        // a partially-migrated table and must land at the current version.
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE shows (
@@ -1475,7 +1521,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(volume, 12.5, "the pre-existing column's data must survive");
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         conn.prepare(
             "SELECT player_volume, window_width, window_height, window_maximized, window_fullscreen FROM shows",
         )
@@ -2838,6 +2884,57 @@ mod tests {
     }
 
     #[test]
+    fn batch_links_round_trip() {
+        let db = Db::open_memory().unwrap();
+        let show_id: i64 = db.with(|c| {
+            c.execute("INSERT INTO shows (parsed_title, created_at) VALUES ('t', 0)", [])?;
+            Ok(c.last_insert_rowid())
+        }).unwrap();
+        db.add_batch_link(&TorrentBatch {
+            info_hash: "  ABC123 ".into(), show_id, season: 1,
+            first: 1, last: 12, resolution: Some("1080p".into()), added_at: 0,
+        }).unwrap();
+        let got = db.batch_link("abc123").unwrap().expect("batch stored");
+        assert_eq!(got.info_hash, "abc123", "hash normalized on write");
+        assert_eq!((got.first, got.last), (1, 12));
+        assert_eq!(got.resolution.as_deref(), Some("1080p"));
+        assert!(db.batch_link("nope").unwrap().is_none());
+        db.remove_batch_link("ABC123").unwrap();
+        assert!(db.batch_link("abc123").unwrap().is_none());
+    }
+
+    #[test]
+    fn v8_db_upgrades_to_v9_with_batch_table() {
+        // A v8 database predates torrent_batches. Dropping the table and
+        // rolling the version back must recreate it on migrate, keep the
+        // single-episode pins, and land at v9.
+        let db = Db::open_memory().unwrap();
+        let show_id: i64 = db.with(|c| {
+            c.execute("INSERT INTO shows (parsed_title, created_at) VALUES ('t', 0)", [])?;
+            Ok(c.last_insert_rowid())
+        }).unwrap();
+        db.add_torrent_link(&TorrentLink {
+            info_hash: "aaa".into(), show_id, season: 1, number: 6, added_at: 0,
+        }).unwrap();
+        db.with(|c| {
+            c.execute_batch("DROP TABLE torrent_batches; PRAGMA user_version = 8;")?;
+            Ok(())
+        })
+        .unwrap();
+        db.with(migrate).unwrap();
+        let version: i64 = db
+            .with(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(version, 9);
+        assert!(db.torrent_link("aaa").unwrap().is_some(), "single pins survive");
+        db.add_batch_link(&TorrentBatch {
+            info_hash: "bbb".into(), show_id, season: 1,
+            first: 1, last: 12, resolution: None, added_at: 0,
+        }).unwrap();
+        assert_eq!(db.batch_link("bbb").unwrap().expect("batch stored").last, 12);
+    }
+
+    #[test]
     fn v6_db_upgrades_without_data_loss() {
         // A v6 database predates the three torrent tables and the player-state columns. The
         // in-place upgrade must create/add both and bump to the current version without
@@ -2859,8 +2956,8 @@ mod tests {
         let version: i64 = db
             .with(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?))
             .unwrap();
-        assert_eq!(version, 8);
-        for table in ["torrent_links", "torrent_prefs", "rss_feeds"] {
+        assert_eq!(version, 9);
+        for table in ["torrent_links", "torrent_prefs", "rss_feeds", "torrent_batches"] {
             let n: i64 = db
                 .with(|c| {
                     Ok(c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?)
@@ -2900,7 +2997,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8, "a v7 database advances to v8");
+        assert_eq!(version, 9, "a v7 database advances to the current version");
         conn.prepare(
             "SELECT player_volume, window_width, window_height, window_maximized, window_fullscreen FROM shows",
         )

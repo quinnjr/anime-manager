@@ -145,9 +145,10 @@ fn validate_torrent_url(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Pin a resolved hash to its episode and announce the change. The pin is local
-/// bookkeeping: a write failure is logged and still reported as success, because
-/// the server-side state is already correct.
+/// Pin a resolved hash to its episode — or to a season-pack range when `batch`
+/// is present — and announce the change. The pin is local bookkeeping: a
+/// write failure is logged and still reported as success, because the
+/// server-side state is already correct.
 fn link_and_report(
     app: &AppHandle,
     db: &Db,
@@ -155,8 +156,21 @@ fn link_and_report(
     show_id: i64,
     season: u32,
     number: u32,
+    batch: Option<&BatchRangeArg>,
 ) -> String {
-    if let Err(e) = db.add_torrent_link(&TorrentLink {
+    if let Some(range) = batch {
+        if let Err(e) = db.add_batch_link(&TorrentBatch {
+            info_hash: hash.clone(),
+            show_id,
+            season,
+            first: range.first,
+            last: range.last,
+            resolution: range.resolution.clone(),
+            added_at: db::now(),
+        }) {
+            eprintln!("torrent_add: batch not recorded for {hash}: {e}");
+        }
+    } else if let Err(e) = db.add_torrent_link(&TorrentLink {
         info_hash: hash.clone(),
         show_id,
         season,
@@ -184,6 +198,7 @@ async fn apply_control(
         let key = info_hash.trim().to_lowercase();
         if !key.is_empty() {
             db.remove_torrent_link(&key)?;
+            db.remove_batch_link(&key)?;
         }
     }
     Ok(())
@@ -232,6 +247,7 @@ pub async fn torrent_add(
         number,
         save_path,
         category,
+        batch,
     } = args;
     require_torrent_armed(&state.db)?;
     let client = torrent::TorrentClient::from_db(&state.db)?;
@@ -241,7 +257,7 @@ pub async fn torrent_add(
     // duplicate add can never follow. Pins are only (re-)written here.
     let list = client.list().await?;
     if let Some(hash) = server_has_hash(&list, given.as_deref()) {
-        return Ok(link_and_report(&app, &state.db, hash, show_id, season, number));
+        return Ok(link_and_report(&app, &state.db, hash, show_id, season, number, batch.as_ref()));
     }
     let url = clean(torrent_url).ok_or_else(|| {
         crate::error::AppError::Parse("no .torrent URL to send".into())
@@ -258,7 +274,7 @@ pub async fn torrent_add(
         && let Some(derived) = torrent::info_hash_of_torrent(&bytes)
         && let Some(found) = server_has_hash(&list, Some(&derived))
     {
-        return Ok(link_and_report(&app, &state.db, found, show_id, season, number));
+        return Ok(link_and_report(&app, &state.db, found, show_id, season, number, batch.as_ref()));
     }
     let filename = url
         .rsplit('/')
@@ -302,7 +318,7 @@ pub async fn torrent_add(
         );
     }
     // The server add already succeeded; losing the local pin must not report failure.
-    Ok(link_and_report(&app, &state.db, hash, show_id, season, number))
+    Ok(link_and_report(&app, &state.db, hash, show_id, season, number, batch.as_ref()))
 }
 
 /// Start / pause / recheck / remove one torrent.
