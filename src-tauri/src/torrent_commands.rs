@@ -180,6 +180,18 @@ async fn apply_control(
     Ok(())
 }
 
+/// Start a freshly added torrent so it announces regardless of the server's
+/// own `auto_start` setting. Returns `None` on success, `Some(message)` when
+/// the start failed — the add itself already succeeded, so the caller reports
+/// success and surfaces the message separately. Split from the command so the
+/// ordering is unit-testable without a Tauri `State` (cf. `apply_control`).
+async fn start_after_add(client: &torrent::TorrentClient, hash: &str) -> Option<String> {
+    match client.control(hash, &torrent::ControlOp::Start).await {
+        Ok(()) => None,
+        Err(e) => Some(e.to_string()),
+    }
+}
+
 /// Whether two connection snapshots are the same. `torrent_test` arms the flag
 /// only when the URL and password are unchanged across the round trip, so a
 /// settings edit mid-test cannot arm a config that was never tested.
@@ -264,6 +276,22 @@ pub async fn torrent_add(
     let hash = client
         .add_torrent_mapped(bytes, &filename, &dest, &cat, &map)
         .await?;
+    // The server only auto-starts when its own `auto_start` setting is on; an
+    // add that lands paused would otherwise sit queued forever and never
+    // announce. Start explicitly (idempotent on an already-running torrent).
+    if let Some(msg) = start_after_add(&client, &hash).await {
+        // The server add already succeeded, so this stays a success — but a
+        // torrent that never started is indistinguishable from a working one,
+        // and stderr is discarded in the packaged app, so say so out loud
+        // through the global `error` event the frontend already toasts.
+        eprintln!("torrent_add: start after add failed for {hash}: {msg}");
+        let _ = app.emit(
+            "error",
+            crate::error::AppError::Network(format!(
+                "Added to rustorrent but failed to start ({msg}) — start it from Downloads"
+            )),
+        );
+    }
     // The server add already succeeded; losing the local pin must not report failure.
     Ok(link_and_report(&app, &state.db, hash, show_id, season, number))
 }
@@ -624,5 +652,36 @@ mod tests {
             .is_err()
         );
         assert!(db2.torrent_link("abc123").unwrap().is_some(), "failed remove keeps the pin");
+    }
+
+    #[tokio::test]
+    async fn start_after_add_posts_start_and_reports_outcome() {
+        // Success: the start is issued exactly once and reports no error.
+        let ok = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/torrents/abc123/start"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&ok)
+            .await;
+        let client = torrent::TorrentClient::new(ok.uri(), None);
+        assert_eq!(start_after_add(&client, "abc123").await, None);
+
+        // Failure: the start is still attempted exactly once, and its message
+        // comes back so the caller can surface it instead of a silent success.
+        // (400, not 500: the retry ladder re-sends 429/5xx, so a 500 would
+        // arrive three times and `expect(1)` would lie about the call count.)
+        let bad = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/torrents/abc123/start"))
+            .respond_with(wiremock::ResponseTemplate::new(400))
+            .expect(1)
+            .mount(&bad)
+            .await;
+        let client2 = torrent::TorrentClient::new(bad.uri(), None);
+        let msg = start_after_add(&client2, "abc123")
+            .await
+            .expect("failed start reports its message");
+        assert!(msg.contains("400"), "names the failure: {msg}");
     }
 }
