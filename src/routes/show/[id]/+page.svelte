@@ -35,7 +35,7 @@
   let saveDraft = $state('');
   let catDraft = $state('');
   let prefsSaving = $state(false);
-  let sendingKey = $state<string | null>(null);
+  let sendingKeys = $state<Set<string>>(new Set());
   let busyHash = $state<string | null>(null);
   let followBusy = $state(false);
   let followResult = $state<RssSubscribeResult | null>(null);
@@ -101,10 +101,9 @@
     } catch (e) { toasts.error(e); } finally { prefsSaving = false; }
   }
 
-  async function send(season: number, number: number, hit: WantedHit) {
+  async function send(season: number, number: number, hit: WantedHit, key: string) {
     if (!show || !hit.torrent_url) return;
-    const key = `${season}:${number}`;
-    sendingKey = key;
+    sendingKeys.add(key);
     try {
       await api.torrentAdd({
         torrentUrl: hit.torrent_url, infoHash: hit.info_hash ?? null,
@@ -113,7 +112,7 @@
       });
       toasts.push('success', `Sent S${season}E${number} to rustorrent.`);
       await loadTorrentState();
-    } catch (e) { toasts.error(e); } finally { if (sendingKey === key) sendingKey = null; }
+    } catch (e) { toasts.error(e); } finally { sendingKeys.delete(key); }
   }
 
   async function control(t: TorrentEntry, op: TorrentControlOp) {
@@ -268,7 +267,7 @@
     finding = false;
     torrents = [];
     prefs = null;
-    sendingKey = null;
+    sendingKeys.clear();
     busyHash = null;
     followBusy = false;
     prefsSaving = false;
@@ -419,31 +418,50 @@
       {#if wanted.length === 0}
         <p class="tag">No missing episodes — the owned range has no gaps.</p>
       {:else}
-        <ul class="flex flex-col gap-2">
+        <ul class="flex flex-col gap-3">
           {#each wanted as w (w.season + ':' + w.number)}
-            {@const best = w.hits[0] as WantedHit | undefined}
-            {@const t = best ? torrentFor(w.season, w.number, best.info_hash) : undefined}
-            {@const st = best ? sendButtonState({ torrent_url: best.torrent_url ?? null, linked: t?.linked ?? null, progress: t?.progress ?? null }) : 'unavailable'}
-            {@const key = w.season + ':' + w.number}
-            <li class="flex flex-wrap items-center gap-x-3 gap-y-1">
-              <span class="tag-chip shrink-0">S{w.season}E{w.number}</span>
-              {#if best}
-                <span class="min-w-0 flex-1 truncate">{best.title}</span>
-                <span class="tag shrink-0">{formatSize(best.size_bytes)} · {best.seeders} seeder{best.seeders === 1 ? '' : 's'}</span>
-                <button class="btn shrink-0" onclick={() => void openPage(best.page_url)}>Nyaa page</button>
-                {#if st === 'send'}
-                  <button class="btn btn-key shrink-0" disabled={sendingKey === key}
-                    title="Download the .torrent and add it to rustorrent"
-                    onclick={() => void send(w.season, w.number, best)}>
-                    {sendingKey === key ? 'Sending…' : 'Send to rustorrent'}
-                  </button>
-                {:else if t && (st === 'downloading' || st === 'seeding')}
-                  <div class="w-full">
-                    <TorrentRow entry={t} busy={busyHash === t.info_hash} onControl={(op) => void control(t, op)} />
-                  </div>
-                {/if}
+            {@const epTorrent = torrentFor(w.season, w.number, undefined)}
+            {@const epKey = w.season + ':' + w.number}
+            <li class="flex flex-col gap-1">
+              <span class="tag-chip w-fit shrink-0">S{w.season}E{w.number}</span>
+              {#snippet hitRow(hit: WantedHit, key: string)}
+                {@const t = torrentFor(w.season, w.number, hit.info_hash)}
+                {@const st = sendButtonState({ torrent_url: hit.torrent_url ?? null, linked: t?.linked ?? null, progress: t?.progress ?? null })}
+                <li class="flex flex-wrap items-center gap-x-3 gap-y-1">
+                  <span class="min-w-0 flex-1 truncate">{hit.title}</span>
+                  <span class="tag shrink-0">{formatSize(hit.size_bytes)} · {hit.seeders} seeder{hit.seeders === 1 ? '' : 's'}</span>
+                  <button class="btn shrink-0" onclick={() => void openPage(hit.page_url)}>Nyaa page</button>
+                  {#if st === 'send'}
+                    <button class="btn btn-key shrink-0" disabled={sendingKeys.has(key)}
+                      title="Download the .torrent and add it to rustorrent"
+                      onclick={() => void send(w.season, w.number, hit, key)}>
+                      {sendingKeys.has(key) ? 'Sending…' : 'Send to rustorrent'}
+                    </button>
+                  {/if}
+                </li>
+              {/snippet}
+              {#if w.hits.length > 0}
+                <ul class="flex flex-col gap-1">
+                  {#each w.hits as hit, i (hit.page_url)}
+                    {@const key = epKey + ':' + i}
+                    {@render hitRow(hit, key)}
+                  {/each}
+                </ul>
+              {:else if (w.alts ?? []).length > 0}
+                <span class="tag">no strict match — other releases (different group/quality):</span>
+                <ul class="flex flex-col gap-1">
+                  {#each (w.alts ?? []) as hit, i (hit.page_url)}
+                    {@const key = epKey + ':alt:' + i}
+                    {@render hitRow(hit, key)}
+                  {/each}
+                </ul>
               {:else}
                 <span class="tag">no strict match</span>
+              {/if}
+              {#if epTorrent}
+                <div class="w-full">
+                  <TorrentRow entry={epTorrent} busy={busyHash === epTorrent.info_hash} onControl={(op) => void control(epTorrent, op)} />
+                </div>
               {/if}
             </li>
           {/each}

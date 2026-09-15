@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'vitest';
+import type { WantedHit } from '$lib/api';
 import { formatSize, summariseWanted } from './nyaaDisplay';
+
+const hit = (title: string): WantedHit => ({
+  title,
+  page_url: 'https://nyaa.si/view/1',
+  size_bytes: 1,
+  seeders: 1,
+  torrent_url: null,
+  info_hash: null,
+});
 
 describe('formatSize', () => {
   it('renders bytes below 1 KiB', () => {
@@ -29,10 +39,14 @@ describe('summariseWanted', () => {
   });
 
   it('is no-hits when every episode has no hits', () => {
-    expect(summariseWanted([{ hits: [] }, { hits: [] }])).toBe('no-hits');
+    expect(summariseWanted([{ hits: [], alts: [] }, { hits: [], alts: [] }])).toBe('no-hits');
   });
 
   it('is has-hits when any episode has hits', () => {
-    expect(summariseWanted([{ hits: [] }, { hits: [{ title: 'x' }] }])).toBe('has-hits');
+    expect(summariseWanted([{ hits: [], alts: [] }, { hits: [hit('x')], alts: [] }])).toBe('has-hits');
+  });
+
+  it('is has-hits when strict is empty but alts exist', () => {
+    expect(summariseWanted([{ hits: [], alts: [hit('y')] }])).toBe('has-hits');
   });
 });
