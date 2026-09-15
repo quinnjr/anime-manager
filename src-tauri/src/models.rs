@@ -142,6 +142,8 @@ pub enum ShowSort {
     RecentlyAdded,
     /// Newest file on disk first: what the downloader brought in.
     RecentlyUpdated,
+    /// Most recently downloaded via torrent first (pin time in torrent_links/torrent_batches).
+    RecentlyDownloaded,
 }
 
 impl ShowSort {
@@ -163,6 +165,11 @@ impl ShowSort {
             Self::RecentlyUpdated => {
                 format!("(SELECT MAX(e.mtime) {episodes_of}) DESC, {dt} COLLATE NOCASE ASC")
             }
+            // Pin time, not finish time: pins record when added via the app.
+            // Empty union yields NULL, so shows with no pins sort last under DESC.
+            Self::RecentlyDownloaded => format!(
+                "(SELECT MAX(added_at) FROM (SELECT added_at FROM torrent_links WHERE show_id = s.id UNION ALL SELECT added_at FROM torrent_batches WHERE show_id = s.id)) DESC, {dt} COLLATE NOCASE ASC"
+            )
         }
     }
 }

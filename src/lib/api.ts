@@ -17,7 +17,7 @@ export interface ShowDetail {
   cover_url: string | null; cover_path: string | null; total_episodes: number | null;
   user_title_override: string | null; seasons: SeasonDetail[];
 }
-export type ShowSort = 'title' | 'unwatched' | 'last-played' | 'recently-added' | 'recently-updated';
+export type ShowSort = 'title' | 'unwatched' | 'last-played' | 'recently-added' | 'recently-updated' | 'recently-downloaded';
 
 /** Label for each ordering, phrased as what the reader gets rather than which column it uses. */
 export const SHOW_SORTS: { value: ShowSort; label: string }[] = [
@@ -25,7 +25,8 @@ export const SHOW_SORTS: { value: ShowSort; label: string }[] = [
   { value: 'unwatched', label: 'Most unwatched' },
   { value: 'last-played', label: 'Recently played' },
   { value: 'recently-added', label: 'Recently added' },
-  { value: 'recently-updated', label: 'Newest files' }
+  { value: 'recently-updated', label: 'Newest files' },
+  { value: 'recently-downloaded', label: 'Recently added torrents' }
 ];
 
 export interface ShowCard { id: number; display_title: string; cover_url: string | null; cover_path: string | null; episode_count: number; unwatched_count: number }
