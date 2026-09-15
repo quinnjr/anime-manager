@@ -6,7 +6,7 @@ vi.mock('@tauri-apps/api/core', () => ({
   invoke: (...args: unknown[]) => invokeMock(...args)
 }));
 
-const { api, SHOW_SORTS } = await import('./api');
+const { api, SHOW_SORTS, LIBRARY_SORT_KEY } = await import('./api');
 
 describe('findMissing api', () => {
   it('calls find_missing with the show id', async () => {
@@ -18,6 +18,7 @@ describe('findMissing api', () => {
 
 describe('library sorts', () => {
   it('includes recently-downloaded with unique values', () => {
+    expect(LIBRARY_SORT_KEY).toBe('library_sort');
     expect(SHOW_SORTS.some((s) => s.value === 'recently-downloaded')).toBe(true);
     // The sort measures torrent pin time, not byte-complete time, so the label
     // must not promise a download it cannot see (e.g. torrents added outside the app).

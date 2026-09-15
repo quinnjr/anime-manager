@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, onEvent, SHOW_SORTS, type ShowCard as ShowCardT, type ShowSort } from '$lib/api';
+  import { api, onEvent, SHOW_SORTS, LIBRARY_SORT_KEY, type ShowCard as ShowCardT, type ShowSort } from '$lib/api';
   import { isTypingTarget } from '$lib/keys';
   import { toasts } from '$lib/stores/toasts.svelte';
   import { saveShelfScroll, restoreAfterLoad } from '$lib/shelfScroll';
@@ -35,16 +35,18 @@
   }
 
   // The chosen order is worth remembering; re-picking it every launch is pure friction.
+  // The ordering applies immediately, but if the save fails the next mount falls
+  // back to title — say so instead of letting the choice silently evaporate.
   async function changeSort(next: ShowSort) {
     sort = next;
     load();
-    try { await api.setSetting('library_sort', next); } catch { /* ordering still applied */ }
+    try { await api.setSetting(LIBRARY_SORT_KEY, next); } catch (e) { toasts.error(e); }
   }
 
   onMount(() => {
     api.getSettings()
       .then((s) => {
-        const saved = s.library_sort as ShowSort | undefined;
+        const saved = s[LIBRARY_SORT_KEY] as ShowSort | undefined;
         if (saved && SHOW_SORTS.some((o) => o.value === saved)) sort = saved;
       })
       .catch(() => {})
