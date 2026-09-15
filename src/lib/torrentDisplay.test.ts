@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { formatEta, formatSpeed, isSavePathInsideRoots, sendButtonState, torrentBadge } from './torrentDisplay';
+import type { TorrentEntry } from '$lib/api';
+import { batchSendKey, formatEta, formatSpeed, isSavePathInsideRoots, matchBatch, sendButtonState, torrentBadge } from './torrentDisplay';
 
 describe('torrentBadge', () => {
   it('shows download progress with the linked episode', () => {
@@ -41,6 +42,41 @@ describe('torrentBadge', () => {
     expect(torrentBadge({ progress: 0.31, linked: null, batch: { show_id: 1, season: 1, first: 1, last: 12 } }))
       .toBe('downloading 31% · S1E1–E12 batch');
   });
+
+  it('prefers the single pin when both pins are present', () => {
+    expect(torrentBadge({
+      progress: 0.5, linked: { show_id: 1, season: 1, number: 6 },
+      batch: { show_id: 1, season: 1, first: 1, last: 12 },
+    })).toBe('downloading 50% · S1E6');
+  });
+});
+
+describe('matchBatch', () => {
+  const row = (batch: TorrentEntry['batch']): TorrentEntry => ({
+    info_hash: 'abc', name: 'x', status: 'downloading', progress: 0.5,
+    total_size: 1, downloaded: 0, download_speed: 0, upload_speed: 0,
+    peers: 0, seeds: 0, save_path: '/dl', category: null,
+    ratio: 0, eta: null, error_message: null, linked: null, batch,
+  });
+
+  it('matches inside the range and at both edges', () => {
+    const ts = [row({ show_id: 1, season: 1, first: 3, last: 12 })];
+    expect(matchBatch(ts, 1, 1, 3)?.batch?.first).toBe(3);
+    expect(matchBatch(ts, 1, 1, 12)?.batch?.last).toBe(12);
+    expect(matchBatch(ts, 1, 1, 7)).toBe(ts[0]);
+  });
+
+  it('ignores other shows, seasons, and out-of-range episodes', () => {
+    const ts = [row({ show_id: 1, season: 1, first: 3, last: 12 })];
+    expect(matchBatch(ts, 2, 1, 5)).toBeUndefined();
+    expect(matchBatch(ts, 1, 2, 5)).toBeUndefined();
+    expect(matchBatch(ts, 1, 1, 2)).toBeUndefined();
+    expect(matchBatch([], 1, 1, 5)).toBeUndefined();
+  });
+
+  it('builds one stable key for the button and the send', () => {
+    expect(batchSendKey('1080p', 1, 12)).toBe('batch:1080p:1-12');
+  });
 });
 
 describe('sendButtonState', () => {
@@ -58,6 +94,21 @@ describe('sendButtonState', () => {
 
   it('has nothing to offer when the hit carries no torrent url', () => {
     expect(sendButtonState({ torrent_url: null, linked: null })).toBe('unavailable');
+  });
+
+  it('reads downloading from a batch-covered, incomplete torrent', () => {
+    expect(sendButtonState({ torrent_url: 'https://x/1.torrent', linked: null, batch: { show_id: 1, season: 1, first: 1, last: 12 }, progress: 0.4 }))
+      .toBe('downloading');
+  });
+
+  it('reads seeding from a batch-covered, complete torrent', () => {
+    expect(sendButtonState({ torrent_url: 'https://x/1.torrent', batch: { show_id: 1, season: 1, first: 1, last: 12 }, progress: 1 }))
+      .toBe('seeding');
+  });
+
+  it('offers send when neither pin nor pack covers the episode', () => {
+    expect(sendButtonState({ torrent_url: 'https://x/1.torrent', linked: null, batch: null, progress: 0 }))
+      .toBe('send');
   });
 });
 

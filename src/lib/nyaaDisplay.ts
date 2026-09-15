@@ -2,12 +2,22 @@ import type { SourceComparison, WantedEpisode } from '$lib/api';
 
 export interface BatchRange { first: number; last: number }
 
+/** The resolution vocabulary, shared by every TS call site. The backend owns
+ *  the canonical copy (`RESOLUTION_RE` in nyaa.rs) — change one, change both. */
+export const RESOLUTION_RE = /\b(480p|720p|1080p|2160p)\b/i;
+
+/** Resolution token of a release title, lowercased, or null when untagged. */
+export function extractResolution(title: string): string | null {
+  return RESOLUTION_RE.exec(title)?.[1]?.toLowerCase() ?? null;
+}
+
 /** Episode range of a season-pack title (`(01-12)`, `01~12`), or null for
  *  singles and dash-glued quality tags (`06-1080p`). Mirrors the backend
  *  `parse_batch_title` rule: a range touching the resolution token is a
- *  quality tag, not episodes. */
+ *  quality tag, not episodes. Fallback only — sends prefer the range the
+ *  backend already parsed onto the comparison row. */
 export function parseBatchRange(title: string): BatchRange | null {
-  const res = /\b(480p|720p|1080p|2160p)\b/i.exec(title);
+  const res = RESOLUTION_RE.exec(title);
   const resStart = res?.index ?? -1;
   const resEnd = resStart < 0 ? -1 : resStart + res![0].length;
   const re = /\d+\s*[-~–]\s*\d+/g;

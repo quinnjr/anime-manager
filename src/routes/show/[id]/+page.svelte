@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { page } from '$app/state';
   import { goto } from '$app/navigation';
-  import { api, onEvent, type ShowDetail, type RenameTarget, type ResolutionRow, type RssFeedView, type RssSubscribeResult, type SourceComparison, type TorrentControlOp, type TorrentEntry, type TorrentPrefs, type WantedEpisode, type WantedHit } from '$lib/api';
+  import { api, onEvent, type ShowDetail, type RenameTarget, type ResolutionRow, type RssFeedView, type RssSubscribeResult, type SourceComparison, type TorrentAddArgs, type TorrentControlOp, type TorrentEntry, type TorrentPrefs, type WantedEpisode, type WantedHit } from '$lib/api';
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { toasts } from '$lib/stores/toasts.svelte';
   import { playback } from '$lib/stores/playback.svelte';
@@ -11,8 +11,8 @@
   import RenameModal from '$lib/components/RenameModal.svelte';
   import Cover from '$lib/components/Cover.svelte';
   import { flatten } from '$lib/episodes';
-  import { formatSize, formatSourceComparison, parseBatchRange, summariseWanted } from '$lib/nyaaDisplay';
-  import { isSavePathInsideRoots, sendButtonState } from '$lib/torrentDisplay';
+  import { extractResolution, formatSize, formatSourceComparison, parseBatchRange, summariseWanted } from '$lib/nyaaDisplay';
+  import { batchSendKey, isSavePathInsideRoots, matchBatch, sendButtonState } from '$lib/torrentDisplay';
   import { errMessage } from '$lib/errors';
   import SeasonList from '$lib/components/SeasonList.svelte';
   import TorrentRow from '$lib/components/TorrentRow.svelte';
@@ -67,10 +67,9 @@
       if (byHash) return byHash;
     }
     const pinned = torrents.find((t) => t.linked?.show_id === id && t.linked.season === season && t.linked.number === number);
-    if (pinned) return pinned;
     // A season pack covers its whole range: every episode it spans reads the
     // pack's state rather than offering another Send.
-    return torrents.find((t) => t.batch?.show_id === id && t.batch.season === season && number >= t.batch.first && number <= t.batch.last);
+    return pinned ?? matchBatch(torrents, id, season, number);
   }
 
   // Background refresh: failures render in the missing-episodes section (Settings
@@ -107,52 +106,53 @@
     } catch (e) { toasts.error(e); } finally { prefsSaving = false; }
   }
 
-  async function send(season: number, number: number, hit: WantedHit, key: string) {
-    if (!show || !hit.torrent_url) return;
+  // One send ceremony for singles and packs: busy-key tracking, toast, and
+  // reload live here so the two paths cannot drift apart again.
+  async function sendTorrent(key: string, payload: TorrentAddArgs, okMsg: string) {
+    if (!show) return;
     sendingKeys.add(key);
     try {
-      await api.torrentAdd({
-        torrentUrl: hit.torrent_url, infoHash: hit.info_hash ?? null,
-        showId: show.id, season, number,
-        savePath: prefs?.save_path ?? null, category: prefs?.category ?? null
-      });
-      toasts.push('success', `Sent S${season}E${number} to rustorrent.`);
+      await api.torrentAdd(payload);
+      toasts.push('success', okMsg);
       await loadTorrentState();
     } catch (e) { toasts.error(e); } finally { sendingKeys.delete(key); }
   }
 
-  // Send a season pack from the comparison strip. The range comes from the
-  // pack title; the season falls back to the first wanted episode (packs are
-  // single-season in practice) so the pin names real episodes.
-  async function sendBatch(row: ResolutionRow) {
-    if (!show || !row.best_batch_torrent_url || !row.best_batch_title) return;
-    const range = parseBatchRange(row.best_batch_title);
-    if (!range) {
-      toasts.push('error', 'Could not read the pack episode range from its title.');
-      return;
-    }
-    const res = /\b(480p|720p|1080p|2160p)\b/i.exec(row.best_batch_title)?.[1]?.toLowerCase()
+  async function send(season: number, number: number, hit: WantedHit, key: string) {
+    if (!show || !hit.torrent_url) return;
+    await sendTorrent(key, {
+      torrentUrl: hit.torrent_url, infoHash: hit.info_hash ?? null,
+      showId: show.id, season, number,
+      savePath: prefs?.save_path ?? null, category: prefs?.category ?? null
+    }, `Sent S${season}E${number} to rustorrent.`);
+  }
+
+  // Send a season pack from the comparison strip. The range travels on the
+  // comparison row (parsed once by the backend); the title re-parse is
+  // fallback only. The season prefers the wanted list, then the library's
+  // own first season — never an invented 1 — so the pin names real episodes.
+  async function sendBatch(row: ResolutionRow, range: { first: number; last: number }) {
+    if (!show || !row.best_batch_torrent_url) return;
+    const res = (row.best_batch_title && extractResolution(row.best_batch_title))
       ?? row.resolution;
-    const season = wanted[0]?.season ?? 1;
-    const key = `batch:${row.resolution}:${range.first}-${range.last}`;
-    sendingKeys.add(key);
-    try {
-      await api.torrentAdd({
-        torrentUrl: row.best_batch_torrent_url, infoHash: row.best_batch_info_hash ?? null,
-        showId: show.id, season, number: range.first,
-        savePath: prefs?.save_path ?? null, category: prefs?.category ?? null,
-        batch: { first: range.first, last: range.last, resolution: res }
-      });
-      toasts.push('success', `Sent S${season}E${range.first}–E${range.last} pack to rustorrent.`);
-      await loadTorrentState();
-    } catch (e) { toasts.error(e); } finally { sendingKeys.delete(key); }
+    const season = wanted[0]?.season
+      ?? show.seasons.find((s) => s.number !== 0)?.number
+      ?? 1;
+    await sendTorrent(batchSendKey(row.resolution, range.first, range.last), {
+      torrentUrl: row.best_batch_torrent_url, infoHash: row.best_batch_info_hash ?? null,
+      showId: show.id, season, number: range.first,
+      savePath: prefs?.save_path ?? null, category: prefs?.category ?? null,
+      batch: { first: range.first, last: range.last, resolution: res }
+    }, `Sent S${season}E${range.first}–E${range.last} pack to rustorrent.`);
   }
 
   async function compare() {
     if (!show) return;
     comparing = true;
-    comparison = null;
-    try { comparison = await api.compareSources(show.id); }
+    try {
+      const next = await api.compareSources(show.id);
+      comparison = next;
+    }
     catch (e) { toasts.error(e); }
     finally { comparing = false; }
   }
@@ -468,14 +468,17 @@
         <div class="mb-3 flex flex-col gap-1">
           <span class="tag shrink-0">Sources: {formatSourceComparison(comparison)}</span>
           {#each comparison.rows as row (row.resolution)}
-            {#if row.batches > 0 && row.best_batch_title && row.best_batch_torrent_url}
-              {@const bkey = `batch:${row.resolution}`}
+            {@const range = row.best_batch_first != null && row.best_batch_last != null
+              ? { first: row.best_batch_first, last: row.best_batch_last }
+              : (row.best_batch_title ? parseBatchRange(row.best_batch_title) : null)}
+            {#if row.batches > 0 && row.best_batch_title && row.best_batch_torrent_url && range}
+              {@const bkey = batchSendKey(row.resolution, range.first, range.last)}
               <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
                 <span class="min-w-0 flex-1 truncate">{row.best_batch_title}</span>
                 <span class="tag shrink-0">{row.best_batch_seeders} seeder{row.best_batch_seeders === 1 ? '' : 's'}</span>
                 <button class="btn btn-key shrink-0" disabled={sendingKeys.has(bkey)}
                   title="Download the pack and pin its episode range to this show"
-                  onclick={() => void sendBatch(row)}>
+                  onclick={() => void sendBatch(row, range)}>
                   {sendingKeys.has(bkey) ? 'Sending…' : 'Send pack to rustorrent'}
                 </button>
               </div>

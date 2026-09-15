@@ -89,13 +89,6 @@ CREATE TABLE IF NOT EXISTS torrent_prefs (
 CREATE TABLE IF NOT EXISTS rss_feeds (
   label TEXT PRIMARY KEY, show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
   added_at INTEGER NOT NULL);
--- Season-pack pins (schema v9). One row per batch, unlike torrent_links'
--- one row per episode: a pack's single info_hash covers first..=last.
-CREATE TABLE IF NOT EXISTS torrent_batches (
-  info_hash TEXT PRIMARY KEY,
-  show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
-  season INTEGER NOT NULL, first INTEGER NOT NULL, last INTEGER NOT NULL,
-  resolution TEXT, added_at INTEGER NOT NULL);
 "#;
 
 // v7 belongs to the torrent migration already merged on develop (torrent_links, torrent_prefs,
@@ -103,6 +96,15 @@ CREATE TABLE IF NOT EXISTS torrent_batches (
 // early return above, never add the player-state columns, and break playback with
 // "no such column: player_volume". This is the v7 -> v8 step on top of develop.
 const SCHEMA_VERSION: i64 = 9;
+
+/// v9 DDL, shared by fresh-schema creation, the version-gated upgrade, and the
+/// unconditional self-heal below — one definition so the three can never drift.
+const TORRENT_BATCHES_DDL: &str =
+    "CREATE TABLE IF NOT EXISTS torrent_batches (
+       info_hash TEXT PRIMARY KEY,
+       show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
+       season INTEGER NOT NULL, first INTEGER NOT NULL, last INTEGER NOT NULL,
+       resolution TEXT, added_at INTEGER NOT NULL);";
 
 /// Bring an existing database up to `SCHEMA_VERSION`. Fresh databases get the current shape
 /// from SCHEMA directly; older ones are altered in place so no user data is lost.
@@ -181,17 +183,12 @@ fn upgrade(conn: &Connection) -> Result<()> {
                added_at INTEGER NOT NULL);",
         )?;
     }
-    // v9 is additive (a new table), so older databases only need the CREATE;
-    // single-episode pins and everything else are untouched.
-    if v < 9 {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS torrent_batches (
-               info_hash TEXT PRIMARY KEY,
-               show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
-               season INTEGER NOT NULL, first INTEGER NOT NULL, last INTEGER NOT NULL,
-               resolution TEXT, added_at INTEGER NOT NULL);",
-        )?;
-    }
+    // v9 is additive (a new table), so older databases only need the CREATE —
+    // and it runs outside the version gate so a v9 database that lost the
+    // table (hand-deleted, stale dev build kept by IF NOT EXISTS) self-heals
+    // instead of failing every pack pin silently, forever. Idempotent, and
+    // single-episode pins are untouched either way.
+    conn.execute_batch(TORRENT_BATCHES_DDL)?;
     // rename_log's foreign key cannot be altered in place; rebuild the table when it still
     // carries the old NOT NULL / ON DELETE CASCADE definition.
     let sql: String = conn
@@ -220,6 +217,10 @@ fn upgrade(conn: &Connection) -> Result<()> {
 pub fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     conn.execute_batch(SCHEMA)?;
+    // Season-pack pins (schema v9) live in TORRENT_BATCHES_DDL rather than
+    // SCHEMA so fresh installs, upgrades, and the self-heal share one
+    // definition that cannot drift.
+    conn.execute_batch(TORRENT_BATCHES_DDL)?;
     upgrade(conn)?;
     Ok(())
 }

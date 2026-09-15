@@ -1,4 +1,24 @@
-import type { LinkedBatch, LinkedTo } from '$lib/api';
+import type { LinkedBatch, LinkedTo, TorrentEntry } from '$lib/api';
+
+/** Sending-state key for a pack send, shared by the strip button and the
+ *  send itself so the busy state always engages. */
+export function batchSendKey(resolution: string, first: number, last: number): string {
+  return `batch:${resolution}:${first}-${last}`;
+}
+
+/** First torrent whose pack pin covers this episode. Single pins win
+ *  elsewhere (`torrentFor` checks those first); this is the range fallback. */
+export function matchBatch(
+  torrents: TorrentEntry[],
+  showId: number,
+  season: number,
+  number: number
+): TorrentEntry | undefined {
+  return torrents.find((t) =>
+    t.batch?.show_id === showId && t.batch.season === season
+    && number >= t.batch.first && number <= t.batch.last
+  );
+}
 
 /** Anything with the torrent state fields, so a listed row passes directly. */
 export interface BadgeTorrent {

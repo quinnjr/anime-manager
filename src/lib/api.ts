@@ -63,6 +63,7 @@ export interface WantedEpisode { season: number; number: number; hits: WantedHit
 export interface ResolutionRow {
   resolution: string; singles: number; singles_seeders: number;
   batches: number; best_batch_seeders: number; best_batch_title: string | null;
+  best_batch_first?: number | null; best_batch_last?: number | null;
   best_batch_torrent_url?: string | null; best_batch_info_hash?: string | null;
 }
 export interface SourceComparison { rows: ResolutionRow[] }
@@ -88,7 +89,7 @@ export interface TorrentInfo {
 }
 export interface LinkedTo { show_id: number; season: number; number: number }
 export interface LinkedBatch { show_id: number; season: number; first: number; last: number }
-export interface TorrentEntry extends TorrentInfo { linked: LinkedTo | null; batch: LinkedBatch | null }
+export interface TorrentEntry extends TorrentInfo { linked: LinkedTo | null; batch?: LinkedBatch | null }
 export interface TorrentPrefs { show_id: number; save_path: string | null; category: string | null }
 export interface RssFeedView {
   label: string; url: string; search: string; category: string; enabled: boolean; show_id: number | null;

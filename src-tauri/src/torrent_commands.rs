@@ -145,10 +145,39 @@ fn validate_torrent_url(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolutions the comparison understands. Anything else arrives as
+/// display-only noise, so it normalizes to `None` rather than becoming a
+/// distinct source no query can reproduce.
+fn normalize_batch_resolution(res: &Option<String>) -> Option<String> {
+    res.as_deref().filter(|r| {
+        matches!(*r, "480p" | "720p" | "1080p" | "2160p")
+    }).map(str::to_string)
+}
+
+/// Validate a pack range from the frontend before it is pinned: the Tauri
+/// command is the trust boundary, and a dead pin (`first == 0`, inverted)
+/// would never match an episode while looking tracked.
+fn check_batch_arg(batch: &BatchRangeArg) -> Result<BatchRangeArg> {
+    if batch.first == 0 || batch.first > batch.last {
+        return Err(crate::error::AppError::Parse(format!(
+            "bad pack range {}-{}: first episode must be >= 1 and <= last",
+            batch.first, batch.last
+        )));
+    }
+    Ok(BatchRangeArg {
+        first: batch.first,
+        last: batch.last,
+        resolution: normalize_batch_resolution(&batch.resolution),
+    })
+}
+
 /// Pin a resolved hash to its episode — or to a season-pack range when `batch`
-/// is present — and announce the change. The pin is local bookkeeping: a
-/// write failure is logged and still reported as success, because the
-/// server-side state is already correct.
+/// is present — and announce the change. Writing one kind forgets the other,
+/// so re-sending a hash the other way cannot leave both pins behind to mask
+/// each other. A pin-write failure is local bookkeeping against correct
+/// server state, but a lost pack pin is indistinguishable from untracked, and
+/// stderr is discarded in the packaged app — so pack failures also emit the
+/// global `error` event the frontend toasts (cf. `start_after_add`).
 fn link_and_report(
     app: &AppHandle,
     db: &Db,
@@ -159,6 +188,7 @@ fn link_and_report(
     batch: Option<&BatchRangeArg>,
 ) -> String {
     if let Some(range) = batch {
+        let _ = db.remove_torrent_link(&hash);
         if let Err(e) = db.add_batch_link(&TorrentBatch {
             info_hash: hash.clone(),
             show_id,
@@ -169,15 +199,24 @@ fn link_and_report(
             added_at: db::now(),
         }) {
             eprintln!("torrent_add: batch not recorded for {hash}: {e}");
+            let _ = app.emit(
+                "error",
+                crate::error::AppError::Network(format!(
+                    "Added to rustorrent but the pack pin was not recorded ({e}) — re-send or it stays unattributed"
+                )),
+            );
         }
-    } else if let Err(e) = db.add_torrent_link(&TorrentLink {
-        info_hash: hash.clone(),
-        show_id,
-        season,
-        number,
-        added_at: db::now(),
-    }) {
-        eprintln!("torrent_add: link not recorded for {hash}: {e}");
+    } else {
+        let _ = db.remove_batch_link(&hash);
+        if let Err(e) = db.add_torrent_link(&TorrentLink {
+            info_hash: hash.clone(),
+            show_id,
+            season,
+            number,
+            added_at: db::now(),
+        }) {
+            eprintln!("torrent_add: link not recorded for {hash}: {e}");
+        }
     }
     let _ = app.emit("torrent-changed", ());
     let _ = app.emit("show-updated", show_id);
@@ -250,6 +289,9 @@ pub async fn torrent_add(
         batch,
     } = args;
     require_torrent_armed(&state.db)?;
+    // Validate the pack range before any network: the command is the trust
+    // boundary and a bad range must fail loudly, never store a dead pin.
+    let batch = batch.map(|b| check_batch_arg(&b)).transpose()?;
     let client = torrent::TorrentClient::from_db(&state.db)?;
     let clean = |o: Option<String>| o.filter(|v| !v.trim().is_empty());
     let given = clean(info_hash);
@@ -682,6 +724,97 @@ mod tests {
             .is_err()
         );
         assert!(db2.torrent_link("abc123").unwrap().is_some(), "failed remove keeps the pin");
+    }
+
+    #[test]
+    fn check_batch_arg_rejects_dead_ranges_and_normalizes_resolution() {
+        let ok = check_batch_arg(&BatchRangeArg {
+            first: 1,
+            last: 12,
+            resolution: Some("1080p".into()),
+        })
+        .unwrap();
+        assert_eq!(ok.resolution.as_deref(), Some("1080p"));
+        let norm = check_batch_arg(&BatchRangeArg {
+            first: 1,
+            last: 12,
+            resolution: Some("unknown".into()),
+        })
+        .unwrap();
+        assert_eq!(norm.resolution, None, "off-vocabulary resolutions normalize away");
+        assert!(
+            check_batch_arg(&BatchRangeArg { first: 0, last: 12, resolution: None }).is_err(),
+            "zero-start ranges never store"
+        );
+        assert!(
+            check_batch_arg(&BatchRangeArg { first: 12, last: 1, resolution: None }).is_err(),
+            "inverted ranges never store"
+        );
+    }
+
+    /// Seed both pin kinds on one hash: removal must forget both together.
+    fn seed_both_pins(db: &Db, hash: &str) {
+        seed_pin(db, hash);
+        let show_id = db.show_id_for_path("/r/Pinned/01.mkv").unwrap().expect("show seeded");
+        db.add_batch_link(&TorrentBatch {
+            info_hash: hash.into(),
+            show_id,
+            season: 1,
+            first: 1,
+            last: 12,
+            resolution: Some("1080p".into()),
+            added_at: 0,
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn apply_control_forgets_batch_pin_only_after_server_success() {
+        let ok = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/api/torrents/abc123"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).insert_header("retry-after", "0"),
+            )
+            .mount(&ok)
+            .await;
+        let db = Db::open_memory().unwrap();
+        seed_both_pins(&db, "abc123");
+        let client = torrent::TorrentClient::new(ok.uri(), None);
+        apply_control(
+            &client,
+            &db,
+            "abc123",
+            &torrent::ControlOp::Remove { delete_files: false },
+        )
+        .await
+        .unwrap();
+        assert!(db.torrent_link("abc123").unwrap().is_none(), "single pin dies after removal");
+        assert!(db.batch_link("abc123").unwrap().is_none(), "batch pin dies after removal");
+
+        let bad = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/api/torrents/abc123"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(500).insert_header("retry-after", "0"),
+            )
+            .mount(&bad)
+            .await;
+        let db2 = Db::open_memory().unwrap();
+        seed_both_pins(&db2, "abc123");
+        let client2 = torrent::TorrentClient::new(bad.uri(), None);
+        assert!(
+            apply_control(
+                &client2,
+                &db2,
+                "abc123",
+                &torrent::ControlOp::Remove { delete_files: false },
+            )
+            .await
+            .is_err()
+        );
+        assert!(db2.torrent_link("abc123").unwrap().is_some(), "failed remove keeps the pin");
+        assert!(db2.batch_link("abc123").unwrap().is_some(), "failed remove keeps the batch pin");
     }
 
     #[tokio::test]

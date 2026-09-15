@@ -64,6 +64,13 @@ static SEASON_EP_RE: Lazy<Regex> = Lazy::new(|| {
 /// A `[ABCDEF12]` CRC token: eight hex digits, never a release group.
 static CRC_TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^[0-9a-f]{8}$").unwrap());
 
+/// Whether a `[start, end)` span touches (overlaps or abuts) an optional
+/// `span` — the shared "range touching the resolution token is a quality tag,
+/// not episodes" rule used by both single and pack classification.
+fn touches(span: Option<(usize, usize)>, start: usize, end: usize) -> bool {
+    span.map(|(s, e)| start <= e && end >= s).unwrap_or(false)
+}
+
 /// A `[v2]` / `[ver2]` release-revision token: never a release group.
 static VERSION_TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^(?:v\d+|ver\d+)$").unwrap());
 
@@ -109,9 +116,6 @@ pub fn classify_title(title: &str) -> Option<SingleEpisode> {
         .map(|m| (m.start(), m.end()))
         .collect();
     let res_span: Option<(usize, usize)> = RESOLUTION_RE.find(stem).map(|m| (m.start(), m.end()));
-    let touches = |span: Option<(usize, usize)>, start: usize, end: usize| {
-        span.map(|(s, e)| start <= e && end >= s).unwrap_or(false)
-    };
     // Any `NN-MM` style range means this is not one episode.
     if RANGE_RE
         .find_iter(stem)
@@ -225,13 +229,8 @@ pub fn parse_batch_title(title: &str) -> Option<BatchInfo> {
         .map(|m| m.as_str().to_lowercase());
     let res_span: Option<(usize, usize)> =
         RESOLUTION_RE.find(stem).map(|m| (m.start(), m.end()));
-    let touches_res = |start: usize, end: usize| {
-        res_span
-            .map(|(s, e)| start <= e && end >= s)
-            .unwrap_or(false)
-    };
     for m in RANGE_RE.find_iter(stem) {
-        if touches_res(m.start(), m.end()) {
+        if touches(res_span, m.start(), m.end()) {
             continue;
         }
         let mut parts = m.as_str().split(['-', '~', '–']);
@@ -255,8 +254,9 @@ pub fn parse_batch_title(title: &str) -> Option<BatchInfo> {
 }
 
 /// One resolution's seeder picture across single releases and packs.
-/// `best_batch_*` names the pack to fetch when `batches > 0`: title plus the
-/// send targets, attached by `compare_sources` after summarizing.
+/// `best_batch_*` names the pack to fetch when `batches > 0`: range, title,
+/// and send targets. The range travels on the wire so the frontend never
+/// re-parses titles to send a pack (`parseBatchRange` is fallback only).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ResolutionRow {
     pub resolution: String,
@@ -266,9 +266,21 @@ pub struct ResolutionRow {
     pub best_batch_seeders: u32,
     pub best_batch_title: Option<String>,
     #[serde(default)]
+    pub best_batch_first: Option<u32>,
+    #[serde(default)]
+    pub best_batch_last: Option<u32>,
+    #[serde(default)]
     pub best_batch_torrent_url: Option<String>,
     #[serde(default)]
     pub best_batch_info_hash: Option<String>,
+}
+
+impl ResolutionRow {
+    /// The count the UI prints and ranks by: the best single source, never
+    /// the sum — summing would double-count the same swarm.
+    fn seeds(&self) -> u32 {
+        self.singles_seeders.max(self.best_batch_seeders)
+    }
 }
 
 /// Rank resolutions best-seeded first by singles seeders plus the best pack.
@@ -284,6 +296,8 @@ pub fn summarize_sources(titles_seeders: &[(&str, u32)]) -> Vec<ResolutionRow> {
         batches: u32,
         best_batch_seeders: u32,
         best_batch_title: Option<String>,
+        best_batch_first: Option<u32>,
+        best_batch_last: Option<u32>,
     }
     let mut by_res: BTreeMap<String, Acc> = BTreeMap::new();
     for (title, seeders) in titles_seeders {
@@ -295,6 +309,8 @@ pub fn summarize_sources(titles_seeders: &[(&str, u32)]) -> Vec<ResolutionRow> {
             if *seeders >= acc.best_batch_seeders {
                 acc.best_batch_seeders = *seeders;
                 acc.best_batch_title = Some(title.to_string());
+                acc.best_batch_first = Some(b.first);
+                acc.best_batch_last = Some(b.last);
             }
         } else if let Some(s) = classify_title(title) {
             let acc = by_res
@@ -313,15 +329,13 @@ pub fn summarize_sources(titles_seeders: &[(&str, u32)]) -> Vec<ResolutionRow> {
             batches: acc.batches,
             best_batch_seeders: acc.best_batch_seeders,
             best_batch_title: acc.best_batch_title,
+            best_batch_first: acc.best_batch_first,
+            best_batch_last: acc.best_batch_last,
             best_batch_torrent_url: None,
             best_batch_info_hash: None,
         })
         .collect();
-    rows.sort_by(|a, b| {
-        (b.singles_seeders + b.best_batch_seeders)
-            .cmp(&(a.singles_seeders + a.best_batch_seeders))
-            .then_with(|| a.resolution.cmp(&b.resolution))
-    });
+    rows.sort_by(|a, b| b.seeds().cmp(&a.seeds()).then_with(|| a.resolution.cmp(&b.resolution)));
     rows
 }
 
@@ -737,11 +751,15 @@ pub async fn compare_sources(db: &Db, nyaa: &Nyaa, show_id: i64) -> Result<Sourc
         .map(|h| (h.title.as_str(), h.seeders))
         .collect();
     let mut rows = summarize_sources(&pairs);
-    // Send targets for the winning pack of each resolution: the first raw hit
-    // carrying that exact title. Titles are unique per search page.
+    // Send targets for the winning pack of each resolution: the best-seeded
+    // raw hit carrying that exact title. Titles repeat across reposts, so a
+    // first-match join could attach a worse swarm than the row advertises.
     for row in &mut rows {
         if let Some(want) = row.best_batch_title.clone()
-            && let Some(hit) = raw.iter().find(|h| h.title == want)
+            && let Some(hit) = raw
+                .iter()
+                .filter(|h| h.title == want)
+                .max_by_key(|h| h.seeders)
         {
             row.best_batch_torrent_url = hit.torrent_url.clone();
             row.best_batch_info_hash = hit.info_hash.clone();
@@ -944,6 +962,8 @@ mod tests {
         assert!(parse_batch_title("[SubGroup] Show - 06 [1080p]").is_none(), "singles are not batches");
         assert!(parse_batch_title("[SubGroup] Show - 06v2 [1080p]").is_none(), "version suffix is not a range");
         assert!(parse_batch_title("Show - 06-1080p").is_none(), "dash-glued quality tag is not a range");
+        assert!(parse_batch_title("[G] Show (12-01) [1080p]").is_none(), "reversed ranges are not batches");
+        assert!(parse_batch_title("[G] Show (00-12) [1080p]").is_none(), "zero-start ranges are not batches");
     }
 
     #[test]
@@ -953,14 +973,42 @@ mod tests {
             ("[G] Show - 04 [720p]", 2),
             ("[G] Show (01-12) [1080p] (Unofficial Batch)", 16),
             ("[G] Show (01-12) [720p] [Batch]", 3),
+            ("[G] Show - 05 [480p]", 10),
+            ("[G] Show (01-12) [480p] [Batch]", 10),
         ]);
-        assert_eq!(rows.len(), 2, "one row per resolution: {rows:?}");
+        assert_eq!(rows.len(), 3, "one row per resolution: {rows:?}");
+        // Ranked by best single source (max), not the sum: 480p sums to 20
+        // but its best source is 10, so 1080p (16) still leads.
         assert_eq!(rows[0].resolution, "1080p", "best-seeded resolution first");
         assert_eq!(rows[0].best_batch_seeders, 16);
         assert_eq!(rows[0].singles_seeders, 0);
-        let r720 = &rows[1];
+        assert_eq!((rows[0].best_batch_first, rows[0].best_batch_last), (Some(1), Some(12)));
+        assert_eq!(rows[1].resolution, "480p");
+        let r720 = &rows[2];
         assert_eq!(r720.singles_seeders, 3, "1 + 2 across the two singles");
         assert_eq!(r720.best_batch_seeders, 3);
+    }
+
+    #[test]
+    fn source_summary_ignores_movies_and_empty() {
+        assert!(summarize_sources(&[]).is_empty(), "no input, no rows");
+        assert!(
+            summarize_sources(&[("[G] Show Movie Final [1080p]", 9), ("garbage!!", 3)]).is_empty(),
+            "movies and unparseable titles summarize to nothing"
+        );
+    }
+
+    #[test]
+    fn source_summary_groups_resolutionless_under_unknown() {
+        let rows = summarize_sources(&[
+            ("[G] Show - 03", 4),
+            ("[G] Show (01-12) [Batch]", 7),
+        ]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].resolution, "unknown");
+        assert_eq!(rows[0].singles, 1);
+        assert_eq!(rows[0].batches, 1);
+        assert_eq!(rows[0].best_batch_seeders, 7);
     }
 
     // --- Task 3: find_missing orchestration ---
@@ -1145,11 +1193,12 @@ mod tests {
             &server,
             "T",
             &format!(
-                "{}{}{}{}",
+                "{}{}{}{}{}",
                 item_xml("[G] T - 02 [720p]", 201, 1),
                 item_xml("[G] T - 02 [1080p]", 202, 0),
                 item_xml("[G] T (01-12) [1080p] (Unofficial Batch)", 203, 16),
                 item_xml("[G] T (01-12) [720p] [Batch]", 204, 3),
+                item_xml("[G] T (01-12) [1080p] (Unofficial Batch)", 205, 2),
             ),
         )
         .await;
@@ -1170,8 +1219,43 @@ mod tests {
         assert_eq!(
             cmp.rows[0].best_batch_torrent_url.as_deref(),
             Some("https://nyaa.si/download/203.torrent"),
-            "winning pack carries its send target"
+            "same title reposted with 2 seeds must not win over the 16-seed hit"
         );
+        assert_eq!(
+            (cmp.rows[0].best_batch_first, cmp.rows[0].best_batch_last),
+            (Some(1), Some(12)),
+            "the row carries its range so sends never re-parse titles"
+        );
+    }
+
+    #[tokio::test]
+    async fn compare_sources_unknown_show_errors() {
+        let db = Db::open_memory().unwrap();
+        let server = MockServer::start().await;
+        // A missing show is loud (rusqlite row error), never empty rows.
+        compare_sources(&db, &Nyaa::with_endpoint(server.uri()).unwrap(), 9999)
+            .await
+            .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn compare_sources_search_failure_errors() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("U", 1, 1, None, None), &rf("/lib/U/01.mkv"))
+            .unwrap();
+        let show_id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(query_param("page", "rss"))
+            .and(query_param("q", "U"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let err = compare_sources(&db, &Nyaa::with_endpoint(server.uri()).unwrap(), show_id)
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().is_empty(), "a failed search is loud, never empty rows");
     }
 
     #[tokio::test]

@@ -64,6 +64,11 @@ describe('parseBatchRange', () => {
     expect(parseBatchRange('[SubGroup] Show - 06 [1080p]')).toBeNull();
     expect(parseBatchRange('Show - 06-1080p')).toBeNull();
   });
+
+  it('rejects reversed and zero-start ranges like the backend', () => {
+    expect(parseBatchRange('[G] Show (12-01) [1080p]')).toBeNull();
+    expect(parseBatchRange('[G] Show (00-12) [1080p]')).toBeNull();
+  });
 });
 
 const comparison = (over: Partial<SourceComparison> = {}): SourceComparison => ({
