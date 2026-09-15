@@ -57,6 +57,11 @@ impl TorrentClient {
         let http = reqwest::Client::builder()
             .user_agent("anime-manager")
             .timeout(std::time::Duration::from_secs(20))
+            // Fail closed on redirects: `fetch_bytes` follows a validated Nyaa
+            // URL, and a cross-host redirect must never land on an internal
+            // target. No rustorrent endpoint relies on redirects (all callers
+            // use exact API paths), so the shared client carries this too.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest client builds");
         Self {

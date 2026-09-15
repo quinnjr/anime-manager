@@ -11,9 +11,9 @@ export function formatSize(bytes: number): string {
 }
 
 export function summariseWanted(
-  wanted: Pick<WantedEpisode, 'hits'>[] | { hits: unknown[] }[]
+  wanted: Pick<WantedEpisode, 'hits' | 'alts'>[]
 ): 'empty' | 'no-hits' | 'has-hits' {
   if (wanted.length === 0) return 'empty';
-  if (wanted.every((w) => w.hits.length === 0)) return 'no-hits';
+  if (wanted.every((w) => w.hits.length === 0 && (w.alts ?? []).length === 0)) return 'no-hits';
   return 'has-hits';
 }
