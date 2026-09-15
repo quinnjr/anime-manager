@@ -29,6 +29,9 @@ export const SHOW_SORTS: { value: ShowSort; label: string }[] = [
   { value: 'recently-downloaded', label: 'Recently added torrents' }
 ];
 
+// Backend echoes this key (see SETTING_LIBRARY_SORT in src-tauri/src/commands.rs).
+export const LIBRARY_SORT_KEY = 'library_sort' as const;
+
 export interface ShowCard { id: number; display_title: string; cover_url: string | null; cover_path: string | null; episode_count: number; unwatched_count: number }
 export interface ScanSummary { files_seen: number; episodes_added: number; episodes_updated: number; episodes_missing: number; errors: string[]; low_confidence_folders: string[] }
 export interface InspectChange { path: string; from: string; to: string }

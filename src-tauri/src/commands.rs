@@ -480,6 +480,9 @@ pub fn set_status(
 
 /// Settings key for the background auto-scan cadence (string minutes, "0" = off).
 pub const SETTING_AUTO_SCAN_MINS: &str = "auto_scan_interval_mins";
+/// The values are frontend-owned, see `ShowSort`/`SHOW_SORTS` in
+/// `src/lib/api.ts` — only the key is pinned here.
+pub const SETTING_LIBRARY_SORT: &str = "library_sort";
 /// Default cadence. Kept in sync with DEFAULT_AUTO_SCAN_MINS in src/lib/autoScan.ts.
 pub const DEFAULT_AUTO_SCAN_MINS: &str = "15";
 
@@ -502,112 +505,109 @@ fn test_ok_flag(db: &Db) -> &'static str {
     flag(Llm::test_ok(db))
 }
 
+/// Testable composition behind get_settings; get_settings is the only production caller.
+fn assembled_settings(db: &Db) -> Result<HashMap<String, String>> {
+    Ok(apply_settings_defaults(settings_map(db)?))
+}
+
 #[tauri::command]
 pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String>> {
+    assembled_settings(&state.db)
+}
+
+/// Stored settings rows behind `get_settings`, without the fresh-database
+/// fills in `apply_settings_defaults`.
+/// Takes `Db` directly so key coverage is unit-testable without a Tauri
+/// `State`; `assembled_settings` (via `get_settings`) is the only caller.
+fn settings_map(db: &Db) -> Result<HashMap<String, String>> {
     let mut m = HashMap::new();
     m.insert(
         "played_threshold".into(),
-        state.db.played_threshold()?.to_string(),
+        db.played_threshold()?.to_string(),
     );
     // Effective config: blank stored paths fall back to the binary name, so the
     // settings page echoes what playback will actually run.
-    m.insert("mpv_path".into(), player::mpv_binary(&state.db));
-    m.insert("vlc_path".into(), player::vlc_binary(&state.db));
+    m.insert("mpv_path".into(), player::mpv_binary(db));
+    m.insert("vlc_path".into(), player::vlc_binary(db));
     // Effective, normalised backend: an unknown stored value parses to mpv, which
     // is what playback will actually run, so echo that rather than the raw row.
     m.insert(
         "player_backend".into(),
-        player::player_backend(&state.db).as_str().into(),
+        player::player_backend(db).as_str().into(),
     );
     m.insert(
         "llm_api_key".into(),
-        state.db.get_setting("llm_api_key")?.unwrap_or_default(),
+        db.get_setting("llm_api_key")?.unwrap_or_default(),
     );
     m.insert(
         "llm_model".into(),
-        state
-            .db
-            .get_setting("llm_model")?
+        db.get_setting("llm_model")?
             .unwrap_or_else(|| llm::DEFAULT_MODEL.into()),
     );
     m.insert(
         "llm_base_url".into(),
-        state
-            .db
-            .get_setting("llm_base_url")?
+        db.get_setting("llm_base_url")?
             .unwrap_or_else(|| llm::DEFAULT_BASE_URL.into()),
     );
     m.insert(
         "llm_assist_on_scan".into(),
-        state
-            .db
-            .get_setting("llm_assist_on_scan")?
+        db.get_setting("llm_assist_on_scan")?
             .unwrap_or_else(|| "true".into()),
     );
-    if let Some(v) = state.db.get_setting(SETTING_AUTO_SCAN_MINS)? {
+    if let Some(v) = db.get_setting(SETTING_AUTO_SCAN_MINS)? {
         m.insert(SETTING_AUTO_SCAN_MINS.into(), v);
+    }
+    // The shelf order; echoed only when stored, the shelf defaults to title itself.
+    if let Some(v) = db.get_setting(SETTING_LIBRARY_SORT)? {
+        m.insert(SETTING_LIBRARY_SORT.into(), v);
     }
     m.insert(
         "llm_delay_ms".into(),
-        state
-            .db
-            .get_setting("llm_delay_ms")?
+        db.get_setting("llm_delay_ms")?
             .unwrap_or_else(|| llm::DEFAULT_DELAY_MS.to_string()),
     );
     // Whether the background worker is armed; the settings page reads this so an untested
     // config says so instead of silently never assisting.
-    m.insert(llm::TEST_OK_KEY.into(), test_ok_flag(&state.db).into());
+    m.insert(llm::TEST_OK_KEY.into(), test_ok_flag(db).into());
     m.insert(
         torrent::BASE_URL_KEY.into(),
-        state
-            .db
-            .get_setting(torrent::BASE_URL_KEY)?
+        db.get_setting(torrent::BASE_URL_KEY)?
             .unwrap_or_default(),
     );
     m.insert(
         torrent::PASSWORD_KEY.into(),
-        state
-            .db
-            .get_setting(torrent::PASSWORD_KEY)?
+        db.get_setting(torrent::PASSWORD_KEY)?
             .unwrap_or_default(),
     );
     // NAS prefix pairs (`server_prefix=local_prefix,…`); "" is no mapping.
     m.insert(
         torrent::PATH_MAP_KEY.into(),
-        state
-            .db
-            .get_setting(torrent::PATH_MAP_KEY)?
+        db.get_setting(torrent::PATH_MAP_KEY)?
             .unwrap_or_default(),
     );
     // Read-only like its LLM counterpart: managed by Test connection.
     m.insert(
         torrent::TEST_OK_KEY.into(),
-        torrent_test_ok_flag(&state.db).into(),
+        torrent_test_ok_flag(db).into(),
     );
     // Opt-in acknowledgement for sending a password over plain http; default off.
     m.insert(
         torrent::ALLOW_CLEARTEXT_KEY.into(),
-        state
-            .db
-            .get_setting(torrent::ALLOW_CLEARTEXT_KEY)?
+        db.get_setting(torrent::ALLOW_CLEARTEXT_KEY)?
             .filter(|v| v == "true")
             .unwrap_or_else(|| "false".into()),
     );
     m.insert(
         SETTING_DLNA_NAME.into(),
-        state
-            .db
-            .get_setting(SETTING_DLNA_NAME)?
+        db.get_setting(SETTING_DLNA_NAME)?
             .unwrap_or_else(default_dlna_name),
     );
     m.insert(
         SETTING_DLNA_PORT.into(),
-        state
-            .db
-            .get_setting(SETTING_DLNA_PORT)?
+        db.get_setting(SETTING_DLNA_PORT)?
             .unwrap_or_else(|| DLNA_DEFAULT_PORT.to_string()),
     );
-    Ok(apply_settings_defaults(m))
+    Ok(m)
 }
 
 /// Read-compare-write for settings that invalidate a connection test: the write always
@@ -1013,6 +1013,7 @@ pub fn set_show_title(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn auto_scan_default_applies_when_unset_and_keeps_stored_value() {
@@ -1030,6 +1031,145 @@ mod tests {
             Some("0")
         );
         assert_eq!(out.get("mpv_path").map(String::as_str), Some("custom"));
+    }
+
+    #[test]
+    fn settings_map_echoes_stored_library_sort() {
+        let db = Db::open_memory().unwrap();
+        // Fresh database: no row, so the shelf falls back to its own default.
+        assert_eq!(settings_map(&db).unwrap().get(SETTING_LIBRARY_SORT), None);
+        assert_eq!(
+            assembled_settings(&db).unwrap().get(SETTING_LIBRARY_SORT),
+            None
+        );
+        // The shelf persists its order via set_setting; the map must echo it back,
+        // or the mount-time restore reads undefined and resets to title.
+        db.set_setting(SETTING_LIBRARY_SORT, "recently-downloaded")
+            .unwrap();
+        assert_eq!(
+            settings_map(&db)
+                .unwrap()
+                .get(SETTING_LIBRARY_SORT)
+                .map(String::as_str),
+            Some("recently-downloaded")
+        );
+        assert_eq!(
+            assembled_settings(&db).unwrap()
+                .get(SETTING_LIBRARY_SORT)
+                .map(String::as_str),
+            Some("recently-downloaded")
+        );
+    }
+
+    #[test]
+    fn settings_map_echoes_every_show_sort() {
+        let db = Db::open_memory().unwrap();
+        // ShowSort wire values mirror src/lib/api.ts ShowSort; every value must
+        // echo back verbatim, or the shelf silently resets on mount.
+        for sort in [
+            "title",
+            "unwatched",
+            "last-played",
+            "recently-added",
+            "recently-updated",
+            "recently-downloaded",
+        ] {
+            db.set_setting(SETTING_LIBRARY_SORT, sort).unwrap();
+            assert_eq!(
+                settings_map(&db)
+                    .unwrap()
+                    .get(SETTING_LIBRARY_SORT)
+                    .map(String::as_str),
+                Some(sort)
+            );
+            assert_eq!(
+                assembled_settings(&db).unwrap()
+                    .get(SETTING_LIBRARY_SORT)
+                    .map(String::as_str),
+                Some(sort)
+            );
+        }
+    }
+
+    #[test]
+    fn settings_map_preserves_full_key_set() {
+        assert_eq!(SETTING_LIBRARY_SORT, "library_sort");
+        assert_eq!(SETTING_AUTO_SCAN_MINS, "auto_scan_interval_mins");
+        assert_eq!(llm::TEST_OK_KEY, "llm_test_ok");
+        assert_eq!(torrent::BASE_URL_KEY, "torrent_base_url");
+        assert_eq!(torrent::PASSWORD_KEY, "torrent_password");
+        assert_eq!(torrent::PATH_MAP_KEY, "torrent_path_map");
+        assert_eq!(torrent::TEST_OK_KEY, "torrent_test_ok");
+        assert_eq!(torrent::ALLOW_CLEARTEXT_KEY, "torrent_allow_cleartext");
+        assert_eq!(SETTING_DLNA_NAME, "dlna_name");
+        assert_eq!(SETTING_DLNA_PORT, "dlna_port");
+        let db = Db::open_memory().unwrap();
+        let fresh: BTreeSet<String> =
+            settings_map(&db).unwrap().keys().cloned().collect();
+        // Adding a conditional (echo-iff-stored) key requires adding it to expected_full plus a set/echo pair below; presence-testing cannot auto-catch an unset third conditional.
+        let expected: BTreeSet<String> = [
+            "played_threshold",
+            "mpv_path",
+            "vlc_path",
+            "player_backend",
+            "llm_api_key",
+            "llm_model",
+            "llm_base_url",
+            "llm_assist_on_scan",
+            "llm_delay_ms",
+            llm::TEST_OK_KEY,
+            torrent::BASE_URL_KEY,
+            torrent::PASSWORD_KEY,
+            torrent::PATH_MAP_KEY,
+            torrent::TEST_OK_KEY,
+            torrent::ALLOW_CLEARTEXT_KEY,
+            SETTING_DLNA_NAME,
+            SETTING_DLNA_PORT,
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert!(!fresh.contains(SETTING_LIBRARY_SORT));
+        assert!(!fresh.contains(SETTING_AUTO_SCAN_MINS));
+        assert_eq!(fresh, expected);
+        let fresh_through = assembled_settings(&db).unwrap();
+        let mut expected_fresh_through = expected.clone();
+        expected_fresh_through.insert(SETTING_AUTO_SCAN_MINS.into());
+        assert_eq!(
+            fresh_through.keys().cloned().collect::<BTreeSet<String>>(),
+            expected_fresh_through
+        );
+        assert_eq!(fresh_through.get(SETTING_LIBRARY_SORT), None);
+        db.set_setting(SETTING_LIBRARY_SORT, "recently-downloaded")
+            .unwrap();
+        db.set_setting(SETTING_AUTO_SCAN_MINS, "30").unwrap();
+        let full = settings_map(&db).unwrap();
+        assert_eq!(
+            full.get(SETTING_LIBRARY_SORT).map(String::as_str),
+            Some("recently-downloaded")
+        );
+        assert_eq!(
+            full.get(SETTING_AUTO_SCAN_MINS).map(String::as_str),
+            Some("30")
+        );
+        let full_keys: BTreeSet<String> = full.keys().cloned().collect();
+        let mut expected_full = expected.clone();
+        expected_full.insert(SETTING_LIBRARY_SORT.into());
+        expected_full.insert(SETTING_AUTO_SCAN_MINS.into());
+        assert_eq!(full_keys, expected_full);
+        let full_through = assembled_settings(&db).unwrap();
+        assert_eq!(
+            full_through.keys().cloned().collect::<BTreeSet<String>>(),
+            expected_full
+        );
+        assert_eq!(
+            full_through.get(SETTING_LIBRARY_SORT).map(String::as_str),
+            Some("recently-downloaded")
+        );
+        assert_eq!(
+            full_through.get(SETTING_AUTO_SCAN_MINS).map(String::as_str),
+            Some("30")
+        );
     }
 
     #[test]
