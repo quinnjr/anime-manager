@@ -326,6 +326,19 @@ pub struct TorrentLink {
     pub info_hash: String, pub show_id: i64,
     pub season: u32, pub number: u32, pub added_at: i64,
 }
+/// A season-pack pin: one info_hash covering `first..=last` of a season.
+/// Single-episode pins (`TorrentLink`) cannot express this — `info_hash` is
+/// their primary key — so batches get their own table rather than a
+/// nullable range bolted onto a 1:1 row.
+/// Counterparts: `BatchInfo` (nyaa.rs, parsed from a title before the add),
+/// `BatchRangeArg` (the Tauri wire form of this range), `LinkedBatch` (the
+/// read-back form on `LinkedTorrent`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TorrentBatch {
+    pub info_hash: String, pub show_id: i64,
+    pub season: u32, pub first: u32, pub last: u32,
+    pub resolution: Option<String>, pub added_at: i64,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct TorrentPrefs {
     pub show_id: i64, pub save_path: Option<String>, pub category: Option<String>,
@@ -348,8 +361,16 @@ pub struct TorrentInfo {
 pub struct TorrentDetail { #[serde(flatten)] pub info: TorrentInfo, #[serde(default)] pub files: Vec<TorrentFile> }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LinkedTo { pub show_id: i64, pub season: u32, pub number: u32 }
+/// A season pack covering `first..=last`, from `torrent_batches` — the
+/// read-back form of `TorrentBatch`'s range (cf. `BatchRangeArg` on the way in).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct LinkedTorrent { #[serde(flatten)] pub info: TorrentInfo, pub linked: Option<LinkedTo> }
+pub struct LinkedBatch { pub show_id: i64, pub season: u32, pub first: u32, pub last: u32 }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LinkedTorrent {
+    #[serde(flatten)] pub info: TorrentInfo,
+    pub linked: Option<LinkedTo>,
+    #[serde(default)] pub batch: Option<LinkedBatch>,
+}
 /// POST /api/rss/feeds body: which remote feed to poll and what to grab.
 /// `exclude_batch` reproduces the strict no-packs rule.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -375,6 +396,18 @@ pub struct RssSubscribeResult {
     pub resolved_path: Option<String>,
     pub outside_roots: bool,
 }
+/// A season-pack range for `torrent_add`: record one `torrent_batches` row
+/// covering `first..=last` instead of a single-episode pin. This is the wire
+/// form of `TorrentBatch`'s range (camelCase for the JS caller); `LinkedBatch`
+/// is the read-back form on `LinkedTorrent`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchRangeArg {
+    pub first: u32,
+    pub last: u32,
+    pub resolution: Option<String>,
+}
+
 /// Flat `torrent_add` payload from the Downloads view. Tauri keys the invoke
 /// under `args`; the inner fields arrive camelCase from the frontend, so serde
 /// maps them onto these snake_case members.
@@ -388,4 +421,5 @@ pub struct TorrentAddArgs {
     pub number: u32,
     pub save_path: Option<String>,
     pub category: Option<String>,
+    pub batch: Option<BatchRangeArg>,
 }

@@ -97,6 +97,7 @@ pub fn run() {
             commands::undo_rename,
             commands::inspect_show,
             commands::find_missing,
+            commands::compare_sources,
             commands::llm_test,
             commands::llm_models,
             commands::llm_models_for,

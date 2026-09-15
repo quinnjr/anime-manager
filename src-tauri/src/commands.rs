@@ -4,7 +4,7 @@ use crate::error::Result;
 use crate::llm::{self, AssistQueue, Llm};
 use crate::metadata::{self, Providers};
 use crate::models::*;
-use crate::nyaa::{self, Nyaa, WantedEpisode};
+use crate::nyaa::{self, Nyaa, SourceComparison, WantedEpisode};
 use crate::player::{self, Player};
 use crate::rename;
 use crate::torrent;
@@ -509,12 +509,15 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<HashMap<String, String
         "played_threshold".into(),
         state.db.played_threshold()?.to_string(),
     );
+    // Effective config: blank stored paths fall back to the binary name, so the
+    // settings page echoes what playback will actually run.
+    m.insert("mpv_path".into(), player::mpv_binary(&state.db));
+    m.insert("vlc_path".into(), player::vlc_binary(&state.db));
+    // Effective, normalised backend: an unknown stored value parses to mpv, which
+    // is what playback will actually run, so echo that rather than the raw row.
     m.insert(
-        "mpv_path".into(),
-        state
-            .db
-            .get_setting("mpv_path")?
-            .unwrap_or_else(|| "mpv".into()),
+        "player_backend".into(),
+        player::player_backend(&state.db).as_str().into(),
     );
     m.insert(
         "llm_api_key".into(),
@@ -708,6 +711,91 @@ pub fn purge_missing(state: State<'_, AppState>) -> Result<usize> {
     state.db.purge_missing()
 }
 
+/// Pick the player binary for a run: the configured backend first, then the
+/// other one as a fallback. Pure so the preference order is unit-testable;
+/// `play` passes a `--version` probe. Returns the backend actually used.
+fn resolve_player(
+    backend: player::PlayerBackend,
+    mpv_bin: &str,
+    vlc_bin: &str,
+    probe: impl Fn(&str) -> bool,
+) -> Option<(player::PlayerBackend, String)> {
+    let (first, second) = match backend {
+        player::PlayerBackend::Mpv => (
+            (player::PlayerBackend::Mpv, mpv_bin),
+            (player::PlayerBackend::Vlc, vlc_bin),
+        ),
+        player::PlayerBackend::Vlc => (
+            (player::PlayerBackend::Vlc, vlc_bin),
+            (player::PlayerBackend::Mpv, mpv_bin),
+        ),
+    };
+    if probe(first.1) {
+        Some((first.0, first.1.to_string()))
+    } else if probe(second.1) {
+        Some((second.0, second.1.to_string()))
+    } else {
+        None
+    }
+}
+
+/// The synchronous Play preamble as a pure, testable decision: the wanted
+/// backend first via [`resolve_player`], falling back to the other one.
+/// `notice` is `Some("…falling back…")` only on fallback, for the
+/// informational `notice` channel; `Err` is the "no player found…" message
+/// `play` surfaces as an error toast.
+#[derive(Debug)]
+struct PlayDecision {
+    backend: player::PlayerBackend,
+    bin: String,
+    notice: Option<String>,
+}
+
+fn decide_player(
+    wanted: player::PlayerBackend,
+    mpv_bin: &str,
+    vlc_bin: &str,
+    probe: impl Fn(&str) -> bool,
+) -> std::result::Result<PlayDecision, String> {
+    match resolve_player(wanted, mpv_bin, vlc_bin, probe) {
+        Some((backend, bin)) => {
+            let notice = (backend != wanted).then(|| {
+                format!(
+                    "{} not found, falling back to {}",
+                    wanted.as_str(),
+                    backend.as_str()
+                )
+            });
+            Ok(PlayDecision {
+                backend,
+                bin,
+                notice,
+            })
+        }
+        None => Err(format!(
+            "no player found: mpv missing at '{mpv_bin}' and vlc missing at '{vlc_bin}'; install one or set its path in settings"
+        )),
+    }
+}
+
+/// Probe a player binary with `--version`, requiring exit success. Bounded by
+/// a short timeout so a hanging binary can't hang Play: the probe runs on a
+/// thread and anything slower than 5s counts as missing.
+fn probe_binary(bin: &str) -> bool {
+    let bin = bin.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let ok = std::process::Command::new(&bin)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        let _ = tx.send(ok);
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap_or(false)
+}
+
 #[tauri::command]
 pub async fn play(app: AppHandle, state: State<'_, AppState>, episode_id: i64) -> Result<()> {
     let db = state.db.clone();
@@ -717,26 +805,29 @@ pub async fn play(app: AppHandle, state: State<'_, AppState>, episode_id: i64) -
             "another episode is already playing".into(),
         ));
     }
-    // Validate launch synchronously so the caller sees "mpv not found" or a missing file
-    // immediately as a toast, rather than after the background task's IPC timeout.
+    // Validate launch synchronously so the caller sees "player not found" or a missing
+    // file immediately as a toast, rather than after the background task's socket timeout.
     let ep = db.get_episode(episode_id)?;
     player::ensure_file_present(&ep.path)?;
-    let bin = player::mpv_binary(&db);
-    if std::process::Command::new(&bin)
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        return Err(crate::error::AppError::Player(format!(
-            "mpv not found at '{bin}'; install mpv or set mpv_path in settings"
-        )));
-    }
+    let wanted = player::player_backend(&db);
+    let mpv_bin = player::mpv_binary(&db);
+    let vlc_bin = player::vlc_binary(&db);
+    let decision = decide_player(wanted, &mpv_bin, &vlc_bin, probe_binary)
+        .map_err(crate::error::AppError::Player)?;
+    let backend = decision.backend;
+    let bin = decision.bin;
+    let notice = decision.notice;
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
+        if let Some(notice) = notice {
+            let _ = app.emit("notice", notice);
+        }
         if let Err(e) = player::play_episode(
             db,
             player,
             episode_id,
+            backend,
+            &bin,
             move |ev| {
                 let _ = app2.emit("playback-changed", ev);
             },
@@ -843,6 +934,18 @@ pub async fn find_missing(
     nyaa::find_missing(&state.db, &Nyaa::with_endpoint(nyaa::NYAA_BASE.into())?, show_id).await
 }
 
+/// Per-resolution seeder picture for a show from one title-only Nyaa search —
+/// whether 1080p is actually better seeded than 720p, and which packs exist.
+/// `find_missing` cannot answer this: its per-episode filter discards packs.
+/// Pure query: writes nothing, emits nothing.
+#[tauri::command]
+pub async fn compare_sources(
+    state: State<'_, AppState>,
+    show_id: i64,
+) -> Result<SourceComparison> {
+    nyaa::compare_sources(&state.db, &Nyaa::with_endpoint(nyaa::NYAA_BASE.into())?, show_id).await
+}
+
 /// Model ids offered by whatever provider is configured right now.
 #[tauri::command]
 pub async fn llm_models(state: State<'_, AppState>) -> Result<Vec<String>> {
@@ -927,6 +1030,88 @@ mod tests {
             Some("0")
         );
         assert_eq!(out.get("mpv_path").map(String::as_str), Some("custom"));
+    }
+
+    #[test]
+    fn resolve_player_prefers_the_configured_backend() {
+        let (backend, bin) = resolve_player(player::PlayerBackend::Vlc, "mpv", "vlc", |_| true)
+            .expect("a probe that always passes picks something");
+        assert_eq!(backend, player::PlayerBackend::Vlc);
+        assert_eq!(bin, "vlc");
+    }
+
+    #[test]
+    fn resolve_player_falls_back_to_the_other_backend() {
+        let got = resolve_player(player::PlayerBackend::Vlc, "mpv", "vlc", |b| {
+            b == "mpv"
+        });
+        let (backend, bin) = got.expect("mpv is available");
+        assert_eq!(backend, player::PlayerBackend::Mpv);
+        assert_eq!(bin, "mpv");
+    }
+
+    #[test]
+    fn resolve_player_is_none_when_neither_backend_exists() {
+        assert!(
+            resolve_player(player::PlayerBackend::Mpv, "mpv", "vlc", |_| false).is_none()
+        );
+    }
+
+    #[test]
+    fn decide_player_errors_naming_both_binaries_when_none_found() {
+        let err = decide_player(
+            player::PlayerBackend::Mpv,
+            "/none/mpv",
+            "/none/vlc",
+            |_| false,
+        )
+        .expect_err("no probe passes, so there is no player");
+        assert!(err.contains("no player found"), "{err}");
+        assert!(err.contains("/none/mpv"), "{err}");
+        assert!(err.contains("/none/vlc"), "{err}");
+    }
+
+    #[test]
+    fn decide_player_prefers_wanted_with_no_notice() {
+        let d = decide_player(player::PlayerBackend::Vlc, "mpv", "vlc", |_| true).unwrap();
+        assert_eq!(d.backend, player::PlayerBackend::Vlc);
+        assert_eq!(d.bin, "vlc");
+        assert_eq!(d.notice, None);
+    }
+
+    #[test]
+    fn decide_player_falls_back_to_mpv_with_notice() {
+        let d = decide_player(player::PlayerBackend::Vlc, "mpv", "vlc", |b| b == "mpv").unwrap();
+        assert_eq!(d.backend, player::PlayerBackend::Mpv);
+        assert_eq!(d.bin, "mpv");
+        let notice = d.notice.expect("fallback carries a notice");
+        assert!(notice.contains("vlc"), "{notice}");
+        assert!(notice.contains("mpv"), "{notice}");
+    }
+
+    #[test]
+    fn decide_player_falls_back_to_vlc() {
+        let d = decide_player(player::PlayerBackend::Mpv, "mpv", "vlc", |b| b == "vlc").unwrap();
+        assert_eq!(d.backend, player::PlayerBackend::Vlc);
+        assert_eq!(d.bin, "vlc");
+    }
+
+    #[test]
+    fn effective_player_defaults_echo_what_playback_runs() {
+        // get_settings needs a Tauri State so it can't be unit-tested directly;
+        // assert via the same player:: helpers get_settings now echoes instead.
+        let db = Db::open_memory().unwrap();
+        assert_eq!(player::player_backend(&db), player::PlayerBackend::Mpv);
+        assert_eq!(player::mpv_binary(&db), "mpv");
+        assert_eq!(player::vlc_binary(&db), "vlc");
+        // Blank stored paths normalise to the binary name…
+        db.set_setting("vlc_path", "").unwrap();
+        assert_eq!(player::vlc_binary(&db), "vlc");
+        // …while a real custom path is honoured.
+        db.set_setting("vlc_path", "/usr/bin/vlc").unwrap();
+        assert_eq!(player::vlc_binary(&db), "/usr/bin/vlc");
+        db.set_setting("player_backend", "vlc").unwrap();
+        assert_eq!(player::player_backend(&db), player::PlayerBackend::Vlc);
     }
 
     #[test]

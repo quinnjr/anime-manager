@@ -59,6 +59,14 @@ export interface InspectReport { folders: number; ignored: number; changes: Insp
 export interface ScanProgress { done: number; total: number; current_path: string }
 export interface WantedHit { title: string; page_url: string; size_bytes: number; seeders: number; torrent_url: string | null; info_hash: string | null }
 export interface WantedEpisode { season: number; number: number; hits: WantedHit[]; alts: WantedHit[] }
+/** One resolution's seeder picture, mirroring the Rust ResolutionRow (snake_case wire format). */
+export interface ResolutionRow {
+  resolution: string; singles: number; singles_seeders: number;
+  batches: number; best_batch_seeders: number; best_batch_title: string | null;
+  best_batch_first?: number | null; best_batch_last?: number | null;
+  best_batch_torrent_url?: string | null; best_batch_info_hash?: string | null;
+}
+export interface SourceComparison { rows: ResolutionRow[] }
 export interface DlnaStatus { running: boolean; port: number; clients_seen: number; dlna_warning?: string; }
 export interface PlaybackChanged { episode_id: number; status: EpisodeStatus; position_secs: number; duration_secs: number | null }
 export type MetadataSource = 'anilist' | 'kitsu';
@@ -80,7 +88,8 @@ export interface TorrentInfo {
   ratio: number; eta: number | null; error_message: string | null;
 }
 export interface LinkedTo { show_id: number; season: number; number: number }
-export interface TorrentEntry extends TorrentInfo { linked: LinkedTo | null }
+export interface LinkedBatch { show_id: number; season: number; first: number; last: number }
+export interface TorrentEntry extends TorrentInfo { linked: LinkedTo | null; batch?: LinkedBatch | null }
 export interface TorrentPrefs { show_id: number; save_path: string | null; category: string | null }
 export interface RssFeedView {
   label: string; url: string; search: string; category: string; enabled: boolean; show_id: number | null;
@@ -89,15 +98,21 @@ export interface RssSubscribeResult { label: string; url: string; resolved_path:
 /** Mirrors the Rust ControlOp enum: unit variants serialise as bare strings, so
  *  Remove keeps its snake_case payload field exactly as serde expects it. */
 export type TorrentControlOp = 'Start' | 'Pause' | 'Recheck' | { Remove: { delete_files: boolean } };
+export interface BatchRangeArg { first: number; last: number; resolution?: string | null }
 export interface TorrentAddArgs {
   torrentUrl?: string | null; infoHash?: string | null;
   showId: number; season: number; number: number;
   savePath?: string | null; category?: string | null;
+  batch?: BatchRangeArg | null;
 }
 
 /** Known settings keys on top of the free-form string map, so a typo fails loudly. */
 export type SettingsMap = Record<string, string> & {
   auto_scan_interval_mins?: string;
+  mpv_path?: string;
+  vlc_path?: string;
+  player_backend?: 'mpv' | 'vlc';
+  played_threshold?: string;
   library_sort?: ShowSort;
   dlna_name?: string;
   dlna_port?: string;
@@ -157,7 +172,8 @@ export const api = {
   torrentRssSubscribe: (showId: number) => invoke<RssSubscribeResult>('torrent_rss_subscribe', { showId }),
   torrentRssList: () => invoke<RssFeedView[]>('torrent_rss_list'),
   torrentRssToggle: (label: string, enabled: boolean) => invoke<void>('torrent_rss_toggle', { label, enabled }),
-  torrentRssRemove: (label: string) => invoke<void>('torrent_rss_remove', { label })
+   torrentRssRemove: (label: string) => invoke<void>('torrent_rss_remove', { label }),
+  compareSources: (showId: number) => invoke<SourceComparison>('compare_sources', { showId }),
 };
 
 export function onEvent<T>(name: string, cb: (payload: T) => void): Promise<UnlistenFn> {

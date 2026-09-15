@@ -90,6 +90,7 @@
     const unlisteners = [
       onEvent<PlaybackChanged>('playback-changed', (ev) => playback.apply(ev)),
       onEvent<AppError>('error', (e) => toasts.error(e)),
+      onEvent<string>('notice', (msg) => toasts.push('info', msg)),
       onEvent<AssistProgress>('llm-assist-progress', (p) => assist.apply(p)),
       onEvent<MatchProgress>('match-progress', (p) => matching.apply(p)),
       // 'llm-assist' is failures-only: background success stays silent by design
