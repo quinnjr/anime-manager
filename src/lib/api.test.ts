@@ -6,13 +6,32 @@ vi.mock('@tauri-apps/api/core', () => ({
   invoke: (...args: unknown[]) => invokeMock(...args)
 }));
 
-const { api } = await import('./api');
+const { api, SHOW_SORTS } = await import('./api');
 
 describe('findMissing api', () => {
   it('calls find_missing with the show id', async () => {
     invokeMock.mockResolvedValueOnce([]);
     await api.findMissing(7);
     expect(invokeMock).toHaveBeenCalledWith('find_missing', { showId: 7 });
+  });
+});
+
+describe('library sorts', () => {
+  it('includes recently-downloaded with unique values', () => {
+    expect(SHOW_SORTS.some((s) => s.value === 'recently-downloaded')).toBe(true);
+    // The sort measures torrent pin time, not byte-complete time, so the label
+    // must not promise a download it cannot see (e.g. torrents added outside the app).
+    expect(SHOW_SORTS.find((s) => s.value === 'recently-downloaded')?.label).toBe(
+      'Recently added torrents'
+    );
+    const values = SHOW_SORTS.map((s) => s.value);
+    expect(new Set(values).size).toBe(values.length);
+  });
+
+  it('lists shows with the recently-downloaded sort', async () => {
+    invokeMock.mockResolvedValueOnce([]);
+    await api.listShows('', 'recently-downloaded');
+    expect(invokeMock).toHaveBeenCalledWith('list_shows', { filter: '', sort: 'recently-downloaded' });
   });
 });
 
