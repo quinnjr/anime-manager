@@ -367,14 +367,25 @@ pub struct WantedHit {
 }
 
 /// A missing episode and its strict matches, best (highest seeders) first.
-/// Empty `hits` means no strict match — rendered as a "no strict match" row,
+/// Empty `hits` means no strict match — `alts` carries up to [`MAX_ALTS`]
+/// same-episode single releases that missed only on subgroup/resolution,
 /// never silently dropped.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WantedEpisode {
     pub season: u32,
     pub number: u32,
     pub hits: Vec<WantedHit>,
+    pub alts: Vec<WantedHit>,
 }
+
+/// Same-episode near-misses shown when no strict hit exists. Capped so a
+/// popular episode cannot flood the section; batches/ranges never qualify
+/// because `classify_title` already rejected them.
+pub const MAX_ALTS: usize = 5;
+
+/// Strict hits shown per episode. Capped so a popular episode cannot flood
+/// the UI; best (highest seeders) first, sort-then-truncate like `near`.
+pub const MAX_HITS: usize = 10;
 
 /// An episode file on disk that votes for preferences and baselines wanted
 /// numbers. Season 0 and missing-status rows never reach this struct.
@@ -489,6 +500,18 @@ fn size_band(sizes: &[u64]) -> Option<(u64, u64)> {
     Some((median * 70 / 100, median * 130 / 100))
 }
 
+/// Cached per-query hits: strict matches and same-episode near-misses.
+/// Named fields so call sites cannot swap the two vecs by position.
+struct CachedHits {
+    strict: Vec<WantedHit>,
+    alts: Vec<WantedHit>,
+}
+
+/// Sort best (highest seeders) first, in place.
+fn by_seeders_desc(v: &mut [WantedHit]) {
+    v.sort_by_key(|b| std::cmp::Reverse(b.seeders));
+}
+
 /// Hunt a show's missing episodes on Nyaa with strict release matching.
 ///
 /// Pure query: writes nothing, emits no events. Errors (network, non-200, RSS
@@ -513,56 +536,66 @@ pub async fn find_missing(db: &Db, nyaa: &Nyaa, show_id: i64) -> Result<Vec<Want
     // number only, so (1,2) and (2,2) ask Nyaa the same thing, and the strict
     // filter is episode-scoped too — filtered hits are shared. The linked
     // view page disambiguates cross-season lookalikes.
-    let mut seen: HashMap<String, Vec<WantedHit>> = HashMap::new();
+    let mut seen: HashMap<String, CachedHits> = HashMap::new();
     let mut wanted = Vec::new();
     for (season, number) in wanted_numbers(&per_season, total) {
         let query = format!("{} {number}", show.display_title);
-        let hits = if let Some(cached) = seen.get(&query) {
-            cached.clone()
+        let (hits, alts) = if let Some(cached) = seen.get(&query) {
+            (cached.strict.clone(), cached.alts.clone())
         } else {
             if !seen.is_empty() {
                 // Space per-query searches so a multi-season hunt
                 // does not burst the tracker.
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             }
-            let mut kept: Vec<WantedHit> = nyaa
-                .search(&query)
-                .await?
-                .into_iter()
-                .filter_map(|h| {
-                    // `Some` already guarantees a single episode (no batch/range).
-                    let s = classify_title(&h.title)?;
-                    if s.episode != number {
-                        return None;
-                    }
-                    if let Some(ref g) = pref_group
-                        && s.group.as_deref() != Some(g.as_str())
-                    {
-                        return None;
-                    }
-                    if let Some(ref r) = pref_res
-                        && s.resolution.as_deref() != Some(r.as_str())
-                    {
-                        return None;
-                    }
-                    Some(WantedHit {
-                        title: h.title,
-                        page_url: h.page_url,
-                        torrent_url: h.torrent_url,
-                        info_hash: h.info_hash,
-                        size_bytes: h.size_bytes,
-                        seeders: h.seeders,
-                    })
-                })
-                .collect();
-            kept.sort_by_key(|b| std::cmp::Reverse(b.seeders));
-            seen.insert(query, kept.clone());
-            kept
+            let mut kept: Vec<WantedHit> = Vec::new();
+            let mut near: Vec<WantedHit> = Vec::new();
+            for h in nyaa.search(&query).await? {
+                // `Some` already guarantees a single episode (no batch/range).
+                let Some(s) = classify_title(&h.title) else {
+                    continue;
+                };
+                if s.episode != number {
+                    continue;
+                }
+                let hit = WantedHit {
+                    title: h.title,
+                    page_url: h.page_url,
+                    torrent_url: h.torrent_url,
+                    info_hash: h.info_hash,
+                    size_bytes: h.size_bytes,
+                    seeders: h.seeders,
+                };
+                let group_ok = pref_group
+                    .as_deref()
+                    .is_none_or(|g| s.group.as_deref() == Some(g));
+                let res_ok = pref_res
+                    .as_deref()
+                    .is_none_or(|r| s.resolution.as_deref() == Some(r));
+                if group_ok && res_ok {
+                    kept.push(hit);
+                } else {
+                    near.push(hit);
+                }
+            }
+            by_seeders_desc(&mut kept);
+            by_seeders_desc(&mut near);
+            kept.truncate(MAX_HITS);
+            near.truncate(MAX_ALTS);
+            seen.insert(
+                query,
+                CachedHits {
+                    strict: kept.clone(),
+                    alts: near.clone(),
+                },
+            );
+            (kept, near)
         };
         wanted.push(WantedEpisode {
             season,
             number,
             hits,
+            alts,
         });
     }
     Ok(wanted)
@@ -855,6 +888,11 @@ mod tests {
         assert_eq!(wanted[0].hits.len(), 1, "group/res/range rejects leave one E3 hit");
         assert_eq!(wanted[0].hits[0].seeders, 5);
         assert_eq!(wanted[0].hits[0].page_url, "https://nyaa.si/view/101");
+        assert_eq!(
+            wanted[0].alts.len(),
+            2,
+            "items 102,103 are near-misses, 104 is a range reject"
+        );
         assert!(
             wanted[1].hits.is_empty(),
             "untagged resolution must not match a 1080p preference"
@@ -863,6 +901,106 @@ mod tests {
         assert_eq!(wanted[2].hits[0].seeders, 9, "best first");
         assert_eq!(wanted[2].hits[1].seeders, 2);
         assert_eq!(wanted[3].hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn strict_empty_yields_sorted_capped_alts() {
+        let db = Db::open_memory().unwrap();
+        for (e, p) in [(1u32, "/lib/A/01.mkv"), (3, "/lib/A/03.mkv")] {
+            db.upsert_episode(&pn("A", 1, e, Some("G"), Some("1080p")), &rf(p))
+                .unwrap();
+        }
+        let show_id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+
+        let server = MockServer::start().await;
+        // Two near-misses (wrong group, wrong res), one batch (excluded),
+        // one wrong episode (excluded). Seeders out of order to pin sorting.
+        // Seven same-episode near-misses total would exceed the cap; here two
+        // keep the assertion focused while the cap gets its own case below.
+        mock_q(
+            &server,
+            "A 2",
+            &format!(
+                "{}{}{}{}{}",
+                item_xml("[Other] A - 02 [1080p]", 501, 3),
+                item_xml("[G] A - 02 [720p]", 502, 30),
+                item_xml("[G] A Batch [1080p]", 503, 99),
+                item_xml("[G] A - 03 [1080p]", 504, 99),
+                item_xml("[G] A - 02-03 [1080p]", 505, 99),
+            ),
+        )
+        .await;
+
+        let wanted = find_missing(&db, &Nyaa::with_endpoint(server.uri()).unwrap(), show_id)
+            .await
+            .unwrap();
+        assert_eq!(wanted.len(), 1);
+        assert!(wanted[0].hits.is_empty(), "no strict hit");
+        assert_eq!(wanted[0].alts.len(), 2, "group/res misses surface as alts");
+        assert_eq!(wanted[0].alts[0].seeders, 30, "best first");
+        assert_eq!(wanted[0].alts[1].seeders, 3);
+        assert!(
+            wanted[0].alts.iter().all(|a| a.title.contains("02")),
+            "wrong-episode and batch titles never qualify"
+        );
+        assert!(
+            wanted[0].alts.iter().all(|a| !a.title.contains("02-03")),
+            "ranges never qualify as alts even with top seeders"
+        );
+    }
+
+    #[tokio::test]
+    async fn alts_cap_at_five_best_first() {
+        let db = Db::open_memory().unwrap();
+        for (e, p) in [(1u32, "/lib/C/01.mkv"), (3, "/lib/C/03.mkv")] {
+            db.upsert_episode(&pn("C", 1, e, Some("G"), Some("1080p")), &rf(p))
+                .unwrap();
+        }
+        let show_id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+
+        let server = MockServer::start().await;
+        let mut items = String::new();
+        for i in 0..7u32 {
+            items.push_str(&item_xml(
+                &format!("[Other{i}] C - 02 [1080p]"),
+                600 + i,
+                i,
+            ));
+        }
+        mock_q(&server, "C 2", &items).await;
+
+        let wanted = find_missing(&db, &Nyaa::with_endpoint(server.uri()).unwrap(), show_id)
+            .await
+            .unwrap();
+        assert_eq!(wanted[0].alts.len(), MAX_ALTS);
+        let seeders: Vec<u32> = wanted[0].alts.iter().map(|a| a.seeders).collect();
+        assert_eq!(seeders, vec![6, 5, 4, 3, 2], "best first before truncate");
+    }
+
+    #[tokio::test]
+    async fn both_group_and_res_mismatch_still_alts() {
+        let db = Db::open_memory().unwrap();
+        for (e, p) in [(1u32, "/lib/BM/01.mkv"), (3, "/lib/BM/03.mkv")] {
+            db.upsert_episode(&pn("BM", 1, e, Some("G"), Some("1080p")), &rf(p))
+                .unwrap();
+        }
+        let show_id = db.list_shows("", ShowSort::Title).unwrap()[0].id;
+
+        let server = MockServer::start().await;
+        mock_q(
+            &server,
+            "BM 2",
+            &item_xml("[Other] BM - 02 [720p]", 701, 11),
+        )
+        .await;
+
+        let wanted = find_missing(&db, &Nyaa::with_endpoint(server.uri()).unwrap(), show_id)
+            .await
+            .unwrap();
+        assert_eq!(wanted.len(), 1);
+        assert!(wanted[0].hits.is_empty(), "double miss is not strict");
+        assert_eq!(wanted[0].alts.len(), 1);
+        assert_eq!(wanted[0].alts[0].title, "[Other] BM - 02 [720p]");
     }
 
     #[tokio::test]
@@ -920,7 +1058,11 @@ mod tests {
             .and(query_param("page", "rss"))
             .and(query_param("q", "D 2"))
             .respond_with(ResponseTemplate::new(200).set_body_string(rss_wrap(
-                &item_xml("[G] D - 02 [1080p]", 301, 4),
+                &format!(
+                    "{}{}",
+                    item_xml("[G] D - 02 [1080p]", 301, 4),
+                    item_xml("[Other] D - 02 [1080p]", 302, 7),
+                ),
             )))
             .expect(1)
             .mount(&server)
@@ -933,6 +1075,11 @@ mod tests {
         assert_eq!(nums, vec![(1, 2), (2, 2)]);
         assert_eq!(wanted[0].hits, wanted[1].hits, "shared filtered hits");
         assert_eq!(wanted[0].hits[0].page_url, "https://nyaa.si/view/301");
+        assert_eq!(wanted[0].alts, wanted[1].alts, "shared near-misses");
+        assert!(
+            !wanted[1].alts.is_empty(),
+            "group miss surfaces as alts on both"
+        );
     }
 
     #[test]

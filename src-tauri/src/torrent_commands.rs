@@ -108,6 +108,15 @@ fn validate_torrent_url(url: &str) -> Result<()> {
     let host = parsed
         .host_str()
         .ok_or_else(|| crate::error::AppError::Parse("torrent URL has no host".into()))?;
+    // Torrent bytes are fetched from Nyaa RSS `<link>` URLs only. Pin the host
+    // so a tampered link cannot point the fetcher at an arbitrary server: the
+    // literal-IP checks below stay as defence in depth, but the allowlist is
+    // what closes open-redirect, DNS-rebinding and non-canonical-IP bypasses.
+    if !host.eq_ignore_ascii_case("nyaa.si") && !host.eq_ignore_ascii_case("www.nyaa.si") {
+        return Err(crate::error::AppError::Parse(format!(
+            "refusing torrent URL to non-nyaa host {host}"
+        )));
+    }
     // `host_str` brackets an IPv6 literal; strip it before parsing the address.
     let bare = host.trim_start_matches('[').trim_end_matches(']');
     if bare.eq_ignore_ascii_case("localhost") {
@@ -521,6 +530,11 @@ mod tests {
     #[test]
     fn torrent_url_validation_blocks_ssrf_and_non_http() {
         assert!(validate_torrent_url("https://nyaa.si/download/1.torrent").is_ok());
+        assert!(validate_torrent_url("https://www.nyaa.si/download/1.torrent").is_ok());
+        assert!(validate_torrent_url("https://NYAA.SI/download/1.torrent").is_ok());
+        assert!(validate_torrent_url("https://example.com/x.torrent").is_err());
+        assert!(validate_torrent_url("https://nyaa.si.evil.com/x.torrent").is_err());
+        assert!(validate_torrent_url("https://evilnyaa.si/x.torrent").is_err());
         assert!(validate_torrent_url("http://169.254.169.254/latest/meta-data").is_err());
         assert!(validate_torrent_url("http://localhost/x.torrent").is_err());
         assert!(validate_torrent_url("file:///etc/passwd").is_err());
