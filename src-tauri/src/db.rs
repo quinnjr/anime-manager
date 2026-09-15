@@ -2646,6 +2646,134 @@ mod tests {
     }
 
     #[test]
+    fn recently_downloaded_orders_by_torrent_add_time() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/a/1.mkv", 1, 100))
+            .unwrap();
+        db.upsert_episode(&pn("Mid", 1, 1), &rf("/m/1.mkv", 1, 100))
+            .unwrap();
+        db.upsert_episode(&pn("Zulu", 1, 1), &rf("/z/1.mkv", 1, 100))
+            .unwrap();
+        let id = |t: &str| db.list_shows(t, ShowSort::Title).unwrap()[0].id;
+        let (mid, zulu) = (id("Mid"), id("Zulu"));
+        // One pin per table so the sort must look at both, not just torrent_links.
+        // The batch pin sits on Zulu (added_at=100), which sorts AFTER Alpha by title:
+        // a links-only ORDER BY would yield Mid,Alpha,Zulu and a title-only sort would
+        // yield Alpha,Mid,Zulu, so only a both-tables pin sort yields Mid,Zulu,Alpha.
+        db.add_batch_link(&TorrentBatch {
+            info_hash: "aaa".into(),
+            show_id: zulu,
+            season: 1,
+            first: 1,
+            last: 12,
+            resolution: None,
+            added_at: 100,
+        })
+        .unwrap();
+        db.add_torrent_link(&TorrentLink {
+            info_hash: "bbb".into(),
+            show_id: mid,
+            season: 1,
+            number: 1,
+            added_at: 300,
+        })
+        .unwrap();
+        // Alpha has no pin: no download, so it sorts last rather than first.
+        let titles: Vec<_> = db
+            .list_shows("", ShowSort::RecentlyDownloaded)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.display_title)
+            .collect();
+        assert_eq!(titles, ["Mid", "Zulu", "Alpha"]);
+    }
+
+    #[test]
+    fn recently_downloaded_picks_newest_pin_across_tables() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/a/1.mkv", 1, 100))
+            .unwrap();
+        db.upsert_episode(&pn("Zulu", 1, 1), &rf("/z/1.mkv", 1, 100))
+            .unwrap();
+        let id = |t: &str| db.list_shows(t, ShowSort::Title).unwrap()[0].id;
+        let (alpha, zulu) = (id("Alpha"), id("Zulu"));
+        // Zulu holds both kinds of pin; its newest (batch, 400) must win over its
+        // own older link (100) and over Alpha's link (300). A first-non-null sort
+        // would rank Alpha (300) above Zulu (link 100); title order would too.
+        db.add_torrent_link(&TorrentLink {
+            info_hash: "aaa".into(),
+            show_id: zulu,
+            season: 1,
+            number: 1,
+            added_at: 100,
+        })
+        .unwrap();
+        db.add_batch_link(&TorrentBatch {
+            info_hash: "bbb".into(),
+            show_id: zulu,
+            season: 1,
+            first: 1,
+            last: 12,
+            resolution: None,
+            added_at: 400,
+        })
+        .unwrap();
+        db.add_torrent_link(&TorrentLink {
+            info_hash: "ccc".into(),
+            show_id: alpha,
+            season: 1,
+            number: 1,
+            added_at: 300,
+        })
+        .unwrap();
+        let titles: Vec<_> = db
+            .list_shows("", ShowSort::RecentlyDownloaded)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.display_title)
+            .collect();
+        assert_eq!(titles, ["Zulu", "Alpha"]);
+    }
+
+    #[test]
+    fn recently_downloaded_tie_falls_back_to_title() {
+        let db = Db::open_memory().unwrap();
+        // Insert Zulu first so insertion/pin order opposes alphabetical order:
+        // only the title fallback can yield Alpha before Zulu on equal added_at.
+        db.upsert_episode(&pn("Zulu", 1, 1), &rf("/z/1.mkv", 1, 100))
+            .unwrap();
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/a/1.mkv", 1, 100))
+            .unwrap();
+        let id = |t: &str| db.list_shows(t, ShowSort::Title).unwrap()[0].id;
+        let (alpha, zulu) = (id("Alpha"), id("Zulu"));
+        db.add_batch_link(&TorrentBatch {
+            info_hash: "aaa".into(),
+            show_id: zulu,
+            season: 1,
+            first: 1,
+            last: 12,
+            resolution: None,
+            added_at: 200,
+        })
+        .unwrap();
+        db.add_torrent_link(&TorrentLink {
+            info_hash: "bbb".into(),
+            show_id: alpha,
+            season: 1,
+            number: 1,
+            added_at: 200,
+        })
+        .unwrap();
+        let titles: Vec<_> = db
+            .list_shows("", ShowSort::RecentlyDownloaded)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.display_title)
+            .collect();
+        assert_eq!(titles, ["Alpha", "Zulu"]);
+    }
+
+    #[test]
     fn sorting_ties_fall_back_to_title() {
         let db = Db::open_memory().unwrap();
         for t in ["Charlie", "alpha", "Bravo"] {
@@ -2653,10 +2781,12 @@ mod tests {
                 .unwrap();
         }
         // Identical on every sortable axis, so only the title fallback can order them.
+        // No torrent pins here, so RecentlyDownloaded is NULL for every row by construction.
         for s in [
             ShowSort::Unwatched,
             ShowSort::LastPlayed,
             ShowSort::RecentlyUpdated,
+            ShowSort::RecentlyDownloaded,
         ] {
             let titles: Vec<_> = db
                 .list_shows("", s)
