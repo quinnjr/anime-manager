@@ -4,7 +4,7 @@ use crate::error::Result;
 use crate::llm::{self, AssistQueue, Llm};
 use crate::metadata::{self, Providers};
 use crate::models::*;
-use crate::nyaa::{self, Nyaa, WantedEpisode};
+use crate::nyaa::{self, Nyaa, SourceComparison, WantedEpisode};
 use crate::player::{self, Player};
 use crate::rename;
 use crate::torrent;
@@ -932,6 +932,18 @@ pub async fn find_missing(
     show_id: i64,
 ) -> Result<Vec<WantedEpisode>> {
     nyaa::find_missing(&state.db, &Nyaa::with_endpoint(nyaa::NYAA_BASE.into())?, show_id).await
+}
+
+/// Per-resolution seeder picture for a show from one title-only Nyaa search —
+/// whether 1080p is actually better seeded than 720p, and which packs exist.
+/// `find_missing` cannot answer this: its per-episode filter discards packs.
+/// Pure query: writes nothing, emits nothing.
+#[tauri::command]
+pub async fn compare_sources(
+    state: State<'_, AppState>,
+    show_id: i64,
+) -> Result<SourceComparison> {
+    nyaa::compare_sources(&state.db, &Nyaa::with_endpoint(nyaa::NYAA_BASE.into())?, show_id).await
 }
 
 /// Model ids offered by whatever provider is configured right now.

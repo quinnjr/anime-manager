@@ -2,8 +2,8 @@ use crate::db::Db;
 use crate::error::{AppError, Result};
 use crate::http::{read_capped, send_with_retry, snippet};
 use crate::models::{
-    LinkedTo, LinkedTorrent, RssFeedConfig, RssFeedView, ShowSort, TorrentDetail, TorrentFile,
-    TorrentInfo,
+    LinkedBatch, LinkedTo, LinkedTorrent, RssFeedConfig, RssFeedView, ShowSort, TorrentDetail,
+    TorrentFile, TorrentInfo,
 };
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -460,11 +460,12 @@ impl TorrentClient {
     }
 
     /// Resolve each torrent to the episode it belongs to, for the Downloads
-    /// view. The add-time pin (`torrent_links`) wins; anything without a pin
-    /// is backfilled by joining the torrent's `save_path` + `files[]`
-    /// against episode paths. Pure query: writes nothing. One failing
-    /// torrent (gone from the server, unreachable detail) resolves to
-    /// `linked: None` and never fails the list.
+    /// view. The add-time pin (`torrent_links`) wins; a pack pin
+    /// (`torrent_batches`) covers a range and is reported alongside;
+    /// anything with neither is backfilled by joining the torrent's
+    /// `save_path` + `files[]` against episode paths. Pure query: writes
+    /// nothing. One failing torrent (gone from the server, unreachable
+    /// detail) resolves to `linked: None` and never fails the list.
     pub async fn attribute(&self, db: &Db, torrents: Vec<TorrentInfo>) -> Vec<LinkedTorrent> {
         let mut index: Option<Vec<(i64, u32, u32, String)>> = None;
         // The NAS map is stored, so read it once here — never per torrent —
@@ -484,6 +485,7 @@ impl TorrentClient {
         // behavior. Only Ok(empty) (Some([])) fails closed — with no roots
         // nothing can match, so every unpinned torrent skips its detail fetch.
         let mut out = Vec::with_capacity(torrents.len());
+        let mut batch_errors = 0u32;
         for info in torrents {
             let linked = match db.torrent_link(&info.info_hash) {
                 Ok(Some(link)) => Some(LinkedTo {
@@ -506,7 +508,30 @@ impl TorrentClient {
                     None
                 }
             };
-            out.push(LinkedTorrent { info, linked });
+            // Pack pins never shadow single pins and never backfill: the
+            // range names its episodes directly, and a read failure resolves
+            // to no badge rather than a wrong one.
+            let batch = match db.batch_link(&info.info_hash) {
+                Ok(b) => b.map(|link| LinkedBatch {
+                    show_id: link.show_id,
+                    season: link.season,
+                    first: link.first,
+                    last: link.last,
+                }),
+                Err(_) => {
+                    // Counted and reported once below: per-torrent stderr is
+                    // discarded in the packaged app, and a failing DB would
+                    // flood it on every 3s Downloads poll.
+                    batch_errors += 1;
+                    None
+                }
+            };
+            out.push(LinkedTorrent { info, linked, batch });
+        }
+        if batch_errors > 0 {
+            eprintln!(
+                "torrent attribute: {batch_errors} batch lookup(s) failed; pack badges suppressed"
+            );
         }
         out
     }
@@ -1479,6 +1504,60 @@ mod tests {
         assert_eq!(out[0].linked, Some(crate::models::LinkedTo { show_id: owned, season: 1, number: 1 }));
         assert_eq!(out[1].linked, Some(crate::models::LinkedTo { show_id: owned, season: 1, number: 1 }));
         assert_eq!(out[2].linked, None, "detail failure leaves linked None, never fails the list");
+    }
+
+    #[tokio::test]
+    async fn attribute_reports_batch_pins_without_backfill() {
+        use crate::models::TorrentBatch;
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        // No detail mock: a batch pin must never trigger a detail fetch.
+        let db = Db::open_memory().unwrap();
+        db.add_root("/r1").unwrap();
+        db.upsert_episode(&pn("Owned", 1), &rf("/r1/Owned/01.mkv", 11)).unwrap();
+        let owned = show_id(&db, "Owned");
+        db.add_batch_link(&TorrentBatch {
+            info_hash: "pack".into(), show_id: owned, season: 1,
+            first: 1, last: 12, resolution: Some("1080p".into()), added_at: 0,
+        }).unwrap();
+        db.add_torrent_link(&TorrentLink {
+            info_hash: "both".into(), show_id: owned, season: 1, number: 1, added_at: 0,
+        }).unwrap();
+        db.add_batch_link(&TorrentBatch {
+            info_hash: "both".into(), show_id: owned, season: 1,
+            first: 1, last: 12, resolution: None, added_at: 0,
+        }).unwrap();
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        let out = c
+            .attribute(&db, vec![torrent_info("pack"), torrent_info("both")])
+            .await;
+        assert_eq!(out[0].linked, None, "a pure pack pin backfills nothing on its own");
+        assert_eq!(
+            out[0].batch,
+            Some(crate::models::LinkedBatch { show_id: owned, season: 1, first: 1, last: 12 }),
+            "pack range reported for the badge"
+        );
+        assert!(out[1].linked.is_some(), "single pin still wins");
+        assert!(out[1].batch.is_some(), "coexisting pack pin still reported");
+    }
+
+    #[tokio::test]
+    async fn attribute_batch_lookup_failure_yields_no_badge() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        let db = Db::open_memory().unwrap();
+        db.add_root("/r1").unwrap();
+        // Dropping the table poisons every batch_link read; the list must
+        // still resolve with batch None rather than failing.
+        db.with(|c| {
+            c.execute_batch("DROP TABLE torrent_batches;")?;
+            Ok(())
+        })
+        .unwrap();
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        let out = c.attribute(&db, vec![torrent_info("pack")]).await;
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].batch, None, "unreadable pack pins resolve to no badge");
     }
 
     #[test]
