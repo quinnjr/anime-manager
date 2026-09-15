@@ -98,6 +98,10 @@ export interface TorrentAddArgs {
 /** Known settings keys on top of the free-form string map, so a typo fails loudly. */
 export type SettingsMap = Record<string, string> & {
   auto_scan_interval_mins?: string;
+  mpv_path?: string;
+  vlc_path?: string;
+  player_backend?: 'mpv' | 'vlc';
+  played_threshold?: string;
   library_sort?: ShowSort;
   dlna_name?: string;
   dlna_port?: string;

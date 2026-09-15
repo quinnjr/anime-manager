@@ -11,6 +11,7 @@
   import ModelPickerModal from '$lib/components/ModelPickerModal.svelte';
   import { matching } from '$lib/stores/matching.svelte';
   import { DEFAULT_AUTO_SCAN_MINS, parseValidatedAutoScanMins } from '$lib/autoScan';
+  import { normalizePlayerBackend, playerSaveValue, DEFAULT_MPV_PATH, DEFAULT_VLC_PATH } from '$lib/playerSettings';
   import { scanSlot } from '$lib/stores/scan.svelte';
 
   let roots = $state<Root[]>([]);
@@ -21,6 +22,8 @@
   let autoScanMins = $state(String(DEFAULT_AUTO_SCAN_MINS));
 
   let mpvPath = $state('mpv');
+  let vlcPath = $state('vlc');
+  let playerBackend = $state('mpv');
   let threshold = $state('0.9');
   let llmKey = $state('');
   let llmModel = $state('');
@@ -77,7 +80,9 @@
   async function loadSettings() {
     try {
       const s = await api.getSettings();
-      mpvPath = s.mpv_path ?? 'mpv';
+      mpvPath = s.mpv_path ?? DEFAULT_MPV_PATH;
+      vlcPath = s.vlc_path ?? DEFAULT_VLC_PATH;
+      playerBackend = normalizePlayerBackend(s.player_backend);
       threshold = s.played_threshold ?? '0.9';
       llmKey = s.llm_api_key ?? '';
       llmModel = s.llm_model ?? '';
@@ -185,6 +190,8 @@
     if (autoMins === null) { toasts.push('error', 'Auto-scan interval must be a whole number of minutes (0 turns it off)'); return false; }
     try {
       await api.setSetting('mpv_path', mpvPath.trim());
+      await api.setSetting('vlc_path', vlcPath.trim());
+      await api.setSetting('player_backend', playerSaveValue(playerBackend));
       await api.setSetting('played_threshold', String(t));
       await api.setSetting('auto_scan_interval_mins', String(autoMins));
       await api.setSetting('llm_api_key', llmKey.trim());
@@ -412,13 +419,25 @@
     <h2 class="eyebrow mb-3">Playback</h2>
     <div class="grid gap-3 sm:grid-cols-2">
       <label class="block text-sm">
-        <span class="text-muted">mpv command</span>
-        <input bind:value={mpvPath} class="field mt-1 w-full" />
+        <span class="text-muted">Player</span>
+        <select bind:value={playerBackend} class="field mt-1 w-full">
+          <option value="mpv">mpv</option>
+          <option value="vlc">VLC</option>
+        </select>
+        <span class="tag mt-1 block">falls back to the other one when missing</span>
       </label>
       <label class="block text-sm">
         <span class="text-muted">Counts as watched past</span>
         <input bind:value={threshold} class="field mt-1 w-full" />
         <span class="tag mt-1 block">a fraction, so 0.9 means ninety percent</span>
+      </label>
+      <label class="block text-sm">
+        <span class="text-muted">mpv command</span>
+        <input bind:value={mpvPath} class="field mt-1 w-full" />
+      </label>
+      <label class="block text-sm">
+        <span class="text-muted">VLC command</span>
+        <input bind:value={vlcPath} class="field mt-1 w-full" />
       </label>
     </div>
   </section>
