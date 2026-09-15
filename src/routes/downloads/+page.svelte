@@ -3,6 +3,7 @@
   import { api, onEvent, type TorrentControlOp, type TorrentEntry } from '$lib/api';
   import { toasts } from '$lib/stores/toasts.svelte';
   import { errMessage } from '$lib/errors';
+  import { TORRENT_POLL_MS, torrentPollDelay } from '$lib/torrentPoll';
   import TorrentRow from '$lib/components/TorrentRow.svelte';
 
   let torrents = $state<TorrentEntry[]>([]);
@@ -10,6 +11,9 @@
   let loaded = $state(false);
   let loadError = $state<string | null>(null);
   let busyHash = $state<string | null>(null);
+  // Consecutive background-load failures; drives poll backoff. Manual
+  // refreshes never touch it — an explicit retry is the user's own cadence.
+  let failCount = 0;
 
   // Background loads render their failure (Settings link + retry) rather than
   // failing silently; only a manual Refresh additionally toasts.
@@ -19,9 +23,11 @@
       torrents = await api.torrentList();
       loaded = true;
       loadError = null;
+      failCount = 0;
     } catch (e) {
       loadError = errMessage(e);
       if (manual) toasts.error(e);
+      else failCount += 1;
     } finally { loading = false; }
   }
 
@@ -35,9 +41,28 @@
 
   onMount(() => {
     load();
-    // Phase 1 has no timers: mount, manual refresh, and server-pushed change events.
-    const p = onEvent('torrent-changed', () => void load());
-    return () => { void p.then((u) => u()); };
+    // Poll while mounted so progress/speeds stay live; the delay backs off
+    // while the server is unreachable so a dead server is not hammered.
+    // Manual refresh and server-pushed change events reload immediately;
+    // every path skips while a load is in flight so slow lists cannot
+    // overlap. Nothing is scheduled after unmount.
+    let alive = true;
+    let timer: ReturnType<typeof setTimeout>;
+    // One chain only: each tick settles (a skipped tick settles at once)
+    // and schedules exactly one successor, so overlapping loads can never
+    // fork extra timers.
+    const poll = () => {
+      timer = setTimeout(
+        () => {
+          if (!alive) return;
+          void (loading ? Promise.resolve() : load()).then(() => { if (alive) poll(); });
+        },
+        failCount === 0 ? TORRENT_POLL_MS : torrentPollDelay(failCount)
+      );
+    };
+    poll();
+    const p = onEvent('torrent-changed', () => { if (!loading) void load(); });
+    return () => { alive = false; clearTimeout(timer); void p.then((u) => u()); };
   });
 </script>
 
