@@ -89,7 +89,7 @@ export interface TorrentInfo {
   info_hash: string; name: string; status: string; progress: number;
   total_size: number; downloaded: number; download_speed: number; upload_speed: number;
   peers: number; seeds: number; save_path: string; category: string | null;
-  ratio: number; eta: number | null; error_message: string | null;
+  ratio: number; eta: number | null; completed_at: string | null; error_message: string | null;
 }
 export interface LinkedTo { show_id: number; season: number; number: number }
 export interface LinkedBatch { show_id: number; season: number; first: number; last: number }

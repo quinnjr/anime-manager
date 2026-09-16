@@ -387,7 +387,7 @@ pub struct TorrentWatchStatus {
     pub info_hash: String,
     #[serde(default)] pub progress: f64,
     #[serde(default)] pub status: String,
-    pub completed_at: Option<String>,
+    #[serde(default)] pub completed_at: Option<String>,
 }
 /// POST /api/rss/feeds body: which remote feed to poll and what to grab.
 /// `exclude_batch` reproduces the strict no-packs rule.

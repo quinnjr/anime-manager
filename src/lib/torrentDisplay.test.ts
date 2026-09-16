@@ -56,7 +56,7 @@ describe('matchBatch', () => {
     info_hash: 'abc', name: 'x', status: 'downloading', progress: 0.5,
     total_size: 1, downloaded: 0, download_speed: 0, upload_speed: 0,
     peers: 0, seeds: 0, save_path: '/dl', category: null,
-    ratio: 0, eta: null, error_message: null, linked: null, batch,
+    ratio: 0, eta: null, completed_at: null, error_message: null, linked: null, batch,
   });
 
   it('matches inside the range and at both edges', () => {
