@@ -55,6 +55,12 @@ describe('torrent api', () => {
     expect(invokeMock).toHaveBeenCalledWith('torrent_list');
   });
 
+  it('fetches pinned torrent status with no args', async () => {
+    invokeMock.mockResolvedValueOnce([]);
+    await api.torrentWatchStatus();
+    expect(invokeMock).toHaveBeenCalledWith('torrent_watch_status');
+  });
+
   it('adds by url with camelCase args', async () => {
     invokeMock.mockResolvedValueOnce('abc123');
     await api.torrentAdd({ torrentUrl: 'http://x/y.torrent', infoHash: null, showId: 3, season: 1, number: 6, savePath: null, category: null });

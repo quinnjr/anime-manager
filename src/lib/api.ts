@@ -94,6 +94,10 @@ export interface TorrentInfo {
 export interface LinkedTo { show_id: number; season: number; number: number }
 export interface LinkedBatch { show_id: number; season: number; first: number; last: number }
 export interface TorrentEntry extends TorrentInfo { linked: LinkedTo | null; batch?: LinkedBatch | null }
+/** Minimal pinned-torrent status row for the completion watcher. */
+export interface TorrentWatchStatus {
+  info_hash: string; progress: number; status: string; completed_at: string | null;
+}
 export interface TorrentPrefs { show_id: number; save_path: string | null; category: string | null }
 export interface RssFeedView {
   label: string; url: string; search: string; category: string; enabled: boolean; show_id: number | null;
@@ -168,6 +172,7 @@ export const api = {
   torrentDiscover: () => invoke<string[]>('torrent_discover'),
   torrentTest: () => invoke<string>('torrent_test'),
   torrentList: () => invoke<TorrentEntry[]>('torrent_list'),
+  torrentWatchStatus: () => invoke<TorrentWatchStatus[]>('torrent_watch_status'),
   torrentAdd: (args: TorrentAddArgs) => invoke<string>('torrent_add', { args }),
   torrentControl: (infoHash: string, op: TorrentControlOp) => invoke<void>('torrent_control', { infoHash, op }),
   torrentPrefsGet: (showId: number) => invoke<TorrentPrefs>('torrent_prefs_get', { showId }),
