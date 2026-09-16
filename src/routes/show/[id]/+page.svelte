@@ -418,7 +418,7 @@
           </label>
           <label class="flex w-40 flex-col gap-1">
             <span class="tag">Category</span>
-            <input bind:value={catDraft} aria-label="Category" placeholder="anime" class="field font-mono text-xs" />
+            <input bind:value={catDraft} aria-label="Category" placeholder="Anime" class="field font-mono text-xs" />
           </label>
           <button class="btn shrink-0" disabled={prefsSaving}>{prefsSaving ? 'Saving…' : 'Save location'}</button>
         </form>

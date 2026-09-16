@@ -7,8 +7,10 @@ use crate::torrent;
 use tauri::{AppHandle, Emitter, State};
 
 /// Category rustorrent files an add under when neither the show's prefs nor the
-/// caller name one.
-pub const DEFAULT_CATEGORY: &str = "anime";
+/// caller name one. This must match the server's own category: an unknown name
+/// makes rustorrent join it onto the server root (e.g. /downloads/anime),
+/// outside every library root, so the files never scan in and grey out.
+pub const DEFAULT_CATEGORY: &str = "Anime";
 
 /// Control/add/RSS paths refuse while the connection test is disarmed, with a toast
 /// pointing at Settings. Discover and test are always allowed.
@@ -638,6 +640,25 @@ mod tests {
         assert!(outside_roots("/other/place", &map, &roots));
         // With no map the raw server path is compared as-is and matches no root.
         assert!(outside_roots("/downloads/Frieren", &[], &roots));
+    }
+
+    #[test]
+    fn default_category_resolves_inside_the_library_on_a_stock_server() {
+        // Regression: the default was "anime" but a stock rustorrent only ships
+        // "Anime", so the server filed every default-category add under
+        // /downloads/anime — outside every library root, unscanned, grey.
+        let cfg = torrent::ServerConfig {
+            default_save_path: Some("/downloads".into()),
+            categories: vec![torrent::ServerCategory {
+                name: "Anime".into(),
+                save_subpath: None,
+                default_save_path: None,
+            }],
+        };
+        assert_eq!(
+            torrent::resolve_category_path(&cfg, DEFAULT_CATEGORY),
+            "/downloads/Anime"
+        );
     }
 
     #[test]
