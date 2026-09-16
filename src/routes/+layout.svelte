@@ -10,9 +10,10 @@
   import { toasts } from '$lib/stores/toasts.svelte';
   import {
     DEFAULT_AUTO_SCAN_MINS, RETRY_SOON_MINS,
-    parseAutoScanMins, planPass, shouldAutoScan, toTimeoutMs, withTimeout, SCAN_TIMEOUT_MS
+    parseAutoScanMins, planPass, toTimeoutMs, withTimeout, SCAN_TIMEOUT_MS
   } from '$lib/autoScan';
-  import { detectCompletions, QUIET_WINDOW_MS, WATCH_INTERVAL_MS, type WatchBaseline } from '$lib/torrentWatch';
+  import { detectCompletions, QUIET_WINDOW_MS, WATCH_INTERVAL_MS, watchGatesPass, type WatchBaseline } from '$lib/torrentWatch';
+  import { isTestedFlag } from '$lib/llmModels';
   import { scanSlot } from '$lib/stores/scan.svelte';
   import type { ScanSummary } from '$lib/api';
   import Toasts from '$lib/components/Toasts.svelte';
@@ -89,14 +90,18 @@
   let quietTimer: ReturnType<typeof setTimeout> | undefined;
   let watchBaseline: WatchBaseline = new Map();
   let pendingCompletions = 0;
+  let watchInFlight = false;
 
   async function watchPass(): Promise<void> {
-    if (autoCancelled) return;
+    if (autoCancelled || watchInFlight) return;
+    watchInFlight = true;
     try {
       const [roots, s] = await Promise.all([api.listRoots(), api.getSettings()]);
       if (autoCancelled) return;
-      if (!shouldAutoScan(roots.length, parseAutoScanMins(s.auto_scan_interval_mins))) return;
-      if (s.torrent_test_ok !== 'true') return;
+      if (!watchGatesPass(roots.length, parseAutoScanMins(s.auto_scan_interval_mins), isTestedFlag(s.torrent_test_ok))) {
+        watchBaseline = new Map();
+        return;
+      }
       const { baseline, completed } = detectCompletions(watchBaseline, await api.torrentWatchStatus());
       if (autoCancelled) return;
       watchBaseline = baseline;
@@ -106,6 +111,8 @@
       quietTimer = setTimeout(() => { void fireCompletionSync(); }, QUIET_WINDOW_MS);
     } catch (e) {
       console.error('torrent watch failed', e);
+    } finally {
+      watchInFlight = false;
     }
   }
 
@@ -115,7 +122,15 @@
     try {
       // Null when the slot is held: the running scan ingests the files anyway.
       const summary = await scanSlot.withSlot(() => withTimeout(api.scan(), SCAN_TIMEOUT_MS));
-      if (summary === null) return;
+      if (summary === null) {
+        // Slot held: the running scan may have snapshotted before the new files
+        // landed, so restore the count and re-arm the quiet timer instead of
+        // dropping it.
+        pendingCompletions += n;
+        clearTimeout(quietTimer);
+        quietTimer = setTimeout(() => { void fireCompletionSync(); }, QUIET_WINDOW_MS);
+        return;
+      }
       toasts.push('success', `${n} finished — library synced.`);
     } catch (e) {
       console.error('completion sync failed', e);

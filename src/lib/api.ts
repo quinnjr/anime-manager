@@ -95,6 +95,7 @@ export interface LinkedTo { show_id: number; season: number; number: number }
 export interface LinkedBatch { show_id: number; season: number; first: number; last: number }
 export interface TorrentEntry extends TorrentInfo { linked: LinkedTo | null; batch?: LinkedBatch | null }
 /** Minimal pinned-torrent status row for the completion watcher. */
+/** Narrow watcher payload — twin of the Rust TorrentWatchStatus; extend both together. */
 export interface TorrentWatchStatus {
   info_hash: string; progress: number; status: string; completed_at: string | null;
 }

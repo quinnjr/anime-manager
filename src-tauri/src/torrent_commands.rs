@@ -90,14 +90,27 @@ async fn watch_status(
 ) -> Result<Vec<TorrentWatchStatus>> {
     let list = client.list().await?;
     let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for info in &list {
-        let key = info.info_hash.trim().to_lowercase();
-        if key.is_empty() {
+        let key = db::normalize_hash(&info.info_hash);
+        if key.is_empty() || !seen.insert(key.clone()) {
             continue;
         }
-        let pinned =
-            db.torrent_link(&key)?.is_some() || db.batch_link(&key)?.is_some();
-        if !pinned {
+        let single = match db.torrent_link(&key) {
+            Ok(v) => v.is_some(),
+            Err(e) => {
+                eprintln!("watch_status: single pin lookup failed for {key}: {e}");
+                continue;
+            }
+        };
+        let batched = match db.batch_link(&key) {
+            Ok(v) => v.is_some(),
+            Err(e) => {
+                eprintln!("watch_status: batch pin lookup failed for {key}: {e}");
+                continue;
+            }
+        };
+        if !(single || batched) {
             continue;
         }
         out.push(TorrentWatchStatus {
@@ -123,12 +136,12 @@ pub async fn torrent_watch_status(
 /// caller falls through to a download+add. A blank or absent hash never matches, and a
 /// differently-cased one matches its normalized form (hashes are case-insensitive hex).
 fn server_has_hash(list: &[TorrentInfo], given: Option<&str>) -> Option<String> {
-    let given = given?.trim().to_lowercase();
+    let given = db::normalize_hash(given?);
     if given.is_empty() {
         return None;
     }
     list.iter()
-        .any(|t| t.info_hash.trim().to_lowercase() == given)
+        .any(|t| db::normalize_hash(&t.info_hash) == given)
         .then_some(given)
 }
 
@@ -919,5 +932,171 @@ mod tests {
         assert_eq!(rows[0].info_hash, "aabbcc");
         assert_eq!(rows[0].progress, 1.0);
         assert_eq!(rows[0].completed_at.as_deref(), Some("2026-09-15T16:00:00+00:00"));
+    }
+
+    #[tokio::test]
+    async fn watch_status_includes_batch_pinned_hash() {
+        let s = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/login"))
+            .respond_with(|_: &wiremock::Request| {
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("set-cookie", "rustorrent_token=jwt123; Path=/; HttpOnly")
+                    .set_body_json(serde_json::json!({"ok": true}))
+            })
+            .mount(&s)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/torrents"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!([
+                    {"info_hash": "aabbcc", "name": "Pack", "status": "Seeding", "progress": 1.0, "completed_at": null},
+                    {"info_hash": "  AABBCC  ", "name": "Pack duplicate", "status": "Seeding", "progress": 1.0, "completed_at": null},
+                    {"info_hash": "ddeeff", "name": "Stranger", "status": "Downloading", "progress": 0.4, "completed_at": null}
+                ]),
+            ))
+            .mount(&s)
+            .await;
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(
+            &crate::parser::ParsedName {
+                title: "Pinned".into(),
+                season: 1,
+                episode: 1,
+                release_group: None,
+                resolution: None,
+                crc: None,
+            },
+            &crate::scanner::RawFile {
+                path: std::path::PathBuf::from("/r/Pinned/01.mkv"),
+                size: 1,
+                mtime: 1,
+                stem: String::new(),
+                dirs: vec![],
+            },
+        )
+        .unwrap();
+        let show_id = db
+            .show_id_for_path("/r/Pinned/01.mkv")
+            .unwrap()
+            .expect("show seeded");
+        db.add_batch_link(&TorrentBatch {
+            info_hash: "aabbcc".into(),
+            show_id,
+            season: 1,
+            first: 1,
+            last: 12,
+            resolution: Some("1080p".into()),
+            added_at: 0,
+        })
+        .unwrap();
+        let client = torrent::TorrentClient::new(s.uri(), Some("pw".into()));
+        let rows = watch_status(&client, &db).await.unwrap();
+        assert_eq!(rows.len(), 1, "duplicated batch hash yields one row, stranger omitted");
+        assert_eq!(rows[0].info_hash, "aabbcc");
+    }
+
+    #[tokio::test]
+    async fn watch_status_propagates_list_failure() {
+        let s = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/login"))
+            .respond_with(|_: &wiremock::Request| {
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("set-cookie", "rustorrent_token=jwt123; Path=/; HttpOnly")
+                    .set_body_json(serde_json::json!({"ok": true}))
+            })
+            .mount(&s)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/torrents"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&s)
+            .await;
+        let db = Db::open_memory().unwrap();
+        let client = torrent::TorrentClient::new(s.uri(), Some("pw".into()));
+        assert!(watch_status(&client, &db).await.is_err(), "whole-poll failure propagates");
+    }
+
+    #[tokio::test]
+    async fn watch_status_omits_pinned_hash_absent_from_server() {
+        let s = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/login"))
+            .respond_with(|_: &wiremock::Request| {
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("set-cookie", "rustorrent_token=jwt123; Path=/; HttpOnly")
+                    .set_body_json(serde_json::json!({"ok": true}))
+            })
+            .mount(&s)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/torrents"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!([
+                    {"info_hash": "ddeeff", "name": "Stranger", "status": "Downloading", "progress": 0.4, "completed_at": null}
+                ]),
+            ))
+            .mount(&s)
+            .await;
+        let db = Db::open_memory().unwrap();
+        seed_pin(&db, "zz1122");
+        let client = torrent::TorrentClient::new(s.uri(), Some("pw".into()));
+        let rows = watch_status(&client, &db).await.unwrap();
+        assert!(rows.is_empty(), "absent pinned hash is omitted, not an error");
+        assert!(db.torrent_link("zz1122").unwrap().is_some(), "the pin itself is retained");
+    }
+
+    #[tokio::test]
+    async fn watch_status_empty_list_ok() {
+        let s = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/login"))
+            .respond_with(|_: &wiremock::Request| {
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("set-cookie", "rustorrent_token=jwt123; Path=/; HttpOnly")
+                    .set_body_json(serde_json::json!({"ok": true}))
+            })
+            .mount(&s)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/torrents"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&s)
+            .await;
+        let db = Db::open_memory().unwrap();
+        let client = torrent::TorrentClient::new(s.uri(), Some("pw".into()));
+        let rows = watch_status(&client, &db).await.unwrap();
+        assert!(rows.is_empty(), "empty server list is Ok with no rows");
+    }
+
+    #[tokio::test]
+    async fn watch_status_skips_blank_hashes() {
+        let s = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/login"))
+            .respond_with(|_: &wiremock::Request| {
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("set-cookie", "rustorrent_token=jwt123; Path=/; HttpOnly")
+                    .set_body_json(serde_json::json!({"ok": true}))
+            })
+            .mount(&s)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/torrents"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!([
+                    {"info_hash": "   ", "name": "Blank", "status": "Downloading", "progress": 0.1, "completed_at": null},
+                    {"info_hash": "  AABBCC  ", "name": "Pinned Show S01E01", "status": "Seeding", "progress": 1.0, "completed_at": null}
+                ]),
+            ))
+            .mount(&s)
+            .await;
+        let db = Db::open_memory().unwrap();
+        seed_pin(&db, "aabbcc");
+        let client = torrent::TorrentClient::new(s.uri(), Some("pw".into()));
+        let rows = watch_status(&client, &db).await.unwrap();
+        assert_eq!(rows.len(), 1, "blank hashes are skipped");
+        assert_eq!(rows[0].info_hash, "aabbcc", "mixed case + spaces normalize to one row");
     }
 }

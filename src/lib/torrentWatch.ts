@@ -24,8 +24,11 @@ export function detectCompletions(
     const h = (r.info_hash ?? '').trim().toLowerCase();
     if (!h || seen.has(h)) continue;
     seen.add(h);
-    const progress = r.progress ?? 0;
-    const completedAt = r.completed_at ?? null;
+    const rawProgress = r.progress;
+    if (typeof rawProgress !== 'number' || !Number.isFinite(rawProgress)) continue;
+    const progress = rawProgress;
+    const raw = r.completed_at;
+    const completedAt = raw != null && raw.trim() !== '' ? raw : null;
     const was = next.get(h);
     next.set(h, { progress, completedAt });
     if (was !== undefined && (
@@ -36,4 +39,9 @@ export function detectCompletions(
     }
   }
   return { baseline: next, completed };
+}
+
+/** Whether a watcher tick may poll + sync: needs roots, a non-zero interval, and an armed torrent config. */
+export function watchGatesPass(rootCount: number, intervalMins: number, armed: boolean): boolean {
+  return rootCount > 0 && intervalMins > 0 && armed;
 }

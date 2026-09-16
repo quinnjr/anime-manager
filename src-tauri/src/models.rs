@@ -362,6 +362,7 @@ pub struct TorrentInfo {
     #[serde(default)] pub peers: usize, #[serde(default)] pub seeds: usize,
     #[serde(default)] pub save_path: String, #[serde(default)] pub category: Option<String>,
     #[serde(default)] pub ratio: f64, pub eta: Option<u64>,
+    /// Twin: TorrentWatchStatus.completed_at below — extend both when the watcher needs a new server field.
     #[serde(default)] pub completed_at: Option<String>,
     pub error_message: Option<String>,
 }
@@ -387,6 +388,7 @@ pub struct TorrentWatchStatus {
     pub info_hash: String,
     #[serde(default)] pub progress: f64,
     #[serde(default)] pub status: String,
+    /// Twin: TorrentInfo.completed_at above — extend both when the watcher needs a new server field.
     #[serde(default)] pub completed_at: Option<String>,
 }
 /// POST /api/rss/feeds body: which remote feed to poll and what to grab.

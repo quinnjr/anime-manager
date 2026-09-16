@@ -56,8 +56,9 @@ describe('torrent api', () => {
   });
 
   it('fetches pinned torrent status with no args', async () => {
-    invokeMock.mockResolvedValueOnce([]);
-    await api.torrentWatchStatus();
+    const rows = [{ info_hash: 'aabbcc', progress: 1, status: 'Seeding', completed_at: null }];
+    invokeMock.mockResolvedValueOnce(rows);
+    await expect(api.torrentWatchStatus()).resolves.toEqual(rows);
     expect(invokeMock).toHaveBeenCalledWith('torrent_watch_status');
   });
 
@@ -105,7 +106,7 @@ describe('torrent api', () => {
       info_hash: 'abc123', name: 'show', status: 'downloading', progress: 0.62,
       total_size: 0, downloaded: 0, download_speed: 0, upload_speed: 0,
       peers: 0, seeds: 0, save_path: '', category: null, ratio: 0,
-      eta: null, error_message: null,
+      eta: null, completed_at: null, error_message: null,
       linked: { show_id: 1, season: 1, number: 6 }
     }]);
     const rows = await api.torrentList();
