@@ -12,7 +12,7 @@
   import Cover from '$lib/components/Cover.svelte';
   import { flatten } from '$lib/episodes';
   import { extractResolution, formatSize, formatSourceComparison, parseBatchRange, summariseWanted } from '$lib/nyaaDisplay';
-  import { batchSendKey, isSavePathInsideRoots, matchBatch, sendButtonState } from '$lib/torrentDisplay';
+  import { batchSendKey, isSavePathInsideRoots, matchBatch, sendButtonState, torrentsForShow } from '$lib/torrentDisplay';
   import { errMessage } from '$lib/errors';
   import SeasonList from '$lib/components/SeasonList.svelte';
   import TorrentRow from '$lib/components/TorrentRow.svelte';
@@ -538,6 +538,27 @@
           {/each}
         </ul>
       {/if}
+    </section>
+  {/if}
+
+  {#if torrentsError && !found}
+    <section aria-label="Tracked downloads" class="mb-7 border-b border-edge pb-6">
+      <div class="eyebrow mb-2">Tracked downloads</div>
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="tag text-[var(--color-alarm)]">Torrent list failed: {torrentsError}</span>
+        <button class="btn shrink-0" onclick={() => void loadTorrentState()}>Retry</button>
+      </div>
+    </section>
+  {/if}
+  {@const tracked = torrentsForShow(torrents, show!.id)}
+  {#if !found && tracked.length > 0}
+    <section aria-label="Tracked downloads" class="mb-7 border-b border-edge pb-6">
+      <div class="eyebrow mb-2">Tracked downloads</div>
+      <div class="flex flex-col gap-3">
+        {#each tracked as t (t.info_hash)}
+          <TorrentRow entry={t} busy={busyHash === t.info_hash} onControl={(op) => void control(t, op)} />
+        {/each}
+      </div>
     </section>
   {/if}
 

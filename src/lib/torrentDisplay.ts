@@ -20,6 +20,12 @@ export function matchBatch(
   );
 }
 
+/** Every torrent pinned to this show — single-episode pin or season pack —
+ *  so the tracked-downloads section lists one row per download it owns. */
+export function torrentsForShow(torrents: TorrentEntry[], showId: number): TorrentEntry[] {
+  return torrents.filter((t) => t.linked?.show_id === showId || t.batch?.show_id === showId);
+}
+
 /** Anything with the torrent state fields, so a listed row passes directly. */
 export interface BadgeTorrent {
   status?: string | null;
