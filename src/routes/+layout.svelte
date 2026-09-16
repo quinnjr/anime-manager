@@ -94,9 +94,11 @@
     if (autoCancelled) return;
     try {
       const [roots, s] = await Promise.all([api.listRoots(), api.getSettings()]);
+      if (autoCancelled) return;
       if (!shouldAutoScan(roots.length, parseAutoScanMins(s.auto_scan_interval_mins))) return;
       if (s.torrent_test_ok !== 'true') return;
       const { baseline, completed } = detectCompletions(watchBaseline, await api.torrentWatchStatus());
+      if (autoCancelled) return;
       watchBaseline = baseline;
       if (completed.length === 0) return;
       pendingCompletions += completed.length;
@@ -110,10 +112,14 @@
   async function fireCompletionSync(): Promise<void> {
     const n = pendingCompletions;
     pendingCompletions = 0;
-    // Null when the slot is held: the running scan ingests the files anyway.
-    const summary = await scanSlot.withSlot(() => withTimeout(api.scan(), SCAN_TIMEOUT_MS));
-    if (summary === null) return;
-    toasts.push('success', `${n} finished — library synced.`);
+    try {
+      // Null when the slot is held: the running scan ingests the files anyway.
+      const summary = await scanSlot.withSlot(() => withTimeout(api.scan(), SCAN_TIMEOUT_MS));
+      if (summary === null) return;
+      toasts.push('success', `${n} finished — library synced.`);
+    } catch (e) {
+      console.error('completion sync failed', e);
+    }
   }
 
   onMount(() => {
