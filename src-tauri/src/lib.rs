@@ -113,6 +113,7 @@ pub fn run() {
             torrent_commands::torrent_discover,
             torrent_commands::torrent_test,
             torrent_commands::torrent_list,
+            torrent_commands::torrent_watch_status,
             torrent_commands::torrent_add,
             torrent_commands::torrent_control,
             torrent_commands::torrent_prefs_get,

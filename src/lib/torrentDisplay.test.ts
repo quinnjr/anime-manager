@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { TorrentEntry } from '$lib/api';
-import { batchSendKey, formatEta, formatSpeed, isSavePathInsideRoots, matchBatch, sendButtonState, torrentBadge } from './torrentDisplay';
+import { batchSendKey, formatEta, formatSpeed, isSavePathInsideRoots, matchBatch, sendButtonState, torrentBadge, torrentsForShow } from './torrentDisplay';
 
 describe('torrentBadge', () => {
   it('shows download progress with the linked episode', () => {
@@ -56,7 +56,7 @@ describe('matchBatch', () => {
     info_hash: 'abc', name: 'x', status: 'downloading', progress: 0.5,
     total_size: 1, downloaded: 0, download_speed: 0, upload_speed: 0,
     peers: 0, seeds: 0, save_path: '/dl', category: null,
-    ratio: 0, eta: null, error_message: null, linked: null, batch,
+    ratio: 0, eta: null, completed_at: null, error_message: null, linked: null, batch,
   });
 
   it('matches inside the range and at both edges', () => {
@@ -76,6 +76,38 @@ describe('matchBatch', () => {
 
   it('builds one stable key for the button and the send', () => {
     expect(batchSendKey('1080p', 1, 12)).toBe('batch:1080p:1-12');
+  });
+});
+
+describe('torrentsForShow', () => {
+  const row = (linked: TorrentEntry['linked'], batch: TorrentEntry['batch'], info_hash: string): TorrentEntry => ({
+    info_hash, name: 'x', status: 'downloading', progress: 0.5,
+    total_size: 1, downloaded: 0, download_speed: 0, upload_speed: 0,
+    peers: 0, seeds: 0, save_path: '/dl', category: null,
+    ratio: 0, eta: null, completed_at: null, error_message: null, linked, batch,
+  });
+
+  it('keeps an episode-linked match for this show', () => {
+    const ts = [row({ show_id: 1, season: 1, number: 6 }, null, 'a')];
+    expect(torrentsForShow(ts, 1)).toEqual(ts);
+  });
+
+  it('keeps a batch-linked match for this show', () => {
+    const ts = [row(null, { show_id: 1, season: 1, first: 1, last: 12 }, 'b')];
+    expect(torrentsForShow(ts, 1)).toEqual(ts);
+  });
+
+  it('excludes unlinked torrents', () => {
+    const ts = [row(null, null, 'c')];
+    expect(torrentsForShow(ts, 1)).toEqual([]);
+  });
+
+  it('excludes pins for another show', () => {
+    const ts = [
+      row({ show_id: 2, season: 1, number: 1 }, null, 'd'),
+      row(null, { show_id: 2, season: 1, first: 1, last: 12 }, 'e'),
+    ];
+    expect(torrentsForShow(ts, 1)).toEqual([]);
   });
 });
 

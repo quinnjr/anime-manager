@@ -12,6 +12,8 @@
     DEFAULT_AUTO_SCAN_MINS, RETRY_SOON_MINS,
     parseAutoScanMins, planPass, toTimeoutMs, withTimeout, SCAN_TIMEOUT_MS
   } from '$lib/autoScan';
+  import { detectCompletions, QUIET_WINDOW_MS, WATCH_INTERVAL_MS, watchGatesPass, type WatchBaseline } from '$lib/torrentWatch';
+  import { isTestedFlag } from '$lib/llmModels';
   import { scanSlot } from '$lib/stores/scan.svelte';
   import type { ScanSummary } from '$lib/api';
   import Toasts from '$lib/components/Toasts.svelte';
@@ -79,6 +81,62 @@
     autoTimer = setTimeout(() => { void autoScanPass(); }, toTimeoutMs(mins));
   }
 
+  // Completion watcher: polls pinned-torrent status and fires one debounced scan
+  // when tracked torrent(s) finish. Gated on the armed flag like every torrent
+  // command, and on a non-zero auto-scan interval (0 means never scan
+  // automatically). Silent on failure — the next tick retries; persistent failure
+  // already surfaces via the show-page banner and Settings test.
+  let watchTimer: ReturnType<typeof setInterval> | undefined;
+  let quietTimer: ReturnType<typeof setTimeout> | undefined;
+  let watchBaseline: WatchBaseline = new Map();
+  let pendingCompletions = 0;
+  let watchInFlight = false;
+
+  async function watchPass(): Promise<void> {
+    if (autoCancelled || watchInFlight) return;
+    watchInFlight = true;
+    try {
+      const [roots, s] = await Promise.all([api.listRoots(), api.getSettings()]);
+      if (autoCancelled) return;
+      if (!watchGatesPass(roots.length, parseAutoScanMins(s.auto_scan_interval_mins), isTestedFlag(s.torrent_test_ok))) {
+        watchBaseline = new Map();
+        return;
+      }
+      const { baseline, completed } = detectCompletions(watchBaseline, await api.torrentWatchStatus());
+      if (autoCancelled) return;
+      watchBaseline = baseline;
+      if (completed.length === 0) return;
+      pendingCompletions += completed.length;
+      clearTimeout(quietTimer);
+      quietTimer = setTimeout(() => { void fireCompletionSync(); }, QUIET_WINDOW_MS);
+    } catch (e) {
+      console.error('torrent watch failed', e);
+    } finally {
+      watchInFlight = false;
+    }
+  }
+
+  async function fireCompletionSync(): Promise<void> {
+    const n = pendingCompletions;
+    pendingCompletions = 0;
+    try {
+      // Null when the slot is held: the running scan ingests the files anyway.
+      const summary = await scanSlot.withSlot(() => withTimeout(api.scan(), SCAN_TIMEOUT_MS));
+      if (summary === null) {
+        // Slot held: the running scan may have snapshotted before the new files
+        // landed, so restore the count and re-arm the quiet timer instead of
+        // dropping it.
+        pendingCompletions += n;
+        clearTimeout(quietTimer);
+        quietTimer = setTimeout(() => { void fireCompletionSync(); }, QUIET_WINDOW_MS);
+        return;
+      }
+      toasts.push('success', `${n} finished — library synced.`);
+    } catch (e) {
+      console.error('completion sync failed', e);
+    }
+  }
+
   onMount(() => {
     // Save the shelf position BEFORE the branch swaps: once the grid's own DOM detaches,
     // the document collapses and the browser clamps scroll to 0, so the shelf teardown
@@ -106,7 +164,8 @@
     ];
     api.assistProgress().then((p) => assist.apply(p)).catch(() => {});
     void autoScanPass();
-    return () => { autoCancelled = true; clearTimeout(autoTimer); unlisteners.forEach((p) => p.then((u) => u())); };
+    watchTimer = setInterval(() => { void watchPass(); }, WATCH_INTERVAL_MS);
+    return () => { autoCancelled = true; clearTimeout(autoTimer); clearInterval(watchTimer); clearTimeout(quietTimer); unlisteners.forEach((p) => p.then((u) => u())); };
   });
 </script>
 

@@ -25,7 +25,7 @@ pub fn now() -> i64 {
 
 /// Torrent info hashes are case-insensitive hex, and callers may hand over either form:
 /// normalize once at the persistence boundary so a mixed-case write and lookup still meet.
-fn normalize_hash(info_hash: &str) -> String {
+pub(crate) fn normalize_hash(info_hash: &str) -> String {
     info_hash.trim().to_lowercase()
 }
 
@@ -1022,6 +1022,9 @@ impl Db {
                     tx.execute("UPDATE OR IGNORE torrent_links SET show_id = ?1 WHERE show_id = ?2",
                         params![keep, loser])?;
                     tx.execute("DELETE FROM torrent_links WHERE show_id = ?1", params![loser])?;
+                    tx.execute("UPDATE OR IGNORE torrent_batches SET show_id = ?1 WHERE show_id = ?2",
+                        params![keep, loser])?;
+                    tx.execute("DELETE FROM torrent_batches WHERE show_id = ?1", params![loser])?;
                     tx.execute(
                         "INSERT OR IGNORE INTO torrent_prefs(show_id, save_path, category)
                          SELECT ?1, save_path, category FROM torrent_prefs WHERE show_id = ?2",
@@ -3161,5 +3164,95 @@ mod tests {
         );
         assert_eq!(s.missing, 0, "and must not have marked anything missing");
         assert!(s.errors > 0);
+    }
+
+    #[test]
+    fn batch_pin_moves_to_survivor_on_merge() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Bloom Into You", 1, 1), &rf("/a/1.mkv", 1, 1))
+            .unwrap();
+        db.upsert_episode(&pn("Bloom Into You", 1, 2), &rf("/a/2.mkv", 1, 1))
+            .unwrap();
+        db.upsert_episode(&pn("Yagate Kimi ni Naru", 1, 1), &rf("/b/1.mkv", 1, 1))
+            .unwrap();
+        let id = |t: &str| db.list_shows(t, ShowSort::Title).unwrap()[0].id;
+        let (big, small) = (id("Bloom"), id("Yagate"));
+        let hit = MetadataHit {
+            id: 41240,
+            source: "kitsu".into(),
+            title_romaji: "Yagate Kimi ni Naru".into(),
+            title_english: None,
+            cover_url: None,
+            episodes: None,
+        };
+        db.set_anilist(big, &hit).unwrap();
+        db.set_anilist(small, &hit).unwrap();
+        db.add_batch_link(&crate::models::TorrentBatch {
+            info_hash: "aabbcc".into(),
+            show_id: small,
+            season: 1,
+            first: 1,
+            last: 12,
+            resolution: Some("1080p".into()),
+            added_at: 0,
+        })
+        .unwrap();
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+        let kept = db.batch_link("aabbcc").unwrap().expect("pack pin survives the fold");
+        assert_eq!(kept.show_id, big, "pack pin is re-pointed to the survivor");
+        assert_eq!((kept.first, kept.last), (1, 12), "range is unchanged");
+    }
+
+    #[test]
+    fn batch_pins_all_leave_loser_on_merge() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Bloom Into You", 1, 1), &rf("/a/1.mkv", 1, 1))
+            .unwrap();
+        db.upsert_episode(&pn("Bloom Into You", 1, 2), &rf("/a/2.mkv", 1, 1))
+            .unwrap();
+        db.upsert_episode(&pn("Yagate Kimi ni Naru", 1, 1), &rf("/b/1.mkv", 1, 1))
+            .unwrap();
+        let id = |t: &str| db.list_shows(t, ShowSort::Title).unwrap()[0].id;
+        let (big, small) = (id("Bloom"), id("Yagate"));
+        let hit = MetadataHit {
+            id: 41240,
+            source: "kitsu".into(),
+            title_romaji: "Yagate Kimi ni Naru".into(),
+            title_english: None,
+            cover_url: None,
+            episodes: None,
+        };
+        db.set_anilist(big, &hit).unwrap();
+        db.set_anilist(small, &hit).unwrap();
+        for (hash, show, first, last) in
+            [("aa11", small, 1, 12), ("bb22", small, 1, 24), ("cc33", big, 1, 6)]
+        {
+            db.add_batch_link(&crate::models::TorrentBatch {
+                info_hash: hash.into(),
+                show_id: show,
+                season: 1,
+                first,
+                last,
+                resolution: Some("1080p".into()),
+                added_at: 0,
+            })
+            .unwrap();
+        }
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+        let leftover: i64 = db
+            .with(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM torrent_batches WHERE show_id = ?1",
+                    params![small],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(leftover, 0, "no pack pin still points at the folded row");
+        for (hash, first, last) in [("aa11", 1, 12), ("bb22", 1, 24), ("cc33", 1, 6)] {
+            let kept = db.batch_link(hash).unwrap().expect("pack pin survives the fold");
+            assert_eq!(kept.show_id, big, "pack pin {hash} is re-pointed to the survivor");
+            assert_eq!((kept.first, kept.last), (first, last), "range intact for {hash}");
+        }
     }
 }
