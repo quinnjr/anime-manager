@@ -541,6 +541,18 @@
     </section>
   {/if}
 
+  {@const tracked = torrents.filter((t) => t.linked?.show_id === show!.id || t.batch?.show_id === show!.id)}
+  {#if tracked.length > 0}
+    <section aria-label="Tracked downloads" class="mb-7 border-b border-edge pb-6">
+      <div class="eyebrow mb-2">Tracked downloads</div>
+      <div class="flex flex-col gap-3">
+        {#each tracked as t (t.info_hash)}
+          <TorrentRow entry={t} busy={busyHash === t.info_hash} onControl={(op) => void control(t, op)} />
+        {/each}
+      </div>
+    </section>
+  {/if}
+
   <SeasonList {seasons} highlightedId={rows[highlight]?.group.primary.id ?? null}
     onRename={(episodeId) => openRename({ type: 'episode', id: episodeId })} />
 
