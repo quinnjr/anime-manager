@@ -78,6 +78,47 @@ pub async fn torrent_list(state: State<'_, AppState>) -> Result<Vec<LinkedTorren
     Ok(client.attribute(&state.db, torrents).await)
 }
 
+/// Pinned-torrent status for the completion watcher: one minimal row per pinned
+/// hash present on the server. Pure query: writes nothing, emits nothing. A pinned
+/// hash absent from the server is omitted (the pin row itself is retained — the
+/// pin is the explicit user record; deliberate removal already forgets pins via
+/// `apply_control`). Split from the command so it is unit-testable without a
+/// Tauri `State` (cf. `apply_control`).
+async fn watch_status(
+    client: &torrent::TorrentClient,
+    db: &Db,
+) -> Result<Vec<TorrentWatchStatus>> {
+    let list = client.list().await?;
+    let mut out = Vec::new();
+    for info in &list {
+        let key = info.info_hash.trim().to_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        let pinned =
+            db.torrent_link(&key)?.is_some() || db.batch_link(&key)?.is_some();
+        if !pinned {
+            continue;
+        }
+        out.push(TorrentWatchStatus {
+            info_hash: key,
+            progress: info.progress,
+            status: info.status.clone(),
+            completed_at: info.completed_at.clone(),
+        });
+    }
+    Ok(out)
+}
+
+/// Every pinned torrent's live status, minimal rows for the watcher loop.
+#[tauri::command]
+pub async fn torrent_watch_status(
+    state: State<'_, AppState>,
+) -> Result<Vec<TorrentWatchStatus>> {
+    require_torrent_armed(&state.db)?;
+    watch_status(&torrent::TorrentClient::from_db(&state.db)?, &state.db).await
+}
+
 /// The normalized info_hash when the server's list already carries it, else None so the
 /// caller falls through to a download+add. A blank or absent hash never matches, and a
 /// differently-cased one matches its normalized form (hashes are case-insensitive hex).
@@ -846,5 +887,37 @@ mod tests {
             .await
             .expect("failed start reports its message");
         assert!(msg.contains("400"), "names the failure: {msg}");
+    }
+
+    #[tokio::test]
+    async fn watch_status_returns_only_pinned_hashes_present_on_server() {
+        let s = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/api/login"))
+            .respond_with(|_: &wiremock::Request| {
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("set-cookie", "rustorrent_token=jwt123; Path=/; HttpOnly")
+                    .set_body_json(serde_json::json!({"ok": true}))
+            })
+            .mount(&s)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/torrents"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!([
+                    {"info_hash": "aabbcc", "name": "Pinned Show S01E01", "status": "Seeding", "progress": 1.0, "completed_at": "2026-09-15T16:00:00+00:00"},
+                    {"info_hash": "ddeeff", "name": "Stranger", "status": "Downloading", "progress": 0.4, "completed_at": null}
+                ]),
+            ))
+            .mount(&s)
+            .await;
+        let db = Db::open_memory().unwrap();
+        seed_pin(&db, "aabbcc");
+        let client = torrent::TorrentClient::new(s.uri(), Some("pw".into()));
+        let rows = watch_status(&client, &db).await.unwrap();
+        assert_eq!(rows.len(), 1, "unpinned server torrents are omitted, not an error");
+        assert_eq!(rows[0].info_hash, "aabbcc");
+        assert_eq!(rows[0].progress, 1.0);
+        assert_eq!(rows[0].completed_at.as_deref(), Some("2026-09-15T16:00:00+00:00"));
     }
 }

@@ -362,6 +362,7 @@ pub struct TorrentInfo {
     #[serde(default)] pub peers: usize, #[serde(default)] pub seeds: usize,
     #[serde(default)] pub save_path: String, #[serde(default)] pub category: Option<String>,
     #[serde(default)] pub ratio: f64, pub eta: Option<u64>,
+    #[serde(default)] pub completed_at: Option<String>,
     pub error_message: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -377,6 +378,16 @@ pub struct LinkedTorrent {
     #[serde(flatten)] pub info: TorrentInfo,
     pub linked: Option<LinkedTo>,
     #[serde(default)] pub batch: Option<LinkedBatch>,
+}
+/// Minimal pinned-torrent status for the completion watcher: one row per pinned
+/// hash present on the server. Unknown JSON fields are ignored, so this stays
+/// narrow while `TorrentInfo` keeps its shape.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TorrentWatchStatus {
+    pub info_hash: String,
+    #[serde(default)] pub progress: f64,
+    #[serde(default)] pub status: String,
+    pub completed_at: Option<String>,
 }
 /// POST /api/rss/feeds body: which remote feed to poll and what to grab.
 /// `exclude_batch` reproduces the strict no-packs rule.
