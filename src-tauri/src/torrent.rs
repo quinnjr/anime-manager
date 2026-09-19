@@ -353,17 +353,43 @@ impl TorrentClient {
         }
     }
 
+    /// Reject a label that cannot travel safely in a URL path segment: a
+    /// separator or a dot-segment would let the request escape the feed.
+    fn validate_path_label(label: &str) -> Result<()> {
+        if label.trim().is_empty() {
+            return Err(AppError::Parse("rss feed label must not be empty".into()));
+        }
+        if label.contains('/') || label.contains('\\') || label == "." || label == ".." {
+            return Err(AppError::Parse(
+                "rss feed label must not contain a path separator".into(),
+            ));
+        }
+        if label.chars().any(char::is_control) {
+            return Err(AppError::Parse(
+                "rss feed label must not contain control characters".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reject a feed config the server would refuse, before any request is
+    /// sent. Applied to create and update alike so a label that cannot be
+    /// managed later is refused up front; the search is compiled so a bad regex
+    /// never reaches the server.
+    fn validate_feed_config(config: &RssFeedConfig) -> Result<()> {
+        Self::validate_path_label(&config.label)?;
+        if let Err(e) = regex::Regex::new(&config.search) {
+            return Err(AppError::Parse(format!("invalid rss search regex: {e}")));
+        }
+        Ok(())
+    }
+
     /// Subscribe the server's RSS monitor to a feed. The search regex is
     /// validated before sending (defensive: `build_search_regex` already
     /// produces valid patterns); the server rejects empty labels, bad
     /// regexes and duplicate labels. Returns the label the server echoes.
     pub async fn rss_add(&self, config: &RssFeedConfig) -> Result<String> {
-        if config.label.trim().is_empty() {
-            return Err(AppError::Parse("rss feed label must not be empty".into()));
-        }
-        if let Err(e) = regex::Regex::new(&config.search) {
-            return Err(AppError::Parse(format!("invalid rss search regex: {e}")));
-        }
+        Self::validate_feed_config(config)?;
         let url = format!("{}/api/rss/feeds", self.base_url);
         let resp = self
             // Same create rule as torrent add: never re-send on timeout.
@@ -398,6 +424,22 @@ impl TorrentClient {
         }
     }
 
+    /// Update an already-registered feed in place (`PUT`). Used to re-point a
+    /// stored search regex at the current builder's output without removing and
+    /// re-adding the feed. The server validates the regex and 404s an unknown
+    /// label, so a missing feed is an error rather than a silent success.
+    pub async fn rss_update(&self, config: &RssFeedConfig) -> Result<()> {
+        Self::validate_feed_config(config)?;
+        let url = format!(
+            "{}/api/rss/feeds/{}",
+            self.base_url,
+            encode_path_segment(&config.label)
+        );
+        // PUT is idempotent, so a timeout after the server applied it may retry.
+        let resp = self.send_authed(true, || self.http.put(&url).json(config)).await?;
+        Self::check_ok(resp, "rss update").await
+    }
+
     /// Every server-side feed joined to the local show it was registered
     /// for, if any (a feed the app did not create has `show_id: None`).
     pub async fn rss_list(&self, db: &Db) -> Result<Vec<RssFeedView>> {
@@ -423,6 +465,7 @@ impl TorrentClient {
     /// Flip a feed's enabled state. Removal is config-only server-side:
     /// downloaded files are never touched.
     pub async fn rss_toggle(&self, label: &str) -> Result<()> {
+        Self::validate_path_label(label)?;
         let url = format!(
             "{}/api/rss/feeds/{}/toggle",
             self.base_url,
@@ -433,6 +476,7 @@ impl TorrentClient {
     }
 
     pub async fn rss_remove(&self, label: &str) -> Result<()> {
+        Self::validate_path_label(label)?;
         let url = format!(
             "{}/api/rss/feeds/{}",
             self.base_url,
@@ -991,10 +1035,54 @@ pub fn default_save_path(db: &Db, show_id: i64) -> Result<String> {
         .ok_or_else(|| AppError::Parse("no library root to save into".into()))
 }
 
+/// What may sit between a word's alphanumeric runs. Must stay the complement of
+/// the `!c.is_alphanumeric()` split: a Unicode non-alphanumeric, at least one.
+const WORD_GAP: &str = r"[^\p{Alphabetic}\p{N}]+";
+
+/// One title word as a regex fragment. Its alphanumeric runs stay in order with
+/// at least one non-alphanumeric required between them, so `K-On!` keeps its
+/// hyphen and cannot match `Konosuba`. Leading punctuation is kept literal so a
+/// symbol-prefixed word (`∀Gundam`) cannot collapse to the common word. A
+/// trailing run that begins with a period is kept (it marks an abbreviation:
+/// `No. 6` must not become `No.*6`), while other trailing punctuation is dropped
+/// because provider titles routinely append punctuation the release omits
+/// (`Lane:` → `Lane`). A word with no alphanumeric run is escaped verbatim
+/// rather than dropped.
+fn search_word(word: &str) -> String {
+    let runs: Vec<String> = word
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|r| !r.is_empty())
+        .map(regex::escape)
+        .collect();
+    if runs.is_empty() {
+        return regex::escape(word);
+    }
+    let lead_end = word
+        .find(|c: char| c.is_alphanumeric())
+        .unwrap_or(word.len());
+    let mut out = regex::escape(&word[..lead_end]);
+    out.push_str(&runs.join(WORD_GAP));
+    let tail_start = word
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_alphanumeric())
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    let tail = &word[tail_start..];
+    if tail.starts_with('.') {
+        out.push_str(&regex::escape(tail));
+    }
+    out
+}
+
 /// A case-insensitive regex matching the title's words in order, narrowed by
 /// an optional `[Group]` prefix and resolution suffix:
-/// `(?i)\[GROUP\].*word1.*word2.*RES`. Every interpolated piece is
-/// `regex::escape`d, empty clauses are omitted, and the result is validated
+/// `(?i)\[GROUP\].*word1.*word2.*RES`. Group and resolution stay literal; each
+/// title word is rendered by `search_word`, so the canonical
+/// "Azur Lane: Bisoku Zenshin!" still matches a release named
+/// "Azur Lane - Bisoku Zenshin!" while `K-On!` and `Re:Zero` still match their
+/// own spelling. A blank title is an error rather than a bare `(?i)` that
+/// matches everything. Empty clauses are omitted, and the result is validated
 /// with `Regex::new` before return so callers always get a compilable pattern.
 pub fn build_search_regex(
     title: &str,
@@ -1005,10 +1093,12 @@ pub fn build_search_regex(
     if let Some(g) = group.filter(|g| !g.is_empty()) {
         re.push_str(&format!("\\[{}\\].*", regex::escape(g)));
     }
-    let mut words: Vec<String> = title
-        .split_whitespace()
-        .map(regex::escape)
-        .collect();
+    let mut words: Vec<String> = title.split_whitespace().map(search_word).collect();
+    if words.is_empty() {
+        return Err(AppError::Parse(format!(
+            "cannot build a feed search from a blank title: {title:?}"
+        )));
+    }
     // A very long title must not explode into an unbounded `.*` chain:
     // keep the first and last six words, dropping the ambiguous middle.
     if words.len() > 12 {
@@ -1282,7 +1372,8 @@ mod tests {
         let re = build_search_regex("Sousou no Frieren", Some("Gumamish"), Some("1080p")).unwrap();
         assert!(re.contains(r"\[Gumamish\]") && re.contains("1080p"));
         let re2 = build_search_regex("A&B (2024)", None, None).unwrap();
-        assert!(!re2.contains('[')); // title metachars escaped, no group clause
+        assert!(!re2.contains(r"\[")); // no group clause
+        assert!(regex::Regex::new(&re2).unwrap().is_match("[G] A&B (2024) - 01 [1080p]"));
         regex::Regex::new(&re).unwrap(); // always valid
     }
 
@@ -1365,6 +1456,7 @@ mod tests {
             category: "anime".into(),
             enabled: true,
             exclude_batch: true,
+            search_description: None,
         }
     }
 
@@ -1413,6 +1505,9 @@ mod tests {
         bad.search = "(?i)Frieren(".into();
         let err = c.rss_add(&bad).await.unwrap_err();
         assert!(err.to_string().contains("regex"), "{err}");
+        // A label that cannot be managed later is refused at create time too.
+        let err = c.rss_add(&rss_config("animemgr:a/b")).await.unwrap_err();
+        assert!(err.to_string().contains("path separator"), "{err}");
     }
 
     #[tokio::test]
@@ -1437,7 +1532,8 @@ mod tests {
         assert_eq!(feeds.len(), 2);
         assert_eq!(feeds[0].label, "animemgr:Owned");
         assert_eq!(feeds[0].show_id, Some(show_id(&db, "Owned")));
-        assert!(feeds[0].enabled);
+        assert_eq!(feeds[0].enabled, Some(true));
+        assert_eq!(feeds[0].exclude_batch, None, "omitted stays absent, not defaulted");
         assert_eq!(feeds[1].show_id, None, "unknown label maps to no show");
     }
 
@@ -1461,6 +1557,78 @@ mod tests {
         let c = TorrentClient::new(s.uri(), Some("pw".into()));
         c.rss_toggle("animemgr:My Show").await.unwrap();
         c.rss_remove("animemgr:My Show").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rss_toggle_and_remove_reject_path_labels_before_sending() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).expect(0).mount(&s).await;
+        Mock::given(method("DELETE")).respond_with(ResponseTemplate::new(200)).expect(0).mount(&s).await;
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        for label in ["animemgr:a/b", "animemgr:a\\b", "..", ".", "animemgr:a\nb"] {
+            let err = c.rss_toggle(label).await.unwrap_err();
+            assert!(matches!(err, AppError::Parse(_)), "{label}: {err:?}");
+            assert!(c.rss_remove(label).await.is_err(), "{label} must be refused");
+        }
+    }
+
+    #[tokio::test]
+    async fn rss_update_puts_config_and_validates_before_sending() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        // "animemgr:My Show" must travel percent-encoded in the path.
+        Mock::given(method("PUT"))
+            .and(path("/api/rss/feeds/animemgr%3AMy%20Show"))
+            .and(body_json(serde_json::json!({
+                "label": "animemgr:My Show",
+                "url": "https://nyaa.si/?page=rss&q=Frieren&c=1_2&f=0",
+                "search": "(?i)Frieren",
+                "category": "anime",
+                "enabled": true,
+                "exclude_batch": true,
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        let mut cfg = rss_config("animemgr:My Show");
+        c.rss_update(&cfg).await.unwrap();
+
+        cfg.search = "(?i)Frieren(".into();
+        let err = c.rss_update(&cfg).await.unwrap_err();
+        assert!(matches!(err, AppError::Parse(_)), "{err:?}");
+        assert!(err.to_string().contains("regex"), "{err}");
+        cfg.search = "(?i)Frieren".into();
+        cfg.label = "  ".into();
+        let err = c.rss_update(&cfg).await.unwrap_err();
+        assert!(matches!(err, AppError::Parse(_)), "{err:?}");
+        assert!(err.to_string().contains("label"), "{err}");
+        cfg.label = "animemgr:a/b".into();
+        let err = c.rss_update(&cfg).await.unwrap_err();
+        assert!(matches!(err, AppError::Parse(_)), "{err:?}");
+        assert!(err.to_string().contains("path separator"), "{err}");
+        cfg.label = "animemgr:a\\b".into();
+        assert!(c.rss_update(&cfg).await.unwrap_err().to_string().contains("path separator"));
+        cfg.label = "..".into();
+        assert!(c.rss_update(&cfg).await.unwrap_err().to_string().contains("path separator"));
+    }
+
+    #[tokio::test]
+    async fn rss_update_reports_missing_feed() {
+        let s = MockServer::start().await;
+        login_mock("jwt123").mount(&s).await;
+        Mock::given(method("PUT"))
+            .and(path("/api/rss/feeds/animemgr%3AMy%20Show"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no such feed"))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let c = TorrentClient::new(s.uri(), Some("pw".into()));
+        let err = c.rss_update(&rss_config("animemgr:My Show")).await.unwrap_err();
+        assert!(matches!(err, AppError::Network(_)), "{err:?}");
+        assert!(err.to_string().contains("rss update"), "{err}");
     }
 
     #[tokio::test]
@@ -2103,11 +2271,79 @@ mod tests {
 
     #[test]
     fn build_search_regex_caps_very_long_titles() {
-        let title = (1..=20).map(|n| format!("w{n}")).collect::<Vec<_>>().join(" ");
+        let title = (1..=20).map(|n| format!("w{n}:x")).collect::<Vec<_>>().join(" ");
         let re = build_search_regex(&title, None, None).unwrap();
         assert!(re.contains("w1") && re.contains("w20"), "keeps first/last: {re}");
         assert!(!re.contains("w10"), "drops the middle: {re}");
-        regex::Regex::new(&re).unwrap();
+        let re = regex::Regex::new(&re).unwrap();
+        assert!(re.is_match(&title), "matches its own source: {re}");
+    }
+
+    #[test]
+    fn build_search_regex_ignores_provider_punctuation() {
+        let re = build_search_regex("Azur Lane: Bisoku Zenshin!", Some("SubsPlease"), Some("1080p"))
+            .unwrap();
+        let re = regex::Regex::new(&re).unwrap();
+        for title in [
+            "[SubsPlease] Azur Lane - Bisoku Zenshin! - 01 (1080p) [C604AE3C].mkv",
+            "[SubsPlease] Azur Lane - Bisoku Zenshin! S2 - 11 (1080p) [1C413FA9].mkv",
+        ] {
+            assert!(re.is_match(title), "should match {title}\n{re}");
+        }
+        assert!(
+            !re.is_match("[SubsPlease] Azur Lane - Bisoku Zenshin! S2 - 11 (720p) [7743C330].mkv"),
+            "resolution stays literal"
+        );
+        assert!(!re.is_match("[SubsPlease] Otonari no Tenshi-sama S2 - 01 (1080p)"));
+    }
+
+    #[test]
+    fn build_search_regex_keeps_intra_word_punctuation() {
+        for (title, release) in [
+            ("Re:Zero kara Hajimeru Isekai Seikatsu", "[Group] Re:Zero kara Hajimeru Isekai Seikatsu - 03 [1080p]"),
+            ("Otonari no Tenshi-sama ni Itsunomanika", "[Group] Otonari no Tenshi-sama ni Itsunomanika - 01 [1080p]"),
+        ] {
+            let re = regex::Regex::new(&build_search_regex(title, None, None).unwrap()).unwrap();
+            assert!(re.is_match(release), "{title} should match {release}");
+        }
+        let re = regex::Regex::new(&build_search_regex("K-On!", None, None).unwrap()).unwrap();
+        assert!(re.is_match("[Group] K-On! - 01 [1080p]"));
+        assert!(
+            !re.is_match("[Group] KonoSuba - 01 [1080p]"),
+            "separator between runs must be required, not concatenated: {re}"
+        );
+        let re = regex::Regex::new(&build_search_regex("No. 6", None, None).unwrap()).unwrap();
+        assert!(re.is_match("[Group] No. 6 - 01 [1080p]"));
+        assert!(
+            !re.is_match("[Group] No Game No Life - 06 [1080p]"),
+            "an abbreviation period must stay required: {re}"
+        );
+    }
+
+    #[test]
+    fn build_search_regex_rejects_blank_title_and_keeps_punctuation_only_word() {
+        let err = build_search_regex("", None, None).unwrap_err();
+        assert!(matches!(err, AppError::Parse(_)), "{err:?}");
+        assert!(err.to_string().contains("blank title"), "{err}");
+        assert!(build_search_regex("   ", None, None).is_err());
+
+        let re =
+            regex::Regex::new(&build_search_regex("∀ Gundam", None, None).unwrap()).unwrap();
+        assert!(re.is_match("[Group] ∀ Gundam - 01 [1080p]"));
+        assert!(
+            !re.is_match("[Group] Mobile Suit Gundam - 01 [1080p]"),
+            "a punctuation-only word must not be dropped\n{re}"
+        );
+
+        let re = regex::Regex::new(&build_search_regex(". Gundam", None, None).unwrap()).unwrap();
+        assert!(re.is_match("[Group] . Gundam - 01 [1080p]"));
+        assert!(!re.is_match("[Group] X Gundam - 01 [1080p]"), "escaped, not a wildcard: {re}");
+
+        let re = regex::Regex::new(&build_search_regex("∀Gundam", None, None).unwrap()).unwrap();
+        assert!(
+            !re.is_match("[Group] Mobile Suit Gundam - 01 [1080p]"),
+            "leading punctuation stays required: {re}"
+        );
     }
 
     #[test]

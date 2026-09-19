@@ -443,8 +443,10 @@
           {#if subscribedFeed}
             <span class="tag-chip shrink-0">Following ✓</span>
             <span class="tag">Registered — the rustorrent RSS monitor picks this up on its next poll (monitor must be running).</span>
-            <button class="btn shrink-0" disabled={followBusy} onclick={() => void toggleFeed(subscribedFeed)}>
-              {subscribedFeed.enabled ? 'Pause feed' : 'Resume feed'}
+            <button class="btn shrink-0" disabled={followBusy || subscribedFeed.enabled === null}
+              title={subscribedFeed.enabled === null ? 'The server did not report this feed\'s state' : undefined}
+              onclick={() => void toggleFeed(subscribedFeed)}>
+              {subscribedFeed.enabled === null ? 'Feed state unknown' : subscribedFeed.enabled ? 'Pause feed' : 'Resume feed'}
             </button>
           {:else}
             <button class="btn shrink-0" disabled={followBusy} title="Register a rustorrent RSS feed for future episodes of this show"
