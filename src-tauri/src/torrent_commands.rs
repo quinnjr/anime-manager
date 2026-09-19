@@ -498,6 +498,67 @@ async fn subscribe_placement(
     }
 }
 
+/// Re-point an already-registered feed at `search` and `feed_url`, and repair a
+/// drifted URL, when the server's stored row differs. `Ok(true)` means the feed
+/// is listed (updated, unchanged, or unrepairable), `Ok(false)` means the server
+/// no longer lists it and the caller should re-register. `Err` means the refresh
+/// could not be confirmed. Best-effort — the feed may be live, so the caller
+/// surfaces the failure without failing the subscribe.
+async fn refresh_feed_search(
+    client: &torrent::TorrentClient,
+    db: &Db,
+    label: &str,
+    search: &str,
+    feed_url: &str,
+) -> Result<bool> {
+    let feeds = client.rss_list(db).await?;
+    let Some(existing) = feeds.iter().find(|f| f.label == label) else {
+        return Ok(false);
+    };
+    if existing.search == search && existing.url == feed_url {
+        return Ok(true);
+    }
+    // A whole-config PUT echoes the server's fields back, so refuse to write
+    // when the list did not carry them: a serde default is not server truth.
+    let (Some(category), Some(enabled), Some(exclude_batch), Some(search_description)) = (
+        &existing.category,
+        existing.enabled,
+        existing.exclude_batch,
+        existing.search_description,
+    ) else {
+        return Err(crate::error::AppError::Parse(format!(
+            "feed '{label}' row is missing fields, cannot refresh its search"
+        )));
+    };
+    // The URL is re-derived, never echoed: the server's copy can be stale or,
+    // on a hostile reply, point somewhere the monitor would then fetch.
+    let wanted = RssFeedConfig {
+        label: label.to_owned(),
+        url: feed_url.to_owned(),
+        search: search.to_owned(),
+        category: category.clone(),
+        enabled,
+        exclude_batch,
+        search_description: Some(search_description),
+    };
+    client.rss_update(&wanted).await?;
+    Ok(true)
+}
+
+/// Tell the user a best-effort feed repair did not land. The subscribe still
+/// succeeds (the feed is live), but a stale search silently misses episodes and
+/// stderr is discarded in the packaged app, so this goes out the `error` event
+/// the frontend already toasts.
+fn refresh_warning(app: &AppHandle, label: &str, why: &str) {
+    eprintln!("torrent_rss_subscribe: feed '{label}' search not refreshed: {why}");
+    let _ = app.emit(
+        "error",
+        crate::error::AppError::Network(format!(
+            "Feed '{label}' is registered, but its search could not be refreshed ({why}) — downloads may miss episodes"
+        )),
+    );
+}
+
 /// One-click subscribe: derive the feed URL and group/resolution preferences from the
 /// show's owned episodes, register the deterministic `animemgr:<parsed_title>` label
 /// server-side, and remember it for Downloads attribution.
@@ -524,18 +585,45 @@ pub async fn torrent_rss_subscribe(
     let label = torrent::feed_label(&show.parsed_title);
     // Already subscribed for this show: the deterministic label makes a re-click
     // idempotent, so return the existing registration instead of a duplicate-label
-    // error from the server.
+    // error from the server. A regex stored before a builder change would keep the
+    // old, broken pattern, so repair it in place when it differs. A feed the server
+    // no longer lists falls through to re-register rather than reporting success
+    // for a subscription that is gone.
     if state.db.rss_feed_show(&label)? == Some(show_id) {
-        let (resolved_path, outside_roots) =
-            subscribe_placement(&client, &state.db, &category).await;
-        let _ = app.emit("torrent-changed", ());
-        let _ = app.emit("show-updated", show_id);
-        return Ok(RssSubscribeResult {
-            label,
-            url: derivation.feed_url,
-            resolved_path,
-            outside_roots,
-        });
+        // Best-effort repair on a click path: bound it so a slow or unreachable
+        // server cannot hold the button for the full retry ladder. A timeout is
+        // treated as "still listed" so a duplicate feed is never created.
+        let refreshed = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            refresh_feed_search(&client, &state.db, &label, &search, &derivation.feed_url),
+        )
+        .await;
+        let still_listed = match refreshed {
+            Ok(Ok(listed)) => listed,
+            Ok(Err(e)) => {
+                refresh_warning(&app, &label, &e.to_string());
+                true
+            }
+            Err(_) => {
+                refresh_warning(&app, &label, "timed out");
+                true
+            }
+        };
+        if still_listed {
+            let (resolved_path, outside_roots) =
+                subscribe_placement(&client, &state.db, &category).await;
+            let _ = app.emit("torrent-changed", ());
+            let _ = app.emit("show-updated", show_id);
+            return Ok(RssSubscribeResult {
+                label,
+                url: derivation.feed_url,
+                resolved_path,
+                outside_roots,
+            });
+        }
+        // The server lost the feed. The add below re-registers it under the same
+        // deterministic label; `add_rss_feed` is INSERT OR REPLACE, so the stale
+        // local row needs no clearing and survives an add failure.
     }
     let label = client
         .rss_add(&RssFeedConfig {
@@ -545,6 +633,7 @@ pub async fn torrent_rss_subscribe(
             category: category.clone(),
             enabled: true,
             exclude_batch: true,
+            search_description: None,
         })
         .await?;
     // The feed is live server-side, so a failed local label write must not fail the
@@ -602,7 +691,12 @@ pub async fn torrent_rss_toggle(
         .ok_or_else(|| {
             crate::error::AppError::Parse(format!("unknown rss feed '{label}'"))
         })?;
-    if current.enabled != enabled {
+    let Some(current_enabled) = current.enabled else {
+        return Err(crate::error::AppError::Parse(format!(
+            "rss feed '{label}' state unknown"
+        )));
+    };
+    if current_enabled != enabled {
         client.rss_toggle(&label).await?;
         let _ = app.emit("torrent-changed", ());
     }
@@ -629,6 +723,188 @@ pub async fn torrent_rss_remove(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{body_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn login_mock(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/api/login"))
+            .respond_with(|_: &wiremock::Request| {
+                ResponseTemplate::new(200)
+                    .insert_header("set-cookie", "rustorrent_token=jwt123; Path=/; HttpOnly")
+                    .set_body_json(serde_json::json!({"ok": true}))
+            })
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn refresh_feed_search_rewrites_a_stale_regex_preserving_server_state() {
+        let s = MockServer::start().await;
+        login_mock(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/api/rss/feeds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"label": "animemgr:Show", "url": "https://stale",
+                 "search": "(?i)old", "category": "Anime/Show", "enabled": false,
+                 "exclude_batch": false, "search_description": true}
+            ])))
+            .mount(&s)
+            .await;
+        // The rewrite keeps category/enabled/exclude_batch but re-derives the URL.
+        Mock::given(method("PUT"))
+            .and(path("/api/rss/feeds/animemgr%3AShow"))
+            .and(body_json(serde_json::json!({
+                "label": "animemgr:Show",
+                "url": "https://nyaa.si/?page=rss&q=Show",
+                "search": "(?i)new",
+                "category": "Anime/Show",
+                "enabled": false,
+                "exclude_batch": false,
+                "search_description": true,
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let db = Db::open_memory().unwrap();
+        let client = torrent::TorrentClient::new(s.uri(), Some("pw".into()));
+        assert!(
+            refresh_feed_search(&client, &db, "animemgr:Show", "(?i)new", "https://nyaa.si/?page=rss&q=Show")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_feed_search_skips_when_unchanged_or_list_fails() {
+        // Same stored regex: no PUT, still listed.
+        let s = MockServer::start().await;
+        login_mock(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/api/rss/feeds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"label": "animemgr:Show", "url": "https://x", "search": "(?i)new",
+                 "category": "Anime", "enabled": true, "exclude_batch": true,
+                 "search_description": false}
+            ])))
+            .mount(&s)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&s)
+            .await;
+        let db = Db::open_memory().unwrap();
+        let client = torrent::TorrentClient::new(s.uri(), Some("pw".into()));
+        assert!(
+            refresh_feed_search(&client, &db, "animemgr:Show", "(?i)new", "https://x")
+                .await
+                .unwrap()
+        );
+
+        // A list failure is reported so the caller can warn (no re-create).
+        let down = MockServer::start().await;
+        login_mock(&down).await;
+        Mock::given(method("GET"))
+            .and(path("/api/rss/feeds"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("down"))
+            .mount(&down)
+            .await;
+        let client = torrent::TorrentClient::new(down.uri(), Some("pw".into()));
+        assert!(refresh_feed_search(&client, &db, "animemgr:Show", "(?i)new", "https://x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn refresh_feed_search_reports_a_missing_feed() {
+        let s = MockServer::start().await;
+        login_mock(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/api/rss/feeds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&s)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&s)
+            .await;
+        let db = Db::open_memory().unwrap();
+        let client = torrent::TorrentClient::new(s.uri(), Some("pw".into()));
+        assert!(
+            !refresh_feed_search(&client, &db, "animemgr:Gone", "(?i)new", "https://x")
+                .await
+                .unwrap(),
+            "a feed the server no longer lists must report false"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_feed_search_guards_against_echoing_a_partial_server_row() {
+        // A row the server omitted `category` for must not be rewritten.
+        let s = MockServer::start().await;
+        login_mock(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/api/rss/feeds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"label": "animemgr:Show", "url": "https://x", "search": "(?i)old",
+                 "enabled": true, "exclude_batch": true}
+            ])))
+            .mount(&s)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&s)
+            .await;
+        let db = Db::open_memory().unwrap();
+        let client = torrent::TorrentClient::new(s.uri(), Some("pw".into()));
+        assert!(refresh_feed_search(&client, &db, "animemgr:Show", "(?i)new", "https://x").await.is_err());
+
+        // A row whose `enabled` flag the server omitted is also left alone.
+        let partial = MockServer::start().await;
+        login_mock(&partial).await;
+        Mock::given(method("GET"))
+            .and(path("/api/rss/feeds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"label": "animemgr:Show", "url": "https://x", "search": "(?i)old",
+                 "category": "Anime", "exclude_batch": true}
+            ])))
+            .mount(&partial)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&partial)
+            .await;
+        let client = torrent::TorrentClient::new(partial.uri(), Some("pw".into()));
+        assert!(refresh_feed_search(&client, &db, "animemgr:Show", "(?i)new", "https://x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn refresh_feed_search_reports_a_failed_update() {
+        let s = MockServer::start().await;
+        login_mock(&s).await;
+        Mock::given(method("GET"))
+            .and(path("/api/rss/feeds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"label": "animemgr:Show", "url": "https://x", "search": "(?i)old",
+                 "category": "Anime", "enabled": true, "exclude_batch": true,
+                 "search_description": false}
+            ])))
+            .mount(&s)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/api/rss/feeds/animemgr%3AShow"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("boom"))
+            .expect(1)
+            .mount(&s)
+            .await;
+        let db = Db::open_memory().unwrap();
+        let client = torrent::TorrentClient::new(s.uri(), Some("pw".into()));
+        // The helper propagates the failure so the caller can warn.
+        assert!(refresh_feed_search(&client, &db, "animemgr:Show", "(?i)new", "https://x").await.is_err());
+    }
 
     #[test]
     fn outside_roots_translates_the_server_path_before_matching() {

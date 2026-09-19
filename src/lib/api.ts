@@ -101,7 +101,8 @@ export interface TorrentWatchStatus {
 }
 export interface TorrentPrefs { show_id: number; save_path: string | null; category: string | null }
 export interface RssFeedView {
-  label: string; url: string; search: string; category: string; enabled: boolean; show_id: number | null;
+  label: string; url: string; search: string; category: string | null;
+  enabled: boolean | null; exclude_batch: boolean | null; show_id: number | null;
 }
 export interface RssSubscribeResult { label: string; url: string; resolved_path: string | null; outside_roots: boolean }
 /** Mirrors the Rust ControlOp enum: unit variants serialise as bare strings, so

@@ -391,19 +391,27 @@ pub struct TorrentWatchStatus {
     /// Twin: TorrentInfo.completed_at above — extend both when the watcher needs a new server field.
     #[serde(default)] pub completed_at: Option<String>,
 }
-/// POST /api/rss/feeds body: which remote feed to poll and what to grab.
-/// `exclude_batch` reproduces the strict no-packs rule.
+/// POST /api/rss/feeds body (or PUT to the same path with the label): which
+/// remote feed to poll and what to grab. `exclude_batch` reproduces the strict
+/// no-packs rule. `search_description` is server-owned; it is carried on updates
+/// so a whole-config PUT does not reset it, and omitted on create.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RssFeedConfig {
     pub label: String, pub url: String, pub search: String, pub category: String,
     pub enabled: bool, pub exclude_batch: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub search_description: Option<bool>,
 }
 /// One server-side feed joined to the local show it was registered for, if
-/// any — a feed the app did not create has `show_id: None`.
+/// any — a feed the app did not create has `show_id: None`. The three `Option`
+/// fields exist because `None` means the server omitted the field, which is not
+/// the same as `false`/`""`: a `serde(default)` value must never be written
+/// back as if it were server truth (see `refresh_feed_search`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RssFeedView {
     pub label: String, #[serde(default)] pub url: String, #[serde(default)] pub search: String,
-    #[serde(default)] pub category: String, #[serde(default)] pub enabled: bool,
+    #[serde(default)] pub category: Option<String>, #[serde(default)] pub enabled: Option<bool>,
+    #[serde(default)] pub exclude_batch: Option<bool>,
+    #[serde(default)] pub search_description: Option<bool>,
     #[serde(default)] pub show_id: Option<i64>,
 }
 /// What `torrent_rss_subscribe` reports: the deterministic label, the feed URL,
