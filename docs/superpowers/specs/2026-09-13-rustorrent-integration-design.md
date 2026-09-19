@@ -192,13 +192,27 @@ cross-session touchpoint.
   (deterministic → re-click reports "already subscribed"). Category
   from prefs, default `anime`.
 - Search regex built in `torrent.rs`:
-  `(?i)\[<escaped group>\].*<escaped title core>.*<resolution>`,
+  `(?i)\[<escaped group>\].*<word>.*<word>.*<resolution>`,
   omitting group/resolution clauses when the show has no preference;
   validated client-side with the `regex` crate before sending.
-  Title core is the display-title words regex-escaped and joined by
-  `.*`, so minor separator differences still match without loosening
-  identity.
+  Each word is `search_word`: its alphanumeric runs, escaped, joined by at
+  least one non-alphanumeric (`[^\p{Alphabetic}\p{N}]+`); leading
+  punctuation is kept literal (so `∀Gundam` cannot collapse to `Gundam`)
+  and a trailing run beginning with `.` is kept (so `No. 6` is not
+  `No.*6`), while other trailing punctuation is dropped (provider
+  `Lane:` matches release `Lane`). A blank title is an `AppError::Parse`
+  rather than a bare `(?i)` that would match every release.
   `exclude_batch=true` reproduces the strict no-packs rule.
+- Re-clicking Follow repairs an existing feed (`PUT /api/rss/feeds/{label}`,
+  full-replace, 404 for an unknown label): the stored `search` is re-pointed
+  at the current builder output and the URL is re-derived, never echoed from
+  the server. Every server field the app models (`category`, `enabled`,
+  `exclude_batch`, `search_description`) is round-tripped so a full-replace
+  PUT cannot reset it; a row the server returns without one of those fields
+  is left alone rather than written back with a `serde(default)` value. A
+  feed the server no longer lists is re-registered; a repair that cannot be
+  confirmed emits the `error` event (the subscribe itself still succeeds,
+  since the feed is live).
   Known limitation, deferred to Phase 2: sequel seasons sharing a title
   core share the feed. Revisit when the subscribe UI grows a season
   selector (Phase 2 sketch) — before then there is no per-season feed to
