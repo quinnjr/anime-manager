@@ -146,6 +146,13 @@ pub enum ShowSort {
     RecentlyDownloaded,
 }
 
+/// An episode that is actually on disk: not flagged missing and carrying real bytes. A row
+/// written before the zero-byte scan guard (see `db::run_scan`) can still be size 0, so the
+/// show-card counts, the "Newest files" sort and the "Most unwatched" sort all read presence
+/// through this one predicate instead of re-deriving it and drifting. Requires the `episodes`
+/// table to be aliased `e` and joined to `seasons se` on `se.show_id = s.id`.
+pub(crate) const EPISODE_PRESENT_SQL: &str = "e.status != 'missing' AND e.size > 0";
+
 impl ShowSort {
     /// The ORDER BY body for this option. Every option falls back to title so the grid never
     /// reshuffles arbitrarily between two shows that tie.
@@ -155,7 +162,7 @@ impl ShowSort {
         match self {
             Self::Title => format!("{dt} COLLATE NOCASE ASC"),
             Self::Unwatched => format!(
-                "(SELECT COUNT(*) {episodes_of} AND e.status IN ('unplayed','playing')) DESC, {dt} COLLATE NOCASE ASC"
+                "(SELECT COUNT(*) {episodes_of} AND {EPISODE_PRESENT_SQL} AND e.status IN ('unplayed','playing')) DESC, {dt} COLLATE NOCASE ASC"
             ),
             // NULL sorts lowest in SQLite, so never-played shows land at the end under DESC.
             Self::LastPlayed => format!(
@@ -163,7 +170,10 @@ impl ShowSort {
             ),
             Self::RecentlyAdded => format!("s.created_at DESC, {dt} COLLATE NOCASE ASC"),
             Self::RecentlyUpdated => {
-                format!("(SELECT MAX(e.mtime) {episodes_of}) DESC, {dt} COLLATE NOCASE ASC")
+                // "Newest file on disk" means a file that is actually there: an incomplete
+                // download and a vanished one both carry mtimes that say nothing about what
+                // arrived, and would otherwise sort their show to the top.
+                format!("(SELECT MAX(e.mtime) {episodes_of} AND {EPISODE_PRESENT_SQL}) DESC, {dt} COLLATE NOCASE ASC")
             }
             // Pin time, not finish time: pins record when added via the app.
             // Empty union yields NULL, so shows with no pins sort last under DESC.

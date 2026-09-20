@@ -251,6 +251,12 @@ fn row_to_episode(r: &rusqlite::Row) -> rusqlite::Result<Episode> {
 }
 const EP_COLS: &str = "id, season_id, number, path, size, mtime, release_group, resolution, crc, status, position_secs, duration_secs, last_played_at";
 
+/// The status a `missing` row returns to when its file reappears: the user's last judgement,
+/// except `playing`, which is a runtime state that does not survive. Shared by the two paths
+/// that revive a row — a file that comes back (`upsert_episode`) and a zero-byte placeholder
+/// that reappears (`mark_incomplete`) — so the two cannot drift apart.
+const REVIVE_MISSING_SQL: &str = "COALESCE(NULLIF(prev_status,'playing'),'unplayed')";
+
 /// Neutralise LIKE wildcards typed into the search box, so `_` filters instead of matching all.
 fn escape_like(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -422,9 +428,9 @@ impl Db {
                     // A file that comes back is restored to whatever the user had judged it to be,
                     // never blanket-reset to unplayed; 'playing' is a runtime state, so it decays.
                     c.execute(
-                        "UPDATE episodes SET season_id=?2, number=?3, path=?4, size=?5, mtime=?6, release_group=?7, resolution=?8, crc=?9,
-                         status = CASE WHEN status='missing' THEN COALESCE(NULLIF(prev_status,'playing'), 'unplayed') ELSE status END,
-                         prev_status = NULL WHERE id=?1",
+                        &format!("UPDATE episodes SET season_id=?2, number=?3, path=?4, size=?5, mtime=?6, release_group=?7, resolution=?8, crc=?9,
+                         status = CASE WHEN status='missing' THEN {REVIVE_MISSING_SQL} ELSE status END,
+                         prev_status = NULL WHERE id=?1"),
                         params![id, season_id, p.episode, path, f.size as i64, f.mtime, p.release_group, p.resolution, p.crc])?;
                     Ok(Upsert::Updated)
                 }
@@ -435,6 +441,27 @@ impl Db {
                     Ok(Upsert::Added)
                 }
             }
+        })
+    }
+
+    /// Record that a path exists on disk but is not readable yet: an incomplete download at
+    /// exactly zero bytes (see `run_scan`). A row already flagged missing is restored to the
+    /// user's judgement, because a file that is present is not gone — leaving it missing would
+    /// let the Settings purge delete the watched flag, resume position and match. `size` is
+    /// zeroed so `EPISODE_PRESENT_SQL` keeps it out of the counts and the sorts until a later
+    /// scan finds it non-empty, and `mtime` is left alone so it cannot jump "Newest files".
+    pub fn mark_incomplete(&self, path: &str) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                &format!(
+                    "UPDATE episodes SET size = 0,
+                     prev_status = CASE WHEN status = 'missing' THEN NULL ELSE prev_status END,
+                     status = CASE WHEN status = 'missing' THEN {REVIVE_MISSING_SQL} ELSE status END
+                     WHERE path = ?1"
+                ),
+                params![path],
+            )?;
+            Ok(())
         })
     }
 
@@ -687,8 +714,8 @@ impl Db {
             let dt = DISPLAY_TITLE_SQL;
             let sql = format!(
                 "SELECT s.id, {dt}, s.cover_url, s.cover_path,
-                        (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id=se.id WHERE se.show_id=s.id AND e.status!='missing'),
-                        (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id=se.id WHERE se.show_id=s.id AND e.status IN ('unplayed','playing'))
+                        (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id=se.id WHERE se.show_id=s.id AND {EPISODE_PRESENT_SQL}),
+                        (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id=se.id WHERE se.show_id=s.id AND {EPISODE_PRESENT_SQL} AND e.status IN ('unplayed','playing'))
                  FROM shows s WHERE {dt} LIKE ?1 ESCAPE '\\' ORDER BY {order}",
                 order = sort.order_by(dt));
             let mut st = c.prepare(&sql)?;
@@ -1375,6 +1402,16 @@ pub fn run_scan(db: &Db, on_progress: &mut dyn FnMut(ScanProgress)) -> Result<Sc
                     continue;
                 }
             };
+            // A zero-byte file is an incomplete download: a real directory entry, so its path is
+            // "seen" and must not mark an existing row missing (or a later purge would delete the
+            // watched judgement), but not playable yet, so it is not ingested. It becomes an
+            // episode on the scan that first finds it non-empty. `EPISODE_PRESENT_SQL` also
+            // ignores size-0 rows, for rows written before this guard existed.
+            if f.size == 0 {
+                db.mark_incomplete(&path_str)?;
+                seen_paths.push(path_str);
+                continue;
+            }
             let parsed = match db.get_override(&path_str)? {
                 Some(o) if o.kind == KIND_IGNORE => {
                     seen_paths.push(path_str);
@@ -1614,6 +1651,18 @@ mod tests {
             dirs: vec![],
         }
     }
+    /// The id of the show whose display title contains `title` (fixture titles are unique).
+    fn show_id(db: &Db, title: &str) -> i64 {
+        db.list_shows(title, ShowSort::Title).unwrap()[0].id
+    }
+    /// Display titles in the order a sort returns them.
+    fn show_titles(db: &Db, sort: ShowSort) -> Vec<String> {
+        db.list_shows("", sort)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.display_title)
+            .collect()
+    }
 
     #[test]
     fn upsert_creates_show_season_episode_then_updates() {
@@ -1776,6 +1825,112 @@ mod tests {
         let summary = run_scan(&db, &mut |_| {}).unwrap();
         assert_eq!(summary.episodes_updated, 1);
         assert_eq!(summary.episodes_missing, 1);
+    }
+
+    #[test]
+    fn run_scan_skips_zero_byte_files_and_ingests_them_when_filled() {
+        let dir = tempfile::tempdir().unwrap();
+        // One byte is an episode; exactly zero is an incomplete download. Pin the boundary.
+        std::fs::write(dir.path().join("Show - 01.mkv"), b"a").unwrap();
+        std::fs::write(dir.path().join("Show - 02.mkv"), b"").unwrap();
+        let db = Db::open_memory().unwrap();
+        db.add_root(dir.path().to_str().unwrap()).unwrap();
+
+        let summary = run_scan(&db, &mut |_| {}).unwrap();
+        // The incomplete download is counted as seen but never becomes an episode.
+        assert_eq!(summary.files_seen, 2);
+        assert_eq!(summary.episodes_added, 1);
+        assert_eq!(summary.episodes_missing, 0);
+        let empty = dir.path().join("Show - 02.mkv");
+        assert!(db.show_id_for_path(empty.to_str().unwrap()).unwrap().is_none());
+
+        // The download finishes: the next scan ingests it, exactly once.
+        std::fs::write(&empty, b"a").unwrap();
+        let summary = run_scan(&db, &mut |_| {}).unwrap();
+        assert_eq!(summary.episodes_added, 1);
+        assert!(db.show_id_for_path(empty.to_str().unwrap()).unwrap().is_some());
+        let show = db.get_show(show_id(&db, "Show")).unwrap();
+        assert_eq!(show.seasons[0].episodes.len(), 2);
+    }
+
+    #[test]
+    fn run_scan_does_not_mark_a_truncated_episode_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Show - 01.mkv");
+        std::fs::write(&file, b"abc").unwrap();
+        let db = Db::open_memory().unwrap();
+        db.add_root(dir.path().to_str().unwrap()).unwrap();
+        run_scan(&db, &mut |_| {}).unwrap();
+        let ep = db.get_show(show_id(&db, "Show")).unwrap().seasons[0].episodes[0].id;
+        db.set_status(ep, EpisodeStatus::Played).unwrap();
+
+        // A re-download truncates the file to zero bytes. The path is still there, so the
+        // watched judgement must survive: not missing, and not deletable by the purge. The row
+        // is not re-ingested either (0 updates), which is what distinguishes the guard from
+        // falling through to upsert_episode, and its mtime is left alone so it cannot jump
+        // "Newest files".
+        let before = db.get_episode(ep).unwrap().mtime;
+        std::fs::File::create(&file).unwrap();
+        let summary = run_scan(&db, &mut |_| {}).unwrap();
+        assert_eq!(summary.episodes_updated, 0, "a placeholder is not an update");
+        assert_eq!(summary.episodes_missing, 0);
+        assert_eq!(db.get_episode(ep).unwrap().status, EpisodeStatus::Played);
+        assert_eq!(db.get_episode(ep).unwrap().mtime, before);
+        assert_eq!(db.purge_missing().unwrap(), 0);
+
+        // The download completes and the row is updated in place, still played.
+        std::fs::write(&file, b"abcdef").unwrap();
+        let summary = run_scan(&db, &mut |_| {}).unwrap();
+        assert_eq!(summary.episodes_updated, 1);
+        assert_eq!(db.get_episode(ep).unwrap().status, EpisodeStatus::Played);
+    }
+
+    #[test]
+    fn run_scan_revives_a_missing_episode_when_its_placeholder_reappears() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Show - 01.mkv");
+        std::fs::write(&file, b"abc").unwrap();
+        let db = Db::open_memory().unwrap();
+        db.add_root(dir.path().to_str().unwrap()).unwrap();
+        run_scan(&db, &mut |_| {}).unwrap();
+        let ep = db.get_show(show_id(&db, "Show")).unwrap().seasons[0].episodes[0].id;
+        db.set_status(ep, EpisodeStatus::Played).unwrap();
+
+        // The downloader removes the old file before re-fetching, and a scan lands in the gap.
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(run_scan(&db, &mut |_| {}).unwrap().episodes_missing, 1);
+        assert_eq!(db.get_episode(ep).unwrap().status, EpisodeStatus::Missing);
+
+        // It recreates the path at zero bytes. The file is present, so the row is not gone: it
+        // is restored to the user's judgement and kept out of the purge. Again the placeholder
+        // is not an update, which is what proves the guard ran rather than upsert_episode.
+        std::fs::File::create(&file).unwrap();
+        let summary = run_scan(&db, &mut |_| {}).unwrap();
+        assert_eq!(summary.episodes_updated, 0, "a placeholder is not an update");
+        assert_eq!(summary.episodes_missing, 0);
+        assert_eq!(db.get_episode(ep).unwrap().status, EpisodeStatus::Played);
+        assert_eq!(db.purge_missing().unwrap(), 0);
+
+        // The download completes; the row is updated in place, still played.
+        std::fs::write(&file, b"abcdef").unwrap();
+        let summary = run_scan(&db, &mut |_| {}).unwrap();
+        assert_eq!(summary.episodes_updated, 1);
+        assert_eq!(db.get_episode(ep).unwrap().status, EpisodeStatus::Played);
+    }
+
+    #[test]
+    fn mark_incomplete_decays_a_playing_row_to_unplayed() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Show", 1, 1), &rf("/s/1.mkv", 1, 1)).unwrap();
+        let ep = db.get_show(show_id(&db, "Show")).unwrap().seasons[0].episodes[0].id;
+        db.set_status(ep, EpisodeStatus::Playing).unwrap();
+        // The file vanishes while it is playing; a scan records prev_status = 'playing'.
+        db.mark_missing_within(&["/s".to_string()], &[]).unwrap();
+        assert_eq!(db.get_episode(ep).unwrap().status, EpisodeStatus::Missing);
+
+        // It returns as a zero-byte placeholder: 'playing' is a runtime state, so it decays.
+        db.mark_incomplete("/s/1.mkv").unwrap();
+        assert_eq!(db.get_episode(ep).unwrap().status, EpisodeStatus::Unplayed);
     }
 
     #[test]
@@ -2645,6 +2800,49 @@ mod tests {
             titles(ShowSort::RecentlyUpdated),
             ["Zulu", "Mid", "Alpha"],
             "newest file on disk first"
+        );
+    }
+
+    #[test]
+    fn recently_updated_ignores_incomplete_and_missing_files() {
+        let db = Db::open_memory().unwrap();
+        // Charlie's only file is a zero-byte placeholder (an incomplete download) and Bravo's
+        // file was deleted. Both carry newer mtimes than anything real, but neither is a file
+        // on disk, so neither may head a sort whose whole job is "what the downloader brought
+        // in". They fall to the bottom on the title tiebreak instead of sorting first.
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/a/1.mkv", 1, 100))
+            .unwrap();
+        db.upsert_episode(&pn("Bravo", 1, 1), &rf("/b/1.mkv", 1, 8000))
+            .unwrap();
+        db.upsert_episode(&pn("Charlie", 1, 1), &rf("/c/1.mkv", 0, 9000))
+            .unwrap();
+        db.upsert_episode(&pn("Delta", 1, 1), &rf("/d/1.mkv", 1, 5000))
+            .unwrap();
+        // Echo holds a real file and a missing one that is newer still: it must rank by the
+        // real file (200), proving MAX runs over the qualifying rows rather than before the
+        // filter (which would rank Echo first on 9500) or dropping the show entirely.
+        db.upsert_episode(&pn("Echo", 1, 1), &rf("/e/1.mkv", 1, 200))
+            .unwrap();
+        db.upsert_episode(&pn("Echo", 1, 2), &rf("/e/2.mkv", 1, 9500))
+            .unwrap();
+
+        let bravo_ep = db.get_show(show_id(&db, "Bravo")).unwrap().seasons[0].episodes[0].id;
+        db.set_status(bravo_ep, EpisodeStatus::Missing).unwrap();
+        let echo_ep2 = db.get_show(show_id(&db, "Echo")).unwrap().seasons[0].episodes[1].id;
+        db.set_status(echo_ep2, EpisodeStatus::Missing).unwrap();
+
+        assert_eq!(
+            show_titles(&db, ShowSort::RecentlyUpdated),
+            ["Delta", "Echo", "Alpha", "Bravo", "Charlie"]
+        );
+        // The badge and the "Most unwatched" sort must read presence the same way: Charlie's
+        // only file is zero bytes, so it is not an episode waiting for the user.
+        let cards = db.list_shows("", ShowSort::RecentlyUpdated).unwrap();
+        let charlie = cards.iter().find(|c| c.display_title == "Charlie").unwrap();
+        assert_eq!((charlie.episode_count, charlie.unwatched_count), (0, 0));
+        assert_eq!(
+            show_titles(&db, ShowSort::Unwatched),
+            ["Alpha", "Delta", "Echo", "Bravo", "Charlie"]
         );
     }
 
