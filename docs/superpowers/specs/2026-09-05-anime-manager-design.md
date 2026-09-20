@@ -222,6 +222,13 @@ These are load-bearing; each exists because its absence destroys user data.
   canonical name with no record of the rename.
 - **Paths must be valid UTF-8.** A non-UTF-8 filename is reported in `ScanSummary.errors` rather
   than stored lossily, which would produce an unopenable row that also collides on `UNIQUE(path)`.
+- **A zero-byte file is not an episode.** A file truncated to exactly zero bytes is an incomplete
+  download that is not readable yet: the scan marks its path seen and zeroes its recorded size, so
+  it is neither ingested nor counted, but a re-download that truncates — or deletes then recreates —
+  a watched episode cannot mark it missing and let the purge delete the watched flag, resume
+  position or match: a row already flagged missing is restored to its `prev_status`. It becomes an
+  episode again on the scan that first finds it non-empty. A preallocated or partially-written file
+  carries a non-zero size and is not distinguished from a complete one.
 - **Untracked playback writes nothing.** If mpv's IPC socket never connects there is no position
   or duration, so the watched judgement is skipped entirely and the episode's progress is left
   exactly as it was, with an error explaining why.
