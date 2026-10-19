@@ -1392,37 +1392,48 @@ mod tests {
 
     #[tokio::test]
     async fn dlna_port_probe_bumps_past_occupied_port() {
-        let want = pick_unbound_test_port().await;
-        let _held =
-            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], want)))
-                .await
-                .unwrap();
-        let (_listener, bound) = bind_free_dlna_port(want).await.unwrap();
-        assert_eq!(bound, want + 1);
+        let (base, mut held) = hold_port_block().await;
+        // Keep the first port occupied and let the rest go, so the probe has to
+        // skip `base` and land on `base + 1`.
+        held.truncate(1);
+        let (_listener, bound) = bind_free_dlna_port(base).await.unwrap();
+        assert_eq!(bound, base + 1);
     }
 
     #[tokio::test]
     async fn dlna_port_probe_errors_when_range_full() {
-        let want = pick_unbound_test_port().await;
-        let mut held = Vec::new();
-        for p in want..=want + DLNA_PORT_TRIES {
-            held.push(
-                tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], p)))
-                    .await
-                    .unwrap(),
-            );
-        }
-        assert!(bind_free_dlna_port(want).await.is_err());
+        let (base, _held) = hold_port_block().await;
+        assert!(bind_free_dlna_port(base).await.is_err());
     }
 
-    /// An ephemeral-bound port, released again: free in practice, stable
-    /// enough as a probe base since the tests hold what they need.
-    async fn pick_unbound_test_port() -> u16 {
-        tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+    /// A whole `DLNA_PORT_TRIES + 1` run of ports, already bound and handed back
+    /// so each test decides which to keep occupied.
+    ///
+    /// The run starts above `ip_local_port_range` (32768-60999 on Linux) on
+    /// purpose. A port released inside that range is fair game for any other
+    /// socket on the machine, so picking a probe base there made these tests fail
+    /// intermittently as soon as the full suite ran next to ordinary network
+    /// activity: `bind(0)` hands out an ephemeral port, and by the time the test
+    /// rebinds it something else owns it.
+    async fn hold_port_block() -> (u16, Vec<tokio::net::TcpListener>) {
+        const FIRST: u16 = 61_000;
+        for base in FIRST..FIRST + 512 {
+            let mut held = Vec::new();
+            for p in base..=base + DLNA_PORT_TRIES {
+                match tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], p)))
+                    .await
+                {
+                    Ok(listener) => held.push(listener),
+                    Err(_) => break,
+                }
+            }
+            if held.len() == DLNA_PORT_TRIES as usize + 1 {
+                return (base, held);
+            }
+        }
+        panic!(
+            "no free {}-port block for the DLNA probe tests",
+            DLNA_PORT_TRIES + 1
+        );
     }
 }
