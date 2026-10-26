@@ -952,7 +952,7 @@ impl Db {
                     hit.episodes
                 ],
             )?;
-            crate::sync::store::publish_show(c, show_id)
+            crate::sync::store::publish_show_match(c, show_id)
         })
     }
 
@@ -960,7 +960,7 @@ impl Db {
     pub fn clear_anilist(&self, show_id: i64) -> Result<()> {
         self.with(|c| {
             c.execute("UPDATE shows SET anilist_id=NULL, canonical_title=NULL, cover_url=NULL, cover_path=NULL, total_episodes=NULL, anilist_cleared=1, match_source=NULL WHERE id=?1", params![show_id])?;
-            crate::sync::store::publish_show(c, show_id)
+            crate::sync::store::publish_show_match(c, show_id)
         })
     }
 
@@ -982,7 +982,7 @@ impl Db {
                 "UPDATE shows SET user_title_override = ?2 WHERE id = ?1",
                 params![show_id, t],
             )?;
-            crate::sync::store::publish_show(c, show_id)
+            crate::sync::store::publish_show_title_override(c, show_id)
         })
     }
 
@@ -1047,6 +1047,21 @@ impl Db {
                 let Some((&keep, losers)) = ids.split_first() else { continue };
 
                 for &loser in losers {
+                    let carried = |tx: &Connection| -> Result<(Option<String>, (Option<String>, Option<String>, Option<i64>))> {
+                        Ok(tx.query_row(
+                            "SELECT user_title_override, canonical_title, cover_url, total_episodes FROM shows WHERE id = ?1",
+                            params![keep],
+                            |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?)
+                    };
+                    let column = |tx: &Connection, sql: &str| -> Result<Vec<String>> {
+                        let mut st = tx.prepare(sql)?;
+                        Ok(st.query_map(params![loser], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?)
+                    };
+                    // What the loser hands over, read before it moves: only these records change.
+                    let loser_links = column(&tx, "SELECT info_hash FROM torrent_links WHERE show_id = ?1")?;
+                    let loser_batches = column(&tx, "SELECT info_hash FROM torrent_batches WHERE show_id = ?1")?;
+                    let loser_feeds = column(&tx, "SELECT label FROM rss_feeds WHERE show_id = ?1")?;
+                    let keep_before = carried(&tx)?;
                     let moved: Vec<String> = {
                         let mut st = tx.prepare(
                             "SELECT e.path FROM episodes e JOIN seasons se ON e.season_id = se.id WHERE se.show_id = ?1")?;
@@ -1105,7 +1120,7 @@ impl Db {
                     tx.execute("UPDATE OR IGNORE torrent_batches SET show_id = ?1 WHERE show_id = ?2",
                         params![keep, loser])?;
                     tx.execute("DELETE FROM torrent_batches WHERE show_id = ?1", params![loser])?;
-                    tx.execute(
+                    let prefs_copied = tx.execute(
                         "INSERT OR IGNORE INTO torrent_prefs(show_id, save_path, category)
                          SELECT ?1, save_path, category FROM torrent_prefs WHERE show_id = ?2",
                         params![keep, loser])?;
@@ -1125,11 +1140,17 @@ impl Db {
                         params![keep, loser])?;
                     tx.execute("DELETE FROM shows WHERE id = ?1", params![loser])?;
                     folded += 1;
-                }
-                // The survivor may now carry fields, torrent state and feeds that were the loser's.
-                // The loser's own records are left as they are: it no longer exists to publish.
-                if folded > 0 {
-                    publish_show_state(&tx, keep)?;
+                    // Re-record only what the fold changed on the survivor. A tombstone or an
+                    // untouched value here would carry this machine's silence over a decision
+                    // another device made.
+                    use crate::sync::store;
+                    for h in &loser_links { store::publish_torrent_link(&tx, h)?; }
+                    for h in &loser_batches { store::publish_torrent_batch(&tx, h)?; }
+                    for l in &loser_feeds { store::publish_rss(&tx, l)?; }
+                    if prefs_copied > 0 { store::publish_prefs(&tx, keep)?; }
+                    let keep_after = carried(&tx)?;
+                    if keep_after.0 != keep_before.0 { store::publish_show_title_override(&tx, keep)?; }
+                    if keep_after.1 != keep_before.1 { store::publish_show_match(&tx, keep)?; }
                 }
             }
             tx.commit()?;
@@ -1398,28 +1419,6 @@ impl Db {
             Ok(())
         })
     }
-}
-
-/// Re-record everything keyed on a show's title: its match, hand-set title, torrent pins,
-/// prefs and feed labels. Used after a merge re-points that state onto the survivor.
-fn publish_show_state(c: &Connection, show_id: i64) -> Result<()> {
-    use crate::sync::store;
-    store::publish_show(c, show_id)?;
-    store::publish_prefs(c, show_id)?;
-    let column = |sql: &str| -> Result<Vec<String>> {
-        let mut st = c.prepare(sql)?;
-        Ok(st.query_map(params![show_id], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?)
-    };
-    for h in column("SELECT info_hash FROM torrent_links WHERE show_id = ?1")? {
-        store::publish_torrent_link(c, &h)?;
-    }
-    for h in column("SELECT info_hash FROM torrent_batches WHERE show_id = ?1")? {
-        store::publish_torrent_batch(c, &h)?;
-    }
-    for l in column("SELECT label FROM rss_feeds WHERE show_id = ?1")? {
-        store::publish_rss(c, &l)?;
-    }
-    Ok(())
 }
 
 pub fn run_scan(db: &Db, on_progress: &mut dyn FnMut(ScanProgress)) -> Result<ScanSummary> {
@@ -1817,7 +1816,8 @@ mod tests {
                     d.upsert_episode(&pn("Beta", 1, 1), &rf("/lib/Beta/b.mkv", 1, 1)).unwrap();
                     d.set_anilist(sid(d, "Alpha"), &hit(7)).unwrap();
                     d.set_anilist(sid(d, "Beta"), &hit(7)).unwrap();
-                }, |d| { d.merge_duplicate_shows().unwrap(); }, K::ShowTitleOverride { title: "Alpha".into() }, true),
+                    d.set_title_override(sid(d, "Beta"), Some("Mine")).unwrap();
+                }, |d| { d.merge_duplicate_shows().unwrap(); }, K::ShowTitleOverride { title: "Alpha".into() }, false),
             ("set_anilist", seed_show, |d| d.set_anilist(sid(d, "Show"), &hit(7)).unwrap(),
                 K::ShowMatch { title: "Show".into() }, false),
             ("clear_anilist", seed_show, |d| d.clear_anilist(sid(d, "Show")).unwrap(),
@@ -1878,6 +1878,68 @@ mod tests {
         let m = get(K::ShowMatch { title: "Show".into() }).unwrap();
         assert_eq!(m["anilist_cleared"], 1);
         assert!(m["match_source"].is_null());
+    }
+
+    #[test]
+    fn match_and_title_override_publish_independently() {
+        use crate::sync::keys::SyncKey as K;
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", "Anime");
+        seed_show(&db);
+        let id = sid(&db, "Show");
+        db.set_anilist(id, &hit(7)).unwrap();
+        db.clear_anilist(id).unwrap();
+        assert_eq!(seq_of(&db, &K::ShowTitleOverride { title: "Show".into() }), None);
+        db.set_title_override(id, Some("Mine")).unwrap();
+        let before = seq_of(&db, &K::ShowMatch { title: "Show".into() });
+        db.set_title_override(id, None).unwrap();
+        assert_eq!(seq_of(&db, &K::ShowMatch { title: "Show".into() }), before);
+    }
+
+    fn fold_pair(db: &Db) {
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/Alpha/a.mkv", 1, 1)).unwrap();
+        db.upsert_episode(&pn("Beta", 1, 1), &rf("/lib/Beta/b.mkv", 1, 1)).unwrap();
+        db.set_anilist(sid(db, "Alpha"), &hit(7)).unwrap();
+        db.set_anilist(sid(db, "Beta"), &hit(7)).unwrap();
+    }
+
+    #[test]
+    fn fold_publishes_the_moved_override_with_the_survivors_title() {
+        use crate::sync::keys::SyncKey as K;
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", "Anime");
+        fold_pair(&db);
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+        let rec = db.with(|c| crate::sync::store::get(c, &K::Override { library: "Anime".into(), relpath: "Beta/b.mkv".into() }))
+            .unwrap().unwrap();
+        assert_eq!(rec.value.unwrap()["title"], "Alpha");
+    }
+
+    #[test]
+    fn fold_publishes_no_tombstone_for_state_it_did_not_remove() {
+        use crate::sync::keys::SyncKey as K;
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", "Anime");
+        fold_pair(&db);
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+        for k in [K::TorrentPrefs { title: "Alpha".into() }, K::ShowTitleOverride { title: "Alpha".into() }] {
+            assert_eq!(seq_of(&db, &k), None, "{k:?}");
+        }
+    }
+
+    #[test]
+    fn fold_publishes_a_carried_over_title_override_and_prefs() {
+        use crate::sync::keys::SyncKey as K;
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", "Anime");
+        fold_pair(&db);
+        let beta = sid(&db, "Beta");
+        db.set_title_override(beta, Some("Mine")).unwrap();
+        db.set_prefs(beta, Some("/tv"), Some("anime")).unwrap();
+        db.merge_duplicate_shows().unwrap();
+        let get = |k: K| db.with(|c| crate::sync::store::get(c, &k)).unwrap().unwrap().value;
+        assert_eq!(get(K::ShowTitleOverride { title: "Alpha".into() }), Some(serde_json::json!("Mine")));
+        assert_eq!(get(K::TorrentPrefs { title: "Alpha".into() }).unwrap()["save_path"], "/tv");
     }
 
     #[test]

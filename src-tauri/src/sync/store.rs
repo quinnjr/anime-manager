@@ -222,19 +222,21 @@ pub fn publish_override(c: &Connection, abs_path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Record a show's provider match and its hand-set title. A show row that no
-/// longer exists (a merge loser) publishes nothing.
-pub fn publish_show(c: &Connection, show_id: i64) -> Result<()> {
-    type ShowRow = (String, Option<String>, Option<i64>, Option<String>, Option<String>, Option<i64>, i64, Option<String>);
-    let row: Option<ShowRow> = c
+/// Record a show's provider match. A show row that no longer exists (a merge
+/// loser) publishes nothing. Kept apart from the title override: each is its own
+/// conclusion, and re-stamping one with a stale null would overwrite another
+/// device's decision about it.
+pub fn publish_show_match(c: &Connection, show_id: i64) -> Result<()> {
+    type MatchRow = (String, Option<String>, Option<i64>, Option<String>, Option<String>, Option<i64>, i64);
+    let row: Option<MatchRow> = c
         .query_row(
             "SELECT parsed_title, match_source, anilist_id, canonical_title, cover_url, total_episodes,
-                    anilist_cleared, user_title_override FROM shows WHERE id = ?1",
+                    anilist_cleared FROM shows WHERE id = ?1",
             [show_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
         )
         .optional()?;
-    let Some((title, source, anilist_id, canonical, cover_url, total, cleared, user_title)) = row else {
+    let Some((title, source, anilist_id, canonical, cover_url, total, cleared)) = row else {
         return Ok(());
     };
     // A cleared match is a conclusion ("not this one"), so it is a value; only a
@@ -249,7 +251,18 @@ pub fn publish_show(c: &Connection, show_id: i64) -> Result<()> {
             "anilist_cleared": cleared,
         })
     });
-    record_local(c, &SyncKey::ShowMatch { title: title.clone() }, matched)?;
+    record_local(c, &SyncKey::ShowMatch { title }, matched)?;
+    Ok(())
+}
+
+/// Record a show's hand-set display title, or a tombstone once it is cleared.
+pub fn publish_show_title_override(c: &Connection, show_id: i64) -> Result<()> {
+    let row: Option<(String, Option<String>)> = c
+        .query_row("SELECT parsed_title, user_title_override FROM shows WHERE id = ?1", [show_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?;
+    let Some((title, user_title)) = row else { return Ok(()) };
     record_local(c, &SyncKey::ShowTitleOverride { title }, user_title.map(Value::from))?;
     Ok(())
 }
