@@ -6,7 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
 use super::clock::{observe, tick, Stamp};
-use super::keys::SyncKey;
+use super::keys::{locate, SyncKey};
 use crate::error::{AppError, Result};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -147,6 +147,52 @@ pub fn all(c: &Connection) -> Result<Vec<Record>> {
 
 pub fn max_seq(c: &Connection) -> Result<i64> {
     Ok(c.query_row("SELECT COALESCE(MAX(seq), 0) FROM sync_records", [], |r| r.get(0))?)
+}
+
+/// Episode value and key for `episode_id`; None when the path is not under a
+/// mapped root or the status is playing/missing (runtime states never sync).
+pub fn episode_value(c: &Connection, episode_id: i64) -> Result<Option<(SyncKey, Value)>> {
+    type EpisodeRow = (String, String, f64, Option<f64>, Option<i64>);
+    let row: Option<EpisodeRow> = c
+        .query_row(
+            "SELECT path, status, position_secs, duration_secs, last_played_at FROM episodes WHERE id = ?1",
+            [episode_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    let Some((path, status, position, duration, last_played)) = row else { return Ok(None) };
+    if status != "played" && status != "unplayed" {
+        return Ok(None);
+    }
+    let Some((library, relpath)) = locate(c, &path)? else { return Ok(None) };
+    let value = serde_json::json!({
+        "status": status,
+        "position_secs": position,
+        "duration_secs": duration,
+        "last_played_at": last_played,
+    });
+    Ok(Some((SyncKey::Episode { library, relpath }, value)))
+}
+
+/// Record the episode's current watched state, when it is syncable.
+pub fn publish_episode(c: &Connection, episode_id: i64) -> Result<()> {
+    if let Some((key, value)) = episode_value(c, episode_id)? {
+        record_local(c, &key, Some(value))?;
+    }
+    Ok(())
+}
+
+/// Write a null record for the path's episode key (`kind_ep`) or override key.
+/// A no-op when the path is not under a mapped root.
+pub fn tombstone_path(c: &Connection, kind_ep: bool, abs_path: &str) -> Result<()> {
+    let Some((library, relpath)) = locate(c, abs_path)? else { return Ok(()) };
+    let key = if kind_ep {
+        SyncKey::Episode { library, relpath }
+    } else {
+        SyncKey::Override { library, relpath }
+    };
+    record_local(c, &key, None)?;
+    Ok(())
 }
 
 #[cfg(test)]
