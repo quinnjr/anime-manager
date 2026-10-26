@@ -386,11 +386,19 @@ impl Db {
         })
     }
 
+    /// Write a setting, publishing it (when allow-listed) only if the value actually changed.
+    /// Settings saves every field at once: re-stamping the ones left alone would revert a
+    /// change another machine made to them since the page loaded.
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         self.with(|c| {
-            c.execute("INSERT INTO settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            let n = c.execute(
+                "INSERT INTO settings(key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE value IS NOT excluded.value",
                 params![key, value])?;
-            crate::sync::store::publish_setting(c, key)
+            if n > 0 {
+                crate::sync::store::publish_setting(c, key)?;
+            }
+            Ok(())
         })
     }
 
@@ -403,10 +411,13 @@ impl Db {
         })
     }
 
+    /// Delete a setting; a tombstone is published only when a row was actually removed.
     pub fn delete_setting(&self, key: &str) -> Result<()> {
         self.with(|c| {
-            c.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
-            crate::sync::store::publish_setting(c, key)
+            if c.execute("DELETE FROM settings WHERE key = ?1", params![key])? > 0 {
+                crate::sync::store::publish_setting(c, key)?;
+            }
+            Ok(())
         })
     }
 
@@ -2061,6 +2072,28 @@ mod tests {
             db.set_status(id, s).unwrap();
             assert_eq!(ep_record(&db, "Alpha/a1.mkv").unwrap(), rec);
         }
+    }
+
+    #[test]
+    fn saving_an_unchanged_setting_does_not_restamp() {
+        use crate::sync::keys::SyncKey as K;
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", "Anime");
+        let key = K::Setting { name: "llm_model".into() };
+        db.set_setting("llm_model", "m").unwrap();
+        let first = seq_of(&db, &key).unwrap();
+        db.set_setting("llm_model", "m").unwrap();
+        assert_eq!(seq_of(&db, &key), Some(first), "re-saving the same value re-stamped it");
+        db.set_setting("llm_model", "n").unwrap();
+        let second = seq_of(&db, &key).unwrap();
+        assert!(second > first, "positive control: a changed value publishes");
+        db.delete_setting("llm_model").unwrap();
+        let tomb = seq_of(&db, &key).unwrap();
+        assert!(tomb > second);
+        db.delete_setting("llm_model").unwrap();
+        assert_eq!(seq_of(&db, &key), Some(tomb), "deleting an absent setting re-stamped it");
+        db.delete_setting("played_threshold").unwrap();
+        assert_eq!(seq_of(&db, &K::Setting { name: "played_threshold".into() }), None);
     }
 
     #[test]
