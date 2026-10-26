@@ -186,6 +186,11 @@ pub fn list_devices(dir: &Path) -> Vec<(String, String, i64)> {
         .collect()
 }
 
+/// Every library name published by any parseable device file, own included.
+pub fn list_libraries(dir: &Path) -> Vec<String> {
+    device_files(dir).into_iter().filter_map(|(_, path)| parse(&path)).flat_map(|f| f.libraries).collect()
+}
+
 /// Removes one device's file. Already gone is fine.
 pub fn forget(dir: &Path, device_id: &str) -> Result<()> {
     match fs::remove_file(device_path(dir, device_id)?) {

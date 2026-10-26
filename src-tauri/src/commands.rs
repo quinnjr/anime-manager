@@ -23,6 +23,9 @@ pub struct AppState {
     /// DLNA/UPnP direct-play server. Off until the user enables it in Settings;
     /// the single app instance owns the port while running.
     pub dlna: DlnaState,
+    /// Library sync bookkeeping. A std mutex: rounds run on blocking threads and the lock is
+    /// never held across an await.
+    pub sync: Arc<std::sync::Mutex<crate::sync::SyncRuntime>>,
 }
 
 /// DLNA/UPnP direct-play server state: atomics so `dlna_status` never blocks.
@@ -43,7 +46,7 @@ pub const SETTING_DLNA_PORT: &str = "dlna_port";
 pub const SETTING_DLNA_UUID: &str = "dlna_uuid";
 
 /// Best-effort machine name without a new crate: $HOSTNAME, else /etc/hostname.
-fn hostname() -> Option<String> {
+pub(crate) fn hostname() -> Option<String> {
     std::env::var("HOSTNAME")
         .ok()
         .map(|h| h.trim().to_string())

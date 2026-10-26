@@ -461,3 +461,36 @@ pub struct TorrentAddArgs {
     pub category: Option<String>,
     pub batch: Option<BatchRangeArg>,
 }
+
+/// One library root and the sync library name it is mapped to, if any.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SyncRootMap {
+    pub root_id: i64,
+    pub root_path: String,
+    pub library: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SyncDevice {
+    pub id: String,
+    pub name: String,
+    pub written_at: i64,
+    pub is_self: bool,
+}
+
+/// Everything the Settings sync panel shows; also the `sync-progress` payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SyncStatus {
+    pub enabled: bool,
+    pub folder: Option<String>,
+    pub device_id: Option<String>,
+    pub device_name: Option<String>,
+    pub roots: Vec<SyncRootMap>,
+    /// Library names any device in the folder has published, plus this machine's own.
+    pub known_libraries: Vec<String>,
+    pub devices: Vec<SyncDevice>,
+    pub last_read_at: Option<i64>,
+    pub last_write_at: Option<i64>,
+    pub unreachable_since: Option<i64>,
+    pub error: Option<String>,
+}
