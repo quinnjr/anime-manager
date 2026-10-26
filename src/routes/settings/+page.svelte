@@ -8,6 +8,7 @@
   } from '$lib/api';
   import { toasts } from '$lib/stores/toasts.svelte';
   import { isTestedFlag } from '$lib/llmModels';
+  import SyncSettings from '$lib/components/SyncSettings.svelte';
   import ModelPickerModal from '$lib/components/ModelPickerModal.svelte';
   import { matching } from '$lib/stores/matching.svelte';
   import { DEFAULT_AUTO_SCAN_MINS, parseValidatedAutoScanMins } from '$lib/autoScan';
@@ -571,6 +572,8 @@
       <span>Allow unencrypted credentials over http (needed for a plain-LAN instance)</span>
     </label>
   </section>
+
+  <SyncSettings />
 
   <!-- Destructive-ish maintenance, kept last and apart -->
   <section class="mb-10">

@@ -108,6 +108,13 @@ export interface RssSubscribeResult { label: string; url: string; resolved_path:
 /** Mirrors the Rust ControlOp enum: unit variants serialise as bare strings, so
  *  Remove keeps its snake_case payload field exactly as serde expects it. */
 export type TorrentControlOp = 'Start' | 'Pause' | 'Recheck' | { Remove: { delete_files: boolean } };
+export interface SyncRootMap { root_id: number; root_path: string; library: string | null }
+export interface SyncDevice { id: string; name: string; written_at: number; is_self: boolean }
+export interface SyncStatus {
+  enabled: boolean; folder: string | null; device_id: string | null; device_name: string | null;
+  roots: SyncRootMap[]; known_libraries: string[]; devices: SyncDevice[];
+  last_read_at: number | null; last_write_at: number | null; unreachable_since: number | null; error: string | null;
+}
 export interface BatchRangeArg { first: number; last: number; resolution?: string | null }
 export interface TorrentAddArgs {
   torrentUrl?: string | null; infoHash?: string | null;
@@ -168,6 +175,12 @@ export const api = {
   clearAiDecisions: () => invoke<number>('clear_ai_decisions'),
   matchLibrary: () => invoke<number>('match_library'),
   setShowTitle: (showId: number, title: string | null) => invoke<ShowDetail>('set_show_title', { showId, title }),
+  syncStatus: () => invoke<SyncStatus>('sync_status'),
+  syncConfigure: (folder: string, enabled: boolean, deviceName: string) =>
+    invoke<SyncStatus>('sync_configure', { folder, enabled, deviceName }),
+  syncMapRoot: (rootId: number, library: string | null) => invoke<SyncStatus>('sync_map_root', { rootId, library }),
+  syncNow: () => invoke<SyncStatus>('sync_now'),
+  syncForgetDevice: (deviceId: string) => invoke<SyncStatus>('sync_forget_device', { deviceId }),
   dlnaStatus: () => invoke<DlnaStatus>('dlna_status'),
   dlnaSetEnabled: (enabled: boolean) => invoke<void>('dlna_set_enabled', { enabled }),
   dlnaSetOptions: (name: string, port: number) => invoke<void>('dlna_set_options', { name, port }),
