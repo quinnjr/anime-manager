@@ -438,3 +438,76 @@ fn two_machines_converge_on_one_survivor() {
     assert_eq!(b.ov_stamps(), ob);
     assert_eq!(oa, ob);
 }
+
+#[test]
+fn failed_apply_is_retried_next_round() {
+    let s = share();
+    let mut a = Machine::joined(s.path(), "dev-a", &SHOW);
+    let mut b = Machine::joined(s.path(), "dev-b", &SHOW);
+    a.watch(SHOW[0]);
+    a.round();
+    b.db.with(|c| {
+        c.execute_batch(
+            "CREATE TEMP TRIGGER fail_apply BEFORE UPDATE ON episodes BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(sync::round(&b.db, &mut b.rt, true).is_err());
+    // Merging rolled back with the apply, so nothing claims to be up to date.
+    assert_eq!(b.record(&ep_key(SHOW[0])), None);
+    assert_eq!(b.status(SHOW[0]), "unplayed");
+    b.db.with(|c| Ok(c.execute_batch("DROP TRIGGER fail_apply;")?)).unwrap();
+    assert!(b.round().applied.library_changed);
+    assert_eq!(b.status(SHOW[0]), "played");
+}
+
+#[test]
+fn scan_detected_move_before_reading_does_not_beat_newer_record() {
+    let s = share();
+    let mut a = Machine::joined(s.path(), "dev-a", &SHOW);
+    let mut b = Machine::joined(s.path(), "dev-b", &SHOW);
+    let renamed = "Show/Show S01E01.mkv";
+    a.watch(SHOW[0]);
+    a.round();
+    b.round();
+    assert_eq!(b.status(SHOW[0]), "played");
+    // A renames, then makes a newer judgement about the renamed file.
+    fs::rename(a.abs(SHOW[0]), a.abs(renamed)).unwrap();
+    a.db.update_episode_path(a.ep_id(SHOW[0]), &a.abs(renamed)).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let id = a.ep_id(renamed);
+    a.db.set_position(id, 500.0, Some(1400.0)).unwrap();
+    a.db.set_status(id, EpisodeStatus::Unplayed).unwrap();
+    a.round();
+    // B scans before reading the share: it detects the move with its stale state.
+    fs::rename(b.abs(SHOW[0]), b.abs(renamed)).unwrap();
+    b.scan();
+    let carried = b.record(&ep_key(renamed)).unwrap();
+    assert_eq!(carried.stamp, b.record(&ep_key(SHOW[0])).unwrap().stamp);
+    b.round();
+    a.round();
+    for m in [&a, &b] {
+        let (status, position, _) = m.ep(renamed);
+        assert_eq!((status.as_str(), position), ("unplayed", 500.0), "{}", m.id);
+    }
+}
+
+#[test]
+fn join_publishes_watched_file_that_is_missing() {
+    let s = share();
+    let mut a = Machine::joined(s.path(), "dev-a", &SHOW);
+    let mut b = Machine::new(s.path(), "dev-b", &SHOW);
+    b.scan();
+    b.watch(SHOW[0]);
+    fs::remove_file(b.abs(SHOW[0])).unwrap();
+    b.scan();
+    assert_eq!(b.status(SHOW[0]), "missing");
+    b.enable();
+    sync::join(&b.db, &mut b.rt).unwrap();
+    let r = b.record(&ep_key(SHOW[0])).unwrap();
+    assert_eq!(r.value.unwrap()["status"], "played");
+    assert_eq!(r.stamp.device, "dev-b");
+    a.round();
+    assert_eq!(a.status(SHOW[0]), "played");
+}

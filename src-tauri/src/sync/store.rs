@@ -158,15 +158,30 @@ pub fn max_seq(c: &Connection) -> Result<i64> {
 /// Episode value and key for `episode_id`; None when the path is not under a
 /// mapped root or the status is playing/missing (runtime states never sync).
 pub fn episode_value(c: &Connection, episode_id: i64) -> Result<Option<(SyncKey, Value)>> {
-    type EpisodeRow = (String, String, f64, Option<f64>, Option<i64>);
+    episode_value_with(c, episode_id, false)
+}
+
+/// Like `episode_value`, but a missing row reports the judgement it keeps in
+/// `prev_status`. Joining uses it: a watched file that is unmounted right now is
+/// still watched, and `missing` itself never leaves the machine.
+pub fn episode_value_keeping_missing(c: &Connection, episode_id: i64) -> Result<Option<(SyncKey, Value)>> {
+    episode_value_with(c, episode_id, true)
+}
+
+fn episode_value_with(c: &Connection, episode_id: i64, missing_as_prev: bool) -> Result<Option<(SyncKey, Value)>> {
+    type EpisodeRow = (String, String, Option<String>, f64, Option<f64>, Option<i64>);
     let row: Option<EpisodeRow> = c
         .query_row(
-            "SELECT path, status, position_secs, duration_secs, last_played_at FROM episodes WHERE id = ?1",
+            "SELECT path, status, prev_status, position_secs, duration_secs, last_played_at FROM episodes WHERE id = ?1",
             [episode_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )
         .optional()?;
-    let Some((path, status, position, duration, last_played)) = row else { return Ok(None) };
+    let Some((path, mut status, prev, position, duration, last_played)) = row else { return Ok(None) };
+    if missing_as_prev && status == "missing" {
+        let Some(prev) = prev else { return Ok(None) };
+        status = prev;
+    }
     if status != "played" && status != "unplayed" {
         return Ok(None);
     }
@@ -178,6 +193,22 @@ pub fn episode_value(c: &Connection, episode_id: i64) -> Result<Option<(SyncKey,
         "last_played_at": last_played,
     });
     Ok(Some((SyncKey::Episode { library, relpath }, value)))
+}
+
+/// A scan-detected move: the row now at a new path carries the old path's
+/// record stamp, never a fresh one. A scan can run before this machine has read
+/// the share, and a fresh stamp would let its stale state beat a newer record
+/// another machine already published for the new path. The old record stays
+/// (a disappearance deletes nothing); with no old record nothing is published.
+pub fn carry_moved_episode(c: &Connection, episode_id: i64, old_path: &str) -> Result<()> {
+    if !enabled(c)? {
+        return Ok(());
+    }
+    let Some((library, relpath)) = locate(c, old_path)? else { return Ok(()) };
+    let Some(old) = get(c, &SyncKey::Episode { library, relpath })? else { return Ok(()) };
+    let Some((key, value)) = episode_value(c, episode_id)? else { return Ok(()) };
+    merge_remote(c, &Record { key: key.encode(), value: Some(value), stamp: old.stamp })?;
+    Ok(())
 }
 
 /// Record the episode's current watched state, when it is syncable.

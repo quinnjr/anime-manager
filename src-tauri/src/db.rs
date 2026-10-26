@@ -458,10 +458,11 @@ impl Db {
                         params![id, season_id, p.episode, path, f.size as i64, f.mtime, p.release_group, p.resolution, p.crc])?;
                     // An incoming record for this path lands first, so a move publishes the merged state.
                     crate::sync::apply::apply_for_episode(c, id)?;
-                    // A scan-detected move: the new path carries the state. The old path's
-                    // record is left alone, since another machine may still have the file there.
+                    // A scan-detected move: the new path carries the state under the old
+                    // record's stamp. The old path's record is left alone, since another
+                    // machine may still have the file there.
                     if old_path != path {
-                        crate::sync::store::publish_episode(c, id)?;
+                        crate::sync::store::carry_moved_episode(c, id, &old_path)?;
                     }
                     Ok(Upsert::Updated)
                 }
@@ -2082,8 +2083,22 @@ mod tests {
         db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/nope/a.mkv", 5, 7)).unwrap();
         db.set_status(only_episode(&db), EpisodeStatus::Played).unwrap();
         db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/nope/b.mkv", 5, 7)).unwrap();
-        assert_eq!(ep_record(&db, "nope/b.mkv").unwrap().value.unwrap()["status"], "played");
-        assert_eq!(ep_record(&db, "nope/a.mkv").unwrap().value.unwrap()["status"], "played");
+        let (moved, old) = (ep_record(&db, "nope/b.mkv").unwrap(), ep_record(&db, "nope/a.mkv").unwrap());
+        assert_eq!(moved.value.unwrap()["status"], "played");
+        assert_eq!(old.value.unwrap()["status"], "played");
+        // The old record's stamp, never a fresh one: the scan may predate a newer record
+        // another machine published for the new path.
+        assert_eq!(moved.stamp, old.stamp);
+    }
+
+    #[test]
+    fn scan_detected_move_without_record_publishes_nothing() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", "Anime");
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/nope/a.mkv", 5, 7)).unwrap();
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/nope/b.mkv", 5, 7)).unwrap();
+        assert_eq!(ep_record(&db, "nope/b.mkv"), None);
+        assert_eq!(ep_record(&db, "nope/a.mkv"), None);
     }
 
     /// The id of the show whose display title contains `title` (fixture titles are unique).
