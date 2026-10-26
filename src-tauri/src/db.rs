@@ -830,16 +830,36 @@ impl Db {
         })
     }
 
+    /// Set an episode's status. Setting the status it already has leaves the row alone, so
+    /// re-marking a watched episode neither rewinds it nor re-stamps its synced record (a fresh
+    /// stamp for an unchanged judgement could beat a real change made on another machine).
     pub fn set_status(&self, id: i64, status: EpisodeStatus) -> Result<()> {
         self.with(|c| {
-            let reset_pos = status == EpisodeStatus::Played;
-            c.execute("UPDATE episodes SET status=?2, position_secs = CASE WHEN ?3 THEN 0 ELSE position_secs END,
-                       last_played_at = CASE WHEN ?3 THEN ?4 ELSE last_played_at END WHERE id=?1",
-                params![id, status.as_str(), reset_pos, now()])?;
+            let old: Option<String> =
+                c.query_row("SELECT status FROM episodes WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
+            if old.as_deref() != Some(status.as_str()) {
+                let reset_pos = status == EpisodeStatus::Played;
+                c.execute("UPDATE episodes SET status=?2, position_secs = CASE WHEN ?3 THEN 0 ELSE position_secs END,
+                           last_played_at = CASE WHEN ?3 THEN ?4 ELSE last_played_at END WHERE id=?1",
+                    params![id, status.as_str(), reset_pos, now()])?;
+            }
+            // Publishes only when the value differs from the stored record (a playback exit's
+            // position, say), never an unchanged one.
             if matches!(status, EpisodeStatus::Played | EpisodeStatus::Unplayed) {
                 crate::sync::store::publish_episode(c, id)?;
             }
             Ok(())
+        })
+    }
+
+    /// Put back the status an episode had before a playback that recorded nothing. Position
+    /// and timestamps are untouched and nothing is published: the synced record never saw
+    /// `playing`. A record that arrived while it played (apply skips a playing row) lands now.
+    pub fn restore_status(&self, id: i64, status: EpisodeStatus) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE episodes SET status = ?2 WHERE id = ?1 AND status = 'playing'",
+                params![id, status.as_str()])?;
+            crate::sync::apply::apply_for_episode(c, id)
         })
     }
 
@@ -2041,6 +2061,27 @@ mod tests {
             db.set_status(id, s).unwrap();
             assert_eq!(ep_record(&db, "Alpha/a1.mkv").unwrap(), rec);
         }
+    }
+
+    #[test]
+    fn setting_an_unchanged_status_does_not_restamp() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", "Anime");
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/Alpha/a1.mkv", 1, 1)).unwrap();
+        let id = only_episode(&db);
+        db.set_status(id, EpisodeStatus::Played).unwrap();
+        db.with(|c| Ok(c.execute("UPDATE episodes SET last_played_at = 5 WHERE id = ?1", [id])?)).unwrap();
+        db.set_status(id, EpisodeStatus::Unplayed).unwrap();
+        let rec = ep_record(&db, "Alpha/a1.mkv").unwrap();
+        db.set_status(id, EpisodeStatus::Unplayed).unwrap();
+        assert_eq!(ep_record(&db, "Alpha/a1.mkv").unwrap(), rec, "same status, same record");
+        db.set_status(id, EpisodeStatus::Played).unwrap();
+        let played = ep_record(&db, "Alpha/a1.mkv").unwrap();
+        assert!(played.stamp > rec.stamp, "positive control: a real change publishes");
+        let at = db.get_episode(id).unwrap().last_played_at;
+        db.set_status(id, EpisodeStatus::Played).unwrap();
+        assert_eq!(ep_record(&db, "Alpha/a1.mkv").unwrap(), played);
+        assert_eq!(db.get_episode(id).unwrap().last_played_at, at, "re-marking does not bump the time");
     }
 
     #[test]

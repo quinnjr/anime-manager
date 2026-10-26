@@ -211,9 +211,13 @@ pub fn carry_moved_episode(c: &Connection, episode_id: i64, old_path: &str) -> R
     Ok(())
 }
 
-/// Record the episode's current watched state, when it is syncable.
+/// Record the episode's current watched state, when it is syncable and differs from the
+/// stored record. Re-stamping an unchanged value would let it beat a real change made elsewhere.
 pub fn publish_episode(c: &Connection, episode_id: i64) -> Result<()> {
     if let Some((key, value)) = episode_value(c, episode_id)? {
+        if get(c, &key)?.is_some_and(|r| r.value.as_ref() == Some(&value)) {
+            return Ok(());
+        }
         record_local(c, &key, Some(value))?;
     }
     Ok(())
