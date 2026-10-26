@@ -1024,8 +1024,12 @@ impl Db {
     /// splitting its watched state. Once both have been matched to the same provider entry the
     /// app already knows they are the same thing, so no model is needed to say so.
     ///
-    /// The survivor is the row carrying the most episodes, so the smaller row's episodes move the
-    /// shorter distance; a title the user set by hand always wins, and any artwork or metadata
+    /// The survivor must be the same row on every synced machine, or two machines with different
+    /// episode counts fold in opposite directions and undo each other forever. So the order is:
+    /// the title most already pinned by a `merge` override (a fold another machine published
+    /// outranks local counts), then the row carrying the most episodes so the smaller row's
+    /// episodes move the shorter distance, then `parsed_title`, which unlike a row id is the
+    /// same everywhere. A title the user set by hand always wins, and any artwork or metadata
     /// only the loser had is carried over rather than dropped. Returns how many rows were folded away.
     pub fn merge_duplicate_shows(&self) -> Result<usize> {
         self.with(|c| {
@@ -1043,8 +1047,10 @@ impl Db {
                 let ids: Vec<i64> = {
                     let mut st = tx.prepare(
                         "SELECT s.id FROM shows s WHERE s.match_source = ?1 AND s.anilist_id = ?2
-                         ORDER BY (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id = se.id
-                                   WHERE se.show_id = s.id) DESC, s.id ASC")?;
+                         ORDER BY (SELECT COUNT(*) FROM parse_overrides po
+                                   WHERE po.source = 'merge' AND po.title = s.parsed_title) DESC,
+                                  (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id = se.id
+                                   WHERE se.show_id = s.id) DESC, s.parsed_title ASC")?;
                     st.query_map(params![source, ext_id], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
                 };
                 let Some((&keep, losers)) = ids.split_first() else { continue };
@@ -1904,6 +1910,41 @@ mod tests {
         db.upsert_episode(&pn("Beta", 1, 1), &rf("/lib/Beta/b.mkv", 1, 1)).unwrap();
         db.set_anilist(sid(db, "Alpha"), &hit(7)).unwrap();
         db.set_anilist(sid(db, "Beta"), &hit(7)).unwrap();
+    }
+
+    #[test]
+    fn fold_prefers_title_already_pinned() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("K", 1, 1), &rf("/lib/K/1.mkv", 1, 1)).unwrap();
+        db.upsert_episode(&pn("K", 1, 2), &rf("/lib/K/2.mkv", 1, 1)).unwrap();
+        for n in 1..=5 {
+            db.upsert_episode(&pn("L", 1, n), &rf(&format!("/lib/L/{n}.mkv"), 1, 1)).unwrap();
+        }
+        db.set_anilist(sid(&db, "K"), &hit(7)).unwrap();
+        db.set_anilist(sid(&db, "L"), &hit(7)).unwrap();
+        // Another machine already folded a path into K, so K is the title everyone converges on.
+        db.set_override(&ParseOverride { title: "K".into(), ..ov("/lib/Elsewhere/x.mkv", "merge") }).unwrap();
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+        assert!(db.get_show(sid(&db, "K")).is_ok());
+        let left: i64 = db.with(|c| Ok(c.query_row("SELECT COUNT(*) FROM shows WHERE parsed_title = 'L'", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(left, 0, "the fuller row is the one folded away");
+    }
+
+    #[test]
+    fn fold_tie_breaks_on_parsed_title() {
+        let db = Db::open_memory().unwrap();
+        // Zulu gets the lower row id, so the old `s.id ASC` tie-break would keep it.
+        db.upsert_episode(&pn("Zulu", 1, 1), &rf("/lib/Zulu/z.mkv", 1, 1)).unwrap();
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/Alpha/a.mkv", 1, 1)).unwrap();
+        db.set_anilist(sid(&db, "Zulu"), &hit(7)).unwrap();
+        db.set_anilist(sid(&db, "Alpha"), &hit(7)).unwrap();
+        assert!(sid(&db, "Zulu") < sid(&db, "Alpha"));
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+        let titles: Vec<String> = db.with(|c| {
+            let mut st = c.prepare("SELECT parsed_title FROM shows")?;
+            Ok(st.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?)
+        }).unwrap();
+        assert_eq!(titles, vec!["Alpha".to_string()]);
     }
 
     #[test]

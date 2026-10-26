@@ -114,7 +114,7 @@ state splits. Two mechanisms close that, in order of trust:
 
 - `db::merge_duplicate_shows` folds rows already matched to the same `(match_source, anilist_id)`.
   That is evidence, not a guess, so it needs no model and runs automatically after every matching
-  pass. The survivor is the row with the most episodes; a `user_title_override` and any artwork or
+  pass. The survivor is picked the same way on every synced machine, or machines with different episode counts would undo each other's folds: most `merge` pins on its title first, then most episodes, then `parsed_title` ascending (never row id); a `user_title_override` and any artwork or
   counts only a folded row carried are kept. Seasons are `UNIQUE(show_id, number)`, so episodes
   move season by season into the survivor's season of that number rather than the season row moving.
   Rows with no shared id are deliberately left alone — titles alone are not evidence.
