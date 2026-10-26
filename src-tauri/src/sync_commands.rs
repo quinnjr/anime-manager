@@ -14,7 +14,7 @@ use crate::commands::AppState;
 use crate::db::Db;
 use crate::error::{AppError, Result};
 use crate::models::*;
-use crate::sync::apply::{self, Applied};
+use crate::sync::apply::Applied;
 use crate::sync::folder::{self, FolderState};
 use crate::sync::{self, SyncRuntime};
 
@@ -48,12 +48,20 @@ pub fn status_with(db: &Db, rt: &SyncRuntime) -> Result<SyncStatus> {
     })?;
     let mut known_libraries = mapped;
     let mut devices = Vec::new();
-    if let Some(dir) = folder.as_deref().map(Path::new) {
-        known_libraries.extend(folder::list_libraries(dir));
-        devices = folder::list_devices(dir)
-            .into_iter()
-            .map(|(id, name, written_at)| SyncDevice { is_self: device_id.as_deref() == Some(id.as_str()), id, name, written_at })
-            .collect();
+    if enabled {
+        // From what rounds already parsed; the status never reads the share itself.
+        if let Some(id) = &device_id {
+            devices.push(SyncDevice {
+                id: id.clone(),
+                name: device_name.clone().unwrap_or_default(),
+                written_at: rt.last_write_at.unwrap_or(0),
+                is_self: true,
+            });
+        }
+        for (id, d) in &rt.devices {
+            known_libraries.extend(d.libraries.iter().cloned());
+            devices.push(SyncDevice { id: id.clone(), name: d.name.clone(), written_at: d.written_at, is_self: false });
+        }
     }
     known_libraries.sort();
     known_libraries.dedup();
@@ -72,23 +80,9 @@ pub fn status_with(db: &Db, rt: &SyncRuntime) -> Result<SyncStatus> {
     })
 }
 
-/// What a disarming flag from an apply means for this machine's own tests.
-fn settle(db: &Db, applied: &Applied) -> Result<()> {
-    if applied.library_changed {
-        db.merge_duplicate_shows()?;
-    }
-    if applied.disarm_llm {
-        crate::llm::Llm::mark_tested(db, false)?;
-    }
-    if applied.disarm_torrent {
-        crate::torrent::mark_tested(db, false)?;
-    }
-    Ok(())
-}
-
 pub fn configure_with(db: &Db, rt: &mut SyncRuntime, folder: &str, enabled: bool, device_name: &str) -> Result<Done> {
     let name = device_name.trim();
-    if name.is_empty() {
+    if enabled && name.is_empty() {
         return Err(fail("Give this device a name so the others can tell it apart."));
     }
     let folder = folder.trim();
@@ -122,12 +116,23 @@ pub fn configure_with(db: &Db, rt: &mut SyncRuntime, folder: &str, enabled: bool
     if !folder.is_empty() {
         db.set_setting_unpublished("sync_folder", folder)?;
     }
-    db.set_setting_unpublished("sync_device_name", name)?;
+    if !name.is_empty() {
+        db.set_setting_unpublished("sync_device_name", name)?;
+    }
     if enabled {
         db.set_setting_unpublished("sync_enabled", "1")?;
         if !was_enabled || old_folder.as_deref() != Some(folder) {
             *rt = SyncRuntime::default();
-            outcome = sync::join(db, rt)?.applied;
+            match sync::join(db, rt) {
+                Ok(o) => outcome = o.applied,
+                Err(e) => {
+                    // A failed join must not leave sync running half-joined.
+                    if !was_enabled {
+                        db.delete_setting("sync_enabled")?;
+                    }
+                    return Err(e);
+                }
+            }
         } else {
             // A rename only: republish so the other machines see the new name.
             sync::flush(db, rt, true)?;
@@ -140,6 +145,7 @@ pub fn configure_with(db: &Db, rt: &mut SyncRuntime, folder: &str, enabled: bool
 
 pub fn map_root_with(db: &Db, rt: &mut SyncRuntime, root_id: i64, library: Option<String>) -> Result<Done> {
     let mut outcome = Applied::default();
+    let enabled = db.get_setting("sync_enabled")?.as_deref() == Some("1");
     match library.as_deref().map(str::trim) {
         None => {
             db.with(|c| Ok(c.execute("DELETE FROM sync_libraries WHERE root_id = ?1", [root_id])?))?;
@@ -164,13 +170,14 @@ pub fn map_root_with(db: &Db, rt: &mut SyncRuntime, root_id: i64, library: Optio
                 )?;
                 Ok(())
             })?;
-            if db.get_setting("sync_enabled")?.as_deref() == Some("1") {
-                let applied = db.with(apply::apply_all)?;
-                sync::publish_existing(db, Some(root_id))?;
-                settle(db, &applied)?;
-                outcome = applied;
+            if enabled {
+                outcome = sync::map_root(db, root_id)?;
             }
         }
+    }
+    if enabled {
+        // The device file's `libraries` list changed whatever else did.
+        sync::flush(db, rt, true)?;
     }
     Ok((status_with(db, rt)?, outcome))
 }
@@ -197,6 +204,8 @@ pub fn forget_with(db: &Db, rt: &mut SyncRuntime, device_id: &str) -> Result<Don
         return Err(fail("Sync has no folder yet."));
     };
     folder::forget(Path::new(&dir), device_id)?;
+    rt.devices.remove(device_id);
+    rt.cache.remove(device_id);
     Ok((status_with(db, rt)?, Applied::default()))
 }
 
@@ -285,6 +294,7 @@ pub async fn sync_forget_device(app: AppHandle, state: State<'_, AppState>, devi
 pub fn spawn_poller(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut every = tokio::time::interval(Duration::from_secs(3));
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut n: u64 = 0;
         loop {
             every.tick().await;
@@ -304,8 +314,11 @@ pub fn spawn_poller(app: AppHandle) {
                 Ok::<_, AppError>((read || before != after).then_some((status, applied)))
             })
             .await;
-            if let Ok(Ok(Some((status, applied)))) = res {
-                emit(&app, &status, &applied);
+            match res {
+                Ok(Ok(Some((status, applied)))) => emit(&app, &status, &applied),
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => eprintln!("sync poll failed: {e}"),
+                Err(e) => eprintln!("sync poll task failed: {e}"),
             }
         }
     });
@@ -398,5 +411,147 @@ mod tests {
         let st = configure_with(&db, &mut rt, dir.path().to_str().unwrap(), false, "laptop").unwrap().0;
         assert!(!st.enabled);
         assert_eq!(db.get_setting("sync_device_id").unwrap(), Some(id));
+    }
+
+    const SHOW: [&str; 2] = ["Show/Show - 01.mkv", "Show/Show - 02.mkv"];
+
+    struct M {
+        db: Db,
+        rt: SyncRuntime,
+        root_id: i64,
+        root: std::path::PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    impl M {
+        fn new(files: &[&str]) -> M {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("lib");
+            for f in files {
+                let p = root.join(f);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, b"video").unwrap();
+            }
+            let db = Db::open_memory().unwrap();
+            let root_id = db.add_root(root.to_str().unwrap()).unwrap().id;
+            crate::db::run_scan(&db, &mut |_| {}).unwrap();
+            M { db, rt: SyncRuntime::default(), root_id, root, _dir: dir }
+        }
+        fn configure(&mut self, dir: &Path, name: &str) -> Result<Done> {
+            configure_with(&self.db, &mut self.rt, dir.to_str().unwrap(), true, name)
+        }
+        fn map(&mut self) -> Done {
+            map_root_with(&self.db, &mut self.rt, self.root_id, Some("Anime".into())).unwrap()
+        }
+        fn ep_id(&self, rel: &str) -> i64 {
+            let p = self.root.join(rel).to_str().unwrap().to_string();
+            self.db.with(|c| Ok(c.query_row("SELECT id FROM episodes WHERE path = ?1", [&p], |r| r.get(0))?)).unwrap()
+        }
+        fn watch(&self, rel: &str) {
+            self.db.set_status(self.ep_id(rel), crate::models::EpisodeStatus::Played).unwrap();
+        }
+        fn ep(&self, rel: &str) -> (String, Option<i64>) {
+            let id = self.ep_id(rel);
+            self.db
+                .with(|c| Ok(c.query_row("SELECT status, last_played_at FROM episodes WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?))
+                .unwrap()
+        }
+        fn has_record(&self, rel: &str) -> bool {
+            let key = crate::sync::keys::SyncKey::Episode { library: "Anime".into(), relpath: rel.into() };
+            self.db.with(|c| crate::sync::store::get(c, &key)).unwrap().is_some()
+        }
+        fn own_file_libraries(&self, share: &Path) -> Vec<String> {
+            let id = self.db.get_setting("sync_device_id").unwrap().unwrap();
+            let mut cache = std::collections::HashMap::new();
+            let res = folder::read_others(share, "", &mut cache);
+            res.files.into_iter().find(|f| f.device_id == id).unwrap().libraries
+        }
+    }
+
+    /// B has watched episode 2 and published it.
+    fn machine_b(share: &Path) -> M {
+        let mut b = M::new(&SHOW);
+        b.configure(share, "b").unwrap();
+        b.map();
+        b.watch(SHOW[1]);
+        sync::flush(&b.db, &mut b.rt, true).unwrap();
+        b
+    }
+
+    #[test]
+    fn mapping_while_enabled_publishes_played_and_applies_share() {
+        let share = tempfile::tempdir().unwrap();
+        let _b = machine_b(share.path());
+        let mut a = M::new(&SHOW);
+        a.configure(share.path(), "a").unwrap();
+        a.watch(SHOW[0]);
+        assert!(!a.has_record(SHOW[0]), "unmapped: nothing published yet");
+        let (_, applied) = a.map();
+        assert!(a.has_record(SHOW[0]), "mapping publishes the root's played episode");
+        assert_eq!(a.ep(SHOW[1]).0, "played", "mapping applies the share's records");
+        assert!(applied.library_changed || !applied.shows.is_empty());
+        assert_eq!(a.own_file_libraries(share.path()), vec!["Anime"]);
+    }
+
+    #[test]
+    fn newer_local_viewing_survives_mapping() {
+        let share = tempfile::tempdir().unwrap();
+        let _b = machine_b(share.path());
+        let mut a = M::new(&SHOW);
+        a.configure(share.path(), "a").unwrap();
+        a.watch(SHOW[1]);
+        let later = crate::db::now() + 10_000;
+        let id = a.ep_id(SHOW[1]);
+        a.db.with(|c| Ok(c.execute("UPDATE episodes SET last_played_at = ?1 WHERE id = ?2", params![later, id])?)).unwrap();
+        a.map();
+        assert_eq!(a.ep(SHOW[1]), ("played".into(), Some(later)));
+    }
+
+    #[test]
+    fn enabling_runs_join_and_folder_change_rejoins() {
+        let (s1, s2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut a = M::new(&SHOW);
+        a.map();
+        a.watch(SHOW[0]);
+        a.configure(s1.path(), "a").unwrap();
+        assert!(a.has_record(SHOW[0]), "join offered the played episode");
+        let id = a.db.get_setting("sync_device_id").unwrap().unwrap();
+        assert!(folder::list_device_ids(s1.path()).contains(&id));
+        a.configure(s2.path(), "a").unwrap();
+        assert!(folder::list_device_ids(s2.path()).contains(&id), "new folder was joined");
+    }
+
+    #[test]
+    fn rename_and_unmap_reach_the_share() {
+        let share = tempfile::tempdir().unwrap();
+        let mut a = M::new(&SHOW);
+        a.configure(share.path(), "old").unwrap();
+        a.map();
+        assert_eq!(a.own_file_libraries(share.path()), vec!["Anime"]);
+        a.configure(share.path(), "new").unwrap();
+        assert!(folder::list_devices(share.path()).iter().any(|d| d.1 == "new"));
+        map_root_with(&a.db, &mut a.rt, a.root_id, None).unwrap();
+        assert!(a.own_file_libraries(share.path()).is_empty());
+    }
+
+    #[test]
+    fn failed_join_leaves_sync_off_and_disable_needs_no_name() {
+        let share = tempfile::tempdir().unwrap();
+        let mut a = M::new(&SHOW);
+        a.db.with(|c| Ok(c.execute_batch("DROP TABLE sync_records")?)).unwrap();
+        assert!(a.configure(share.path(), "a").is_err());
+        assert_eq!(a.db.get_setting("sync_enabled").unwrap(), None);
+        assert!(configure_with(&a.db, &mut a.rt, "", false, "").is_ok());
+    }
+
+    #[test]
+    fn tick_captures_round_errors_in_status() {
+        let share = tempfile::tempdir().unwrap();
+        let mut a = M::new(&SHOW);
+        a.configure(share.path(), "a").unwrap();
+        a.db.with(|c| Ok(c.execute_batch("DROP TABLE sync_records")?)).unwrap();
+        let (st, _) = tick_with(&a.db, &mut a.rt, false).unwrap();
+        assert!(st.error.is_some());
+        assert_eq!(a.rt.error, st.error);
     }
 }

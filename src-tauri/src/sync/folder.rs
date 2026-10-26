@@ -186,9 +186,9 @@ pub fn list_devices(dir: &Path) -> Vec<(String, String, i64)> {
         .collect()
 }
 
-/// Every library name published by any parseable device file, own included.
-pub fn list_libraries(dir: &Path) -> Vec<String> {
-    device_files(dir).into_iter().filter_map(|(_, path)| parse(&path)).flat_map(|f| f.libraries).collect()
+/// Ids of every device file present (parseable or not), own included.
+pub fn list_device_ids(dir: &Path) -> Vec<String> {
+    device_files(dir).into_iter().map(|(id, _)| id).collect()
 }
 
 /// Removes one device's file. Already gone is fine.

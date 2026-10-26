@@ -23,9 +23,19 @@ use self::store::{Entry, Record};
 use crate::db::{now, Db};
 use crate::error::Result;
 
+/// What the last parse of another device's file said, kept so the status never
+/// re-reads files the mtime/size cache says are unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceInfo {
+    pub name: String,
+    pub written_at: i64,
+    pub libraries: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct SyncRuntime {
     pub cache: HashMap<String, folder::Seen>,
+    pub devices: std::collections::BTreeMap<String, DeviceInfo>,
     pub last_written_seq: i64,
     pub pending_seq: Option<i64>,
     pub last_read_at: Option<i64>,
@@ -96,6 +106,16 @@ fn reachable(cfg: &Config, rt: &mut SyncRuntime) -> bool {
 /// Read every other device file. Pure I/O, outside the lock.
 fn read(rt: &mut SyncRuntime, cfg: &Config) -> Vec<Record> {
     let res = folder::read_others(&cfg.folder, &cfg.device_id, &mut rt.cache);
+    for f in &res.files {
+        rt.devices.insert(
+            f.device_id.clone(),
+            DeviceInfo { name: f.device_name.clone(), written_at: f.written_at, libraries: f.libraries.clone() },
+        );
+    }
+    // A file that vanished (forgotten elsewhere) leaves the cache's keys behind only until here.
+    let present = folder::list_device_ids(&cfg.folder);
+    rt.cache.retain(|id, _| present.contains(id));
+    rt.devices.retain(|id, _| present.contains(id));
     rt.error = (!res.skipped.is_empty())
         .then(|| format!("{} device file(s) unreadable: {}", res.skipped.len(), res.skipped.join(", ")));
     res.files
@@ -155,7 +175,7 @@ fn apply_keys(c: &Connection, keys: &[String]) -> Result<apply::Applied> {
 
 /// What follows an apply: a synced match may have made a duplicate pair, and a
 /// changed endpoint or model means this machine's last test no longer holds.
-fn settle(db: &Db, applied: &apply::Applied) -> Result<()> {
+pub(crate) fn settle(db: &Db, applied: &apply::Applied) -> Result<()> {
     if applied.library_changed {
         db.merge_duplicate_shows()?;
     }
@@ -201,6 +221,22 @@ pub fn join(db: &Db, rt: &mut SyncRuntime) -> Result<RoundOutcome> {
     settle(db, &applied)?;
     let wrote = flush(db, rt, true)?;
     Ok(RoundOutcome { applied, wrote })
+}
+
+/// Mapping a root while sync is on: offer that root's existing state, then apply
+/// the share's view, in one transaction (publish first, as in `join`, so a more
+/// recent local viewing competes on its real time before being overwritten).
+/// The caller has already written the `sync_libraries` row.
+pub fn map_root(db: &Db, root_id: i64) -> Result<apply::Applied> {
+    let applied = db.with(|c| {
+        let tx = c.unchecked_transaction()?;
+        publish_existing_in(&tx, Some(root_id))?;
+        let applied = apply::apply_all(&tx)?;
+        tx.commit()?;
+        Ok(applied)
+    })?;
+    settle(db, &applied)?;
+    Ok(applied)
 }
 
 fn offer(c: &Connection, entry: Option<Entry>) -> Result<()> {
