@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS rss_feeds (
 // rss_feeds, gated on `v < 7`). This migration must not reuse it: a v7 database would hit the
 // early return above, never add the player-state columns, and break playback with
 // "no such column: player_volume". This is the v7 -> v8 step on top of develop.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// v9 DDL, shared by fresh-schema creation, the version-gated upgrade, and the
 /// unconditional self-heal below — one definition so the three can never drift.
@@ -105,6 +105,16 @@ const TORRENT_BATCHES_DDL: &str =
        show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
        season INTEGER NOT NULL, first INTEGER NOT NULL, last INTEGER NOT NULL,
        resolution TEXT, added_at INTEGER NOT NULL);";
+
+/// v10 DDL (library sync), shared like `TORRENT_BATCHES_DDL`: fresh creation, upgrade and
+/// self-heal all run this one definition. `value` is JSON text, NULL for a tombstone; `seq`
+/// rises on every upsert so the poller can spot changes not yet written out.
+const SYNC_DDL: &str =
+    "CREATE TABLE IF NOT EXISTS sync_records (
+       key TEXT PRIMARY KEY, value TEXT, stamp TEXT NOT NULL, seq INTEGER NOT NULL);
+     CREATE TABLE IF NOT EXISTS sync_libraries (
+       root_id INTEGER PRIMARY KEY REFERENCES roots(id) ON DELETE CASCADE,
+       library TEXT NOT NULL UNIQUE);";
 
 /// Bring an existing database up to `SCHEMA_VERSION`. Fresh databases get the current shape
 /// from SCHEMA directly; older ones are altered in place so no user data is lost.
@@ -189,6 +199,8 @@ fn upgrade(conn: &Connection) -> Result<()> {
     // instead of failing every pack pin silently, forever. Idempotent, and
     // single-episode pins are untouched either way.
     conn.execute_batch(TORRENT_BATCHES_DDL)?;
+    // v10 sync tables: additive, so same unconditional self-heal.
+    conn.execute_batch(SYNC_DDL)?;
     // rename_log's foreign key cannot be altered in place; rebuild the table when it still
     // carries the old NOT NULL / ON DELETE CASCADE definition.
     let sql: String = conn
@@ -221,6 +233,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // SCHEMA so fresh installs, upgrades, and the self-heal share one
     // definition that cannot drift.
     conn.execute_batch(TORRENT_BATCHES_DDL)?;
+    conn.execute_batch(SYNC_DDL)?;
     upgrade(conn)?;
     Ok(())
 }
@@ -1562,7 +1575,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(volume, 12.5, "the pre-existing column's data must survive");
-        assert_eq!(version, 9);
+        assert_eq!(version, SCHEMA_VERSION);
         conn.prepare(
             "SELECT player_volume, window_width, window_height, window_maximized, window_fullscreen FROM shows",
         )
@@ -3257,13 +3270,74 @@ mod tests {
         let version: i64 = db
             .with(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, SCHEMA_VERSION);
         assert!(db.torrent_link("aaa").unwrap().is_some(), "single pins survive");
         db.add_batch_link(&TorrentBatch {
             info_hash: "bbb".into(), show_id, season: 1,
             first: 1, last: 12, resolution: None, added_at: 0,
         }).unwrap();
         assert_eq!(db.batch_link("bbb").unwrap().expect("batch stored").last, 12);
+    }
+
+    fn table_exists(c: &Connection, name: &str) -> bool {
+        c.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            params![name],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    }
+
+    #[test]
+    fn migrate_creates_sync_tables() {
+        let db = Db::open_memory().unwrap();
+        db.with(|c| {
+            assert!(table_exists(c, "sync_records"));
+            assert!(table_exists(c, "sync_libraries"));
+            let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            assert_eq!(v, 10);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn v9_database_upgrades_to_sync_tables() {
+        let db = Db::open_memory().unwrap();
+        db.with(|c| {
+            c.execute("INSERT INTO shows (parsed_title, created_at) VALUES ('Keep', 0)", [])?;
+            c.execute_batch("DROP TABLE sync_records; DROP TABLE sync_libraries; PRAGMA user_version = 9;")?;
+            migrate(c)?;
+            assert!(table_exists(c, "sync_records"));
+            assert!(table_exists(c, "sync_libraries"));
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM shows WHERE parsed_title = 'Keep'", [], |r| r.get(0))?;
+            assert_eq!(n, 1, "existing rows survive");
+            let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            assert_eq!(v, 10);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn sync_libraries_cascade_with_root() {
+        let db = Db::open_memory().unwrap();
+        let root = db.add_root("/mnt/a").unwrap();
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO sync_libraries (root_id, library) VALUES (?1, 'lib')",
+                params![root.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        db.remove_root(root.id).unwrap();
+        let n: i64 = db
+            .with(|c| Ok(c.query_row("SELECT COUNT(*) FROM sync_libraries", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]
@@ -3288,7 +3362,7 @@ mod tests {
         let version: i64 = db
             .with(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, SCHEMA_VERSION);
         for table in ["torrent_links", "torrent_prefs", "rss_feeds", "torrent_batches"] {
             let n: i64 = db
                 .with(|c| {
@@ -3329,7 +3403,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9, "a v7 database advances to the current version");
+        assert_eq!(version, SCHEMA_VERSION, "a v7 database advances to the current version");
         conn.prepare(
             "SELECT player_volume, window_width, window_height, window_maximized, window_fullscreen FROM shows",
         )
