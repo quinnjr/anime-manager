@@ -84,11 +84,17 @@ pub fn record_local(c: &Connection, key: &SyncKey, value: Option<Value>) -> Resu
     if !enabled(c)? {
         return Ok(false);
     }
+    let stamp = tick_now(c)?;
+    upsert(c, &key.encode(), &value, &stamp)?;
+    Ok(true)
+}
+
+/// Advance the persisted clock for a local event and return the new stamp.
+pub fn tick_now(c: &Connection) -> Result<Stamp> {
     let device = device_id(c)?.ok_or_else(|| AppError::Db("sync enabled without a device id".into()))?;
     let stamp = tick(clock(c)?.as_ref(), now_ms(), &device);
-    upsert(c, &key.encode(), &value, &stamp)?;
     set_setting(c, "sync_clock", &stamp.encode())?;
-    Ok(true)
+    Ok(stamp)
 }
 
 /// Remote merge: replace only when the incoming stamp is strictly newer, and
@@ -199,10 +205,20 @@ fn show_title(c: &Connection, show_id: i64) -> Result<Option<String>> {
     Ok(c.query_row("SELECT parsed_title FROM shows WHERE id = ?1", [show_id], |r| r.get(0)).optional()?)
 }
 
-/// Record the override at `abs_path`, or a tombstone once it is gone. A no-op
-/// when the path is not under a mapped root.
-pub fn publish_override(c: &Connection, abs_path: &str) -> Result<()> {
-    let Some((library, relpath)) = locate(c, abs_path)? else { return Ok(()) };
+/// A key and its current local value (`None` = tombstone). Each publisher records
+/// one; joining offers the same entries to the share without overwriting it.
+pub type Entry = (SyncKey, Option<Value>);
+
+fn publish(c: &Connection, entry: Option<Entry>) -> Result<()> {
+    if let Some((key, value)) = entry {
+        record_local(c, &key, value)?;
+    }
+    Ok(())
+}
+
+/// None when the path is not under a mapped root.
+pub fn override_entry(c: &Connection, abs_path: &str) -> Result<Option<Entry>> {
+    let Some((library, relpath)) = locate(c, abs_path)? else { return Ok(None) };
     let value = c
         .query_row(
             "SELECT title, season, number, kind, source FROM parse_overrides WHERE path = ?1",
@@ -218,15 +234,17 @@ pub fn publish_override(c: &Connection, abs_path: &str) -> Result<()> {
             },
         )
         .optional()?;
-    record_local(c, &SyncKey::Override { library, relpath }, value)?;
-    Ok(())
+    Ok(Some((SyncKey::Override { library, relpath }, value)))
 }
 
-/// Record a show's provider match. A show row that no longer exists (a merge
-/// loser) publishes nothing. Kept apart from the title override: each is its own
-/// conclusion, and re-stamping one with a stale null would overwrite another
-/// device's decision about it.
-pub fn publish_show_match(c: &Connection, show_id: i64) -> Result<()> {
+/// Record the override at `abs_path`, or a tombstone once it is gone. A no-op
+/// when the path is not under a mapped root.
+pub fn publish_override(c: &Connection, abs_path: &str) -> Result<()> {
+    publish(c, override_entry(c, abs_path)?)
+}
+
+/// None when the show row no longer exists (a merge loser).
+pub fn show_match_entry(c: &Connection, show_id: i64) -> Result<Option<Entry>> {
     type MatchRow = (String, Option<String>, Option<i64>, Option<String>, Option<String>, Option<i64>, i64);
     let row: Option<MatchRow> = c
         .query_row(
@@ -237,7 +255,7 @@ pub fn publish_show_match(c: &Connection, show_id: i64) -> Result<()> {
         )
         .optional()?;
     let Some((title, source, anilist_id, canonical, cover_url, total, cleared)) = row else {
-        return Ok(());
+        return Ok(None);
     };
     // A cleared match is a conclusion ("not this one"), so it is a value; only a
     // show nobody has decided anything about is null.
@@ -251,24 +269,33 @@ pub fn publish_show_match(c: &Connection, show_id: i64) -> Result<()> {
             "anilist_cleared": cleared,
         })
     });
-    record_local(c, &SyncKey::ShowMatch { title }, matched)?;
-    Ok(())
+    Ok(Some((SyncKey::ShowMatch { title }, matched)))
 }
 
-/// Record a show's hand-set display title, or a tombstone once it is cleared.
-pub fn publish_show_title_override(c: &Connection, show_id: i64) -> Result<()> {
+/// Record a show's provider match. A show row that no longer exists (a merge
+/// loser) publishes nothing. Kept apart from the title override: each is its own
+/// conclusion, and re-stamping one with a stale null would overwrite another
+/// device's decision about it.
+pub fn publish_show_match(c: &Connection, show_id: i64) -> Result<()> {
+    publish(c, show_match_entry(c, show_id)?)
+}
+
+pub fn show_title_override_entry(c: &Connection, show_id: i64) -> Result<Option<Entry>> {
     let row: Option<(String, Option<String>)> = c
         .query_row("SELECT parsed_title, user_title_override FROM shows WHERE id = ?1", [show_id], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })
         .optional()?;
-    let Some((title, user_title)) = row else { return Ok(()) };
-    record_local(c, &SyncKey::ShowTitleOverride { title }, user_title.map(Value::from))?;
-    Ok(())
+    Ok(row.map(|(title, user_title)| (SyncKey::ShowTitleOverride { title }, user_title.map(Value::from))))
 }
 
-pub fn publish_season_title(c: &Connection, show_id: i64, season: u32) -> Result<()> {
-    let Some(title) = show_title(c, show_id)? else { return Ok(()) };
+/// Record a show's hand-set display title, or a tombstone once it is cleared.
+pub fn publish_show_title_override(c: &Connection, show_id: i64) -> Result<()> {
+    publish(c, show_title_override_entry(c, show_id)?)
+}
+
+pub fn season_title_entry(c: &Connection, show_id: i64, season: u32) -> Result<Option<Entry>> {
+    let Some(title) = show_title(c, show_id)? else { return Ok(None) };
     let name: Option<String> = c
         .query_row(
             "SELECT title FROM seasons WHERE show_id = ?1 AND number = ?2",
@@ -277,11 +304,14 @@ pub fn publish_season_title(c: &Connection, show_id: i64, season: u32) -> Result
         )
         .optional()?
         .flatten();
-    record_local(c, &SyncKey::SeasonTitle { title, season }, name.map(Value::from))?;
-    Ok(())
+    Ok(Some((SyncKey::SeasonTitle { title, season }, name.map(Value::from))))
 }
 
-pub fn publish_torrent_link(c: &Connection, info_hash: &str) -> Result<()> {
+pub fn publish_season_title(c: &Connection, show_id: i64, season: u32) -> Result<()> {
+    publish(c, season_title_entry(c, show_id, season)?)
+}
+
+pub fn torrent_link_entry(c: &Connection, info_hash: &str) -> Result<Entry> {
     let value = c
         .query_row(
             "SELECT s.parsed_title, l.season, l.number FROM torrent_links l JOIN shows s ON s.id = l.show_id
@@ -296,11 +326,14 @@ pub fn publish_torrent_link(c: &Connection, info_hash: &str) -> Result<()> {
             },
         )
         .optional()?;
-    record_local(c, &SyncKey::TorrentLink { info_hash: info_hash.into() }, value)?;
-    Ok(())
+    Ok((SyncKey::TorrentLink { info_hash: info_hash.into() }, value))
 }
 
-pub fn publish_torrent_batch(c: &Connection, info_hash: &str) -> Result<()> {
+pub fn publish_torrent_link(c: &Connection, info_hash: &str) -> Result<()> {
+    publish(c, Some(torrent_link_entry(c, info_hash)?))
+}
+
+pub fn torrent_batch_entry(c: &Connection, info_hash: &str) -> Result<Entry> {
     let value = c
         .query_row(
             "SELECT s.parsed_title, b.season, b.first, b.last, b.resolution FROM torrent_batches b
@@ -317,12 +350,15 @@ pub fn publish_torrent_batch(c: &Connection, info_hash: &str) -> Result<()> {
             },
         )
         .optional()?;
-    record_local(c, &SyncKey::TorrentBatch { info_hash: info_hash.into() }, value)?;
-    Ok(())
+    Ok((SyncKey::TorrentBatch { info_hash: info_hash.into() }, value))
 }
 
-pub fn publish_prefs(c: &Connection, show_id: i64) -> Result<()> {
-    let Some(title) = show_title(c, show_id)? else { return Ok(()) };
+pub fn publish_torrent_batch(c: &Connection, info_hash: &str) -> Result<()> {
+    publish(c, Some(torrent_batch_entry(c, info_hash)?))
+}
+
+pub fn prefs_entry(c: &Connection, show_id: i64) -> Result<Option<Entry>> {
+    let Some(title) = show_title(c, show_id)? else { return Ok(None) };
     let value = c
         .query_row(
             "SELECT save_path, category FROM torrent_prefs WHERE show_id = ?1",
@@ -335,11 +371,14 @@ pub fn publish_prefs(c: &Connection, show_id: i64) -> Result<()> {
             },
         )
         .optional()?;
-    record_local(c, &SyncKey::TorrentPrefs { title }, value)?;
-    Ok(())
+    Ok(Some((SyncKey::TorrentPrefs { title }, value)))
 }
 
-pub fn publish_rss(c: &Connection, label: &str) -> Result<()> {
+pub fn publish_prefs(c: &Connection, show_id: i64) -> Result<()> {
+    publish(c, prefs_entry(c, show_id)?)
+}
+
+pub fn rss_entry(c: &Connection, label: &str) -> Result<Entry> {
     let title: Option<String> = c
         .query_row(
             "SELECT s.parsed_title FROM rss_feeds f JOIN shows s ON s.id = f.show_id WHERE f.label = ?1",
@@ -347,19 +386,26 @@ pub fn publish_rss(c: &Connection, label: &str) -> Result<()> {
             |r| r.get(0),
         )
         .optional()?;
-    record_local(c, &SyncKey::Rss { label: label.into() }, title.map(Value::from))?;
-    Ok(())
+    Ok((SyncKey::Rss { label: label.into() }, title.map(Value::from)))
+}
+
+pub fn publish_rss(c: &Connection, label: &str) -> Result<()> {
+    publish(c, Some(rss_entry(c, label)?))
+}
+
+/// None for any name off the allow-list (secrets, arming flags, machine paths).
+pub fn setting_entry(c: &Connection, name: &str) -> Result<Option<Entry>> {
+    if !SYNCED_SETTINGS.contains(&name) {
+        return Ok(None);
+    }
+    let value = setting(c, name)?.map(Value::from);
+    Ok(Some((SyncKey::Setting { name: name.into() }, value)))
 }
 
 /// Record an allow-listed setting's current value, or a tombstone once it is
 /// deleted. Any other name (secrets, arming flags, machine paths) is ignored.
 pub fn publish_setting(c: &Connection, name: &str) -> Result<()> {
-    if !SYNCED_SETTINGS.contains(&name) {
-        return Ok(());
-    }
-    let value = setting(c, name)?.map(Value::from);
-    record_local(c, &SyncKey::Setting { name: name.into() }, value)?;
-    Ok(())
+    publish(c, setting_entry(c, name)?)
 }
 
 #[cfg(test)]

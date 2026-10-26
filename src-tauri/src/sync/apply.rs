@@ -35,7 +35,7 @@ impl Applied {
         a
     }
 
-    fn absorb(&mut self, o: Applied) {
+    pub fn absorb(&mut self, o: Applied) {
         self.library_changed |= o.library_changed;
         self.disarm_llm |= o.disarm_llm;
         self.disarm_torrent |= o.disarm_torrent;
