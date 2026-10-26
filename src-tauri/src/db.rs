@@ -456,7 +456,8 @@ impl Db {
                          status = CASE WHEN status='missing' THEN {REVIVE_MISSING_SQL} ELSE status END,
                          prev_status = NULL WHERE id=?1"),
                         params![id, season_id, p.episode, path, f.size as i64, f.mtime, p.release_group, p.resolution, p.crc])?;
-                    // (sync-apply of an incoming record for the new path goes here, before publishing.)
+                    // An incoming record for this path lands first, so a move publishes the merged state.
+                    crate::sync::apply::apply_for_episode(c, id)?;
                     // A scan-detected move: the new path carries the state. The old path's
                     // record is left alone, since another machine may still have the file there.
                     if old_path != path {
@@ -468,6 +469,8 @@ impl Db {
                     c.execute(
                         "INSERT INTO episodes(season_id, number, path, size, mtime, release_group, resolution, crc) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                         params![season_id, p.episode, path, f.size as i64, f.mtime, p.release_group, p.resolution, p.crc])?;
+                    // A file watched on another machine arrives watched, with its show's match and pins.
+                    crate::sync::apply::apply_for_episode(c, c.last_insert_rowid())?;
                     Ok(Upsert::Added)
                 }
             }
