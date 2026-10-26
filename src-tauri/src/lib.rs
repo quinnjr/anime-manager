@@ -13,6 +13,7 @@ pub mod parser;
 pub mod player;
 pub mod rename;
 pub mod scanner;
+pub mod sync;
 pub mod torrent;
 pub mod torrent_commands;
 
