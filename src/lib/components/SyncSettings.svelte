@@ -1,8 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { open } from '@tauri-apps/plugin-dialog';
+  import { ask, open } from '@tauri-apps/plugin-dialog';
   import { api, onEvent, type SyncStatus } from '$lib/api';
-  import { otherDevices, syncHealth } from '$lib/sync';
+  import { lastWrote, otherDevices, syncHealth, whenText } from '$lib/sync';
   import { toasts } from '$lib/stores/toasts.svelte';
 
   let status = $state<SyncStatus | null>(null);
@@ -49,7 +49,9 @@
   }
 
   async function forget(id: string, name: string) {
-    if (!window.confirm(`Forget ${name}? Its entry is removed from the sync folder.`)) return;
+    const sure = await ask(`Forget ${name}? Its file is removed from the sync folder; what it shared stays.`,
+      { title: 'Forget machine', kind: 'warning', okLabel: 'Forget', cancelLabel: 'Keep' });
+    if (!sure) return;
     try { apply(await api.syncForgetDevice(id)); } catch (e) { toasts.error(e); }
   }
 
@@ -63,14 +65,17 @@
   const health = $derived(status ? syncHealth(status, now) : null);
   const others = $derived(status ? otherDevices(status) : []);
   const enabled = $derived(status?.enabled ?? false);
-  const hhmm = (secs: number) => new Date(secs * 1000).toLocaleString();
+  // A rename while sync is on republishes this machine's file under the new name.
+  const renamed = $derived(enabled && deviceName.trim() !== '' && deviceName.trim() !== (status?.device_name ?? ''));
 </script>
 
 <section class="mb-10">
   <h2 class="eyebrow mb-3">Library sync</h2>
   <p class="mb-3 max-w-prose text-sm text-muted">
-    Optional. Share watched state between machines through a folder every one of them can reach
-    (a NAS share, Syncthing). Only progress is shared; files are never touched.
+    Optional. Machines that can all reach one folder (a NAS share, say) share what you decided
+    about the library through it: watched state and progress, matches, titles you set, parse
+    decisions, torrent pins and feeds, and a few settings. Each machine still scans its own files,
+    and API keys, passwords and local paths never leave it. Files are never touched.
   </p>
   <div class="grid gap-3 sm:grid-cols-2">
     <label class="block text-sm sm:col-span-2">
@@ -79,10 +84,14 @@
         <input bind:value={folder} class="field w-full font-mono" placeholder="/mnt/nas/anime-sync" disabled={enabled} />
         <button class="btn" disabled={enabled} onclick={pick}>Choose…</button>
       </span>
+      {#if enabled}<span class="tag mt-1 block">Turn sync off to choose a different folder.</span>{/if}
     </label>
     <label class="block text-sm">
       <span class="text-muted">This machine's name</span>
-      <input bind:value={deviceName} class="field mt-1 w-full" placeholder="desktop" disabled={enabled} />
+      <span class="mt-1 flex gap-2">
+        <input bind:value={deviceName} class="field w-full" placeholder="desktop" />
+        {#if renamed}<button class="btn" disabled={busy} onclick={() => configure(true)}>Rename</button>{/if}
+      </span>
     </label>
     <label class="flex items-center gap-2 self-end pb-2 text-sm">
       <input type="checkbox" checked={enabled} disabled={busy || (!enabled && (!folder.trim() || !deviceName.trim()))}
@@ -96,6 +105,7 @@
       <span class="tag" style:color={health?.tone === 'live' ? 'var(--color-live)' : health?.tone === 'alarm' ? 'var(--color-alarm)' : null}>{health?.text}</span>
       {#if enabled}<button class="btn" disabled={busy} onclick={syncNow}>{busy ? 'Syncing…' : 'Sync now'}</button>{/if}
       {#if status.device_id}<span class="tag font-mono">{status.device_id}</span>{/if}
+      {#if enabled}<span class="tag">this machine last wrote {lastWrote(status)}</span>{/if}
     </div>
   {/if}
 
@@ -128,7 +138,7 @@
           <li class="flex flex-wrap items-center gap-3 text-sm">
             <span>{d.name}</span>
             <span class="tag font-mono">{d.id}</span>
-            <span class="tag">last wrote {hhmm(d.written_at)}</span>
+            <span class="tag">last wrote {d.written_at ? whenText(d.written_at) : 'not yet'}</span>
             <button class="btn" onclick={() => forget(d.id, d.name)}>Forget</button>
           </li>
         {/each}

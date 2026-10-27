@@ -24,3 +24,14 @@ export function syncHealth(s: SyncStatus, nowSecs: number): { tone: SyncTone; te
 export function otherDevices(s: SyncStatus): SyncDevice[] {
   return s.devices.filter((d) => !d.is_self).sort((a, b) => b.written_at - a.written_at);
 }
+
+/** A Unix-seconds time as local date and time. */
+export function whenText(secs: number): string {
+  return new Date(secs * 1000).toLocaleString();
+}
+
+/** When this machine last wrote its own sync file, or "not yet": a zero or missing time
+ *  means no write this session, and must not read as 1970. */
+export function lastWrote(s: SyncStatus): string {
+  return s.last_write_at ? whenText(s.last_write_at) : 'not yet';
+}

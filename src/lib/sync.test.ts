@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { SyncDevice, SyncStatus } from './api';
-import { otherDevices, syncHealth } from './sync';
+import { lastWrote, otherDevices, syncHealth, whenText } from './sync';
 
 const status = (over: Partial<SyncStatus> = {}): SyncStatus => ({
   enabled: true, folder: '/s', device_id: 'a', device_name: 'A', roots: [], known_libraries: [], devices: [],
@@ -40,5 +40,16 @@ describe('otherDevices', () => {
     const d = (id: string, written_at: number, is_self = false): SyncDevice => ({ id, name: id, written_at, is_self });
     const out = otherDevices(status({ devices: [d('a', 5), d('me', 99, true), d('b', 9)] }));
     expect(out.map((x) => x.id)).toEqual(['b', 'a']);
+  });
+});
+
+describe('lastWrote', () => {
+  it('says not yet before this machine has written, never 1970', () => {
+    expect(lastWrote(status({ last_write_at: null }))).toBe('not yet');
+    expect(lastWrote(status({ last_write_at: 0 }))).toBe('not yet');
+  });
+  it('shows the local date and time once written', () => {
+    expect(lastWrote(status({ last_write_at: NOW }))).toBe(whenText(NOW));
+    expect(whenText(NOW)).toBe(new Date(NOW * 1000).toLocaleString());
   });
 });
