@@ -319,8 +319,10 @@ impl Endpoint {
 
     /// Remove what a previous run left behind. Only a unix socket outlives its server.
     fn clean(&self) {
+        // Unix builds have no other variant, so the pattern is irrefutable there.
         #[cfg(unix)]
-        if let Endpoint::Unix(p) = self {
+        {
+            let Endpoint::Unix(p) = self;
             let _ = std::fs::remove_file(p);
         }
     }
