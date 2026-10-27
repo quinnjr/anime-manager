@@ -2093,7 +2093,10 @@ mod tests {
     fn secrets_and_flags_never_published() {
         let db = Db::open_memory().unwrap();
         sync_on(&db, "/lib", LIB);
-        for k in ["llm_api_key", "torrent_password", "llm_test_ok", "torrent_test_ok", "mpv_path", "torrent_path_map"] {
+        for k in [
+            "llm_api_key", "torrent_password", "llm_test_ok", "torrent_test_ok", "torrent_path_map",
+            "mpv_path", "vlc_path", "mpc_hc_path", "player_backend",
+        ] {
             db.set_setting(k, "x").unwrap();
             db.delete_setting(k).unwrap();
         }

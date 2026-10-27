@@ -43,24 +43,22 @@ impl Default for Player {
 }
 
 fn player_binary(db: &Db, key: &str, fallback: &str) -> String {
+    // Surrounding quotes come from Explorer's "Copy as path".
     db.get_setting(key)
         .ok()
         .flatten()
+        .map(|s| s.trim().trim_matches('"').trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| fallback.into())
 }
 
-pub fn mpv_binary(db: &Db) -> String {
-    player_binary(db, "mpv_path", "mpv")
-}
-
-/// Which external player a run uses. Stored as the `player_backend` setting
-/// ("mpv" | "vlc"); anything missing or unrecognised falls back to mpv so an
-/// old database or a typo never leaves playback with no player.
+/// An external player. Which one a run uses is the `player_backend` setting,
+/// read through [`crate::player_detect::player_choice`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerBackend {
     Mpv,
     Vlc,
+    MpcHc,
 }
 
 impl PlayerBackend {
@@ -68,28 +66,46 @@ impl PlayerBackend {
         match self {
             PlayerBackend::Mpv => "mpv",
             PlayerBackend::Vlc => "vlc",
+            PlayerBackend::MpcHc => "mpc-hc",
         }
     }
 
-    pub fn parse(s: &str) -> Self {
-        if s.trim().eq_ignore_ascii_case("vlc") {
-            PlayerBackend::Vlc
-        } else {
-            PlayerBackend::Mpv
+    pub fn label(self) -> &'static str {
+        match self {
+            PlayerBackend::Mpv => "mpv",
+            PlayerBackend::Vlc => "VLC",
+            PlayerBackend::MpcHc => "MPC-HC",
         }
+    }
+
+    /// The settings row holding this player's command.
+    pub fn path_key(self) -> &'static str {
+        match self {
+            PlayerBackend::Mpv => "mpv_path",
+            PlayerBackend::Vlc => "vlc_path",
+            PlayerBackend::MpcHc => "mpc_hc_path",
+        }
+    }
+
+    /// The command looked for when none is configured.
+    pub fn default_command(self) -> &'static str {
+        match self {
+            PlayerBackend::Mpv => "mpv",
+            PlayerBackend::Vlc => "vlc",
+            PlayerBackend::MpcHc => "mpc-hc64",
+        }
+    }
+
+    /// Whether this build can track playback in it. MPC-HC is driven through
+    /// Windows window messages, which arrive with Windows support.
+    pub fn playable_here(self) -> bool {
+        !matches!(self, PlayerBackend::MpcHc)
     }
 }
 
-pub fn player_backend(db: &Db) -> PlayerBackend {
-    db.get_setting("player_backend")
-        .ok()
-        .flatten()
-        .map(|s| PlayerBackend::parse(&s))
-        .unwrap_or(PlayerBackend::Mpv)
-}
-
-pub fn vlc_binary(db: &Db) -> String {
-    player_binary(db, "vlc_path", "vlc")
+/// The configured command for a player, or its default name when blank.
+pub fn player_command(db: &Db, backend: PlayerBackend) -> String {
+    player_binary(db, backend.path_key(), backend.default_command())
 }
 
 pub const VLC_STEPS_FOR_FULL_VOLUME: f64 = 256.0;
@@ -119,78 +135,6 @@ pub fn no_console_window(cmd: &mut std::process::Command) {
     }
     #[cfg(not(windows))]
     let _ = cmd;
-}
-
-/// Where Windows installers put each player when they leave `PATH` alone, which the
-/// official VLC installer always does. Tried after `PATH`, in order.
-#[cfg(windows)]
-fn windows_install_dirs(name: &str) -> Vec<PathBuf> {
-    let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
-    let mut out = Vec::new();
-    match name {
-        "vlc" => {
-            for k in ["ProgramFiles", "ProgramFiles(x86)"] {
-                if let Some(p) = env(k) {
-                    out.push(p.join("VideoLAN").join("VLC").join("vlc.exe"));
-                }
-            }
-        }
-        "mpv" => {
-            if let Some(p) = env("ProgramFiles") {
-                out.push(p.join("mpv").join("mpv.exe"));
-            }
-            if let Some(p) = env("USERPROFILE") {
-                out.push(p.join("scoop").join("apps").join("mpv").join("current").join("mpv.exe"));
-            }
-            if let Some(p) = env("LOCALAPPDATA") {
-                out.push(p.join("Programs").join("mpv").join("mpv.exe"));
-            }
-        }
-        _ => {}
-    }
-    out
-}
-
-/// Resolve a configured player binary to a file. A bare name is looked up on `PATH`
-/// (honouring `PATHEXT` on Windows) and then, on Windows, in the players' default install
-/// directories; an explicit path must exist as given. `None` means nothing was found.
-pub fn locate_binary(bin: &str) -> Option<PathBuf> {
-    let p = std::path::Path::new(bin);
-    if bin.is_empty() {
-        return None;
-    }
-    if p.components().count() > 1 || p.is_absolute() {
-        return p.is_file().then(|| p.to_path_buf());
-    }
-    #[cfg(windows)]
-    let exts: Vec<String> = if p.extension().is_some() {
-        vec![String::new()]
-    } else {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
-            .split(';')
-            .filter(|e| !e.is_empty())
-            .map(str::to_string)
-            .collect()
-    };
-    #[cfg(not(windows))]
-    let exts = vec![String::new()];
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            for ext in &exts {
-                let cand = dir.join(format!("{bin}{ext}"));
-                if cand.is_file() {
-                    return Some(cand);
-                }
-            }
-        }
-    }
-    #[cfg(windows)]
-    return windows_install_dirs(&bin.to_ascii_lowercase())
-        .into_iter()
-        .find(|c| c.is_file());
-    #[cfg(not(windows))]
-    None
 }
 
 /// Fails fast when the file vanished. Called synchronously from `commands::play` for the
@@ -273,7 +217,9 @@ impl Endpoint {
                 .unwrap_or_else(|| PathBuf::from("/tmp"));
             let dir = base.join("anime-manager");
             let _ = std::fs::create_dir_all(&dir);
-            Ok(Endpoint::Unix(dir.join(format!("{episode_id}.sock"))))
+            // The process id keeps two processes playing the same episode id (a second
+            // test run, another checkout) from removing or connecting to each other's socket.
+            Ok(Endpoint::Unix(dir.join(format!("{}-{episode_id}.sock", std::process::id()))))
         }
         #[cfg(windows)]
         match backend {
@@ -289,6 +235,8 @@ impl Endpoint {
                 let l = std::net::TcpListener::bind(("127.0.0.1", 0))?;
                 Ok(Endpoint::Tcp(l.local_addr()?))
             }
+            // Refused at the top of `run`: MPC-HC is driven over window messages.
+            PlayerBackend::MpcHc => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
         }
     }
 
@@ -312,6 +260,8 @@ impl Endpoint {
             (PlayerBackend::Vlc, Endpoint::Tcp(addr)) => {
                 vec!["--rc-host".into(), addr.to_string(), "--rc-quiet".into()]
             }
+            // Never launched: `run` refuses it before an endpoint exists.
+            (PlayerBackend::MpcHc, _) => Vec::new(),
             #[cfg(windows)]
             _ => unreachable!("for_run picks the endpoint kind per backend"),
         }
@@ -599,15 +549,115 @@ impl PollBackend for Poller {
     }
 }
 
+/// How a run that did not end normally failed. `NotStarted` means the player
+/// never got going: it could not be spawned, or it exited with a failure before
+/// its control socket opened (a missing shared library, a stale wrapper). Nothing
+/// was played, so the next player may be tried. Detection only finds a program by
+/// location, so this is what catches a player that is installed but broken.
+enum RunError {
+    NotStarted(AppError),
+    Failed(AppError),
+}
+
+impl From<AppError> for RunError {
+    fn from(e: AppError) -> Self {
+        RunError::Failed(e)
+    }
+}
+
+impl RunError {
+    fn into_inner(self) -> AppError {
+        match self {
+            RunError::NotStarted(e) | RunError::Failed(e) => e,
+        }
+    }
+}
+
+fn could_not_run(status: std::process::ExitStatus) -> bool {
+    is_start_failure(status.code())
+}
+
+/// Windows loader failures, reported as the process exit code when a player
+/// cannot start: STATUS_DLL_NOT_FOUND, STATUS_ORDINAL_NOT_FOUND,
+/// STATUS_ENTRYPOINT_NOT_FOUND, STATUS_INVALID_IMAGE_FORMAT and
+/// STATUS_DLL_INIT_FAILED.
+const WINDOWS_LOADER_FAILURES: [u32; 5] =
+    [0xC000_0135, 0xC000_0138, 0xC000_0139, 0xC000_007B, 0xC000_0142];
+
+/// Whether an exit code means the program never ran. 126 and 127 are the
+/// shell and loader's "cannot execute" and "not found" (a missing shared
+/// library lands here); no code at all means a signal, such as a crash on
+/// startup; on Windows the loader reports its own NTSTATUS instead. Unix codes
+/// are 0-255, so the Windows values can never match there.
+fn is_start_failure(code: Option<i32>) -> bool {
+    match code {
+        None | Some(126 | 127) => true,
+        Some(c) => WINDOWS_LOADER_FAILURES.contains(&(c as u32)),
+    }
+}
+
 pub async fn play_episode(
     db: Arc<Db>,
     player: Arc<Player>,
     episode_id: i64,
     backend: PlayerBackend,
-    bin: &str,
-    notify: impl Fn(PlaybackChanged) + Send + 'static,
+    bin: impl AsRef<std::ffi::OsStr>,
+    notify: impl Fn(PlaybackChanged) + Send + Sync + 'static,
     poll_every: Duration,
 ) -> Result<()> {
+    run(db, player, episode_id, backend, bin.as_ref(), &notify, poll_every)
+        .await
+        .map_err(RunError::into_inner)
+}
+
+/// Play with each candidate in turn, moving to the next only when one never
+/// started. A player that ran, even untracked, ends the attempt: launching
+/// another over it would replay the episode. `on_notice` hears each hand-over.
+pub async fn play_with_fallback(
+    db: Arc<Db>,
+    player: Arc<Player>,
+    episode_id: i64,
+    candidates: &[(PlayerBackend, PathBuf)],
+    notify: impl Fn(PlaybackChanged) + Send + Sync,
+    on_notice: impl Fn(String) + Send + Sync,
+    poll_every: Duration,
+) -> Result<()> {
+    let mut last = AppError::Player("no player to try".into());
+    for (i, (backend, bin)) in candidates.iter().enumerate() {
+        match run(db.clone(), player.clone(), episode_id, *backend, bin.as_os_str(), &notify, poll_every).await {
+            Ok(()) => return Ok(()),
+            Err(RunError::Failed(e)) => return Err(e),
+            Err(RunError::NotStarted(e)) => {
+                if let Some((next, _)) = candidates.get(i + 1) {
+                    // The bare message: a notice is not an error, so no "player:" kind prefix.
+                    let why = match &e {
+                        AppError::Player(m) => m.clone(),
+                        other => other.to_string(),
+                    };
+                    on_notice(format!("{why}; trying {}", next.label()));
+                }
+                last = e;
+            }
+        }
+    }
+    Err(last)
+}
+
+async fn run<N: Fn(PlaybackChanged) + Sync>(
+    db: Arc<Db>,
+    player: Arc<Player>,
+    episode_id: i64,
+    backend: PlayerBackend,
+    bin: &std::ffi::OsStr,
+    notify: &N,
+    poll_every: Duration,
+) -> std::result::Result<(), RunError> {
+    if !backend.playable_here() {
+        return Err(RunError::NotStarted(AppError::Player(format!(
+            "{} playback arrives with Windows support",
+            backend.label()
+        ))));
+    }
     let ep = db.get_episode(episode_id)?;
     ensure_file_present(&ep.path)?;
     let show_id = db.show_id_for_episode(episode_id)?;
@@ -643,18 +693,23 @@ pub async fn play_episode(
                 ep.position_secs.max(0.0).round() as i64
             ))
             .args(vlc_state_args(saved.as_ref())),
+        // Refused at the top of `run`; spawning the bare binary would only fail later.
+        PlayerBackend::MpcHc => &mut cmd,
     };
     cmd.arg(&ep.path).kill_on_drop(false);
     no_console_window(cmd.as_std_mut());
     let mut child = cmd.spawn().map_err(|e| {
         player.release();
-        AppError::Player(format!("failed to launch {}: {e}", backend.as_str()))
+        RunError::NotStarted(AppError::Player(format!(
+            "failed to launch {}: {e}",
+            backend.label()
+        )))
     })?;
 
     if let Err(e) = db.set_status(episode_id, EpisodeStatus::Playing) {
         let _ = child.start_kill();
         player.release();
-        return Err(e);
+        return Err(e.into());
     }
     notify(PlaybackChanged {
         episode_id,
@@ -674,21 +729,29 @@ pub async fn play_episode(
     };
 
     // Connect per backend before the loop; `tracked` records whether the
-    // control socket ever bound.
-    let mut poller = match backend {
-        PlayerBackend::Mpv => Ipc::connect(&sock, Duration::from_secs(5))
-            .await
-            .map(|ipc| Poller::Mpv(MpvPoller { ipc })),
-        PlayerBackend::Vlc => VlcRc::connect(&sock, Duration::from_secs(5))
-            .await
-            .map(|rc| Poller::Vlc(VlcPoller { rc })),
+    // control socket ever bound. A player that exits first ends the wait, so a
+    // broken one is reported at once rather than after the connect timeout.
+    let connect = async {
+        match backend {
+            PlayerBackend::Mpv => Ipc::connect(&sock, Duration::from_secs(5))
+                .await
+                .map(|ipc| Poller::Mpv(MpvPoller { ipc })),
+            PlayerBackend::Vlc => VlcRc::connect(&sock, Duration::from_secs(5))
+                .await
+                .map(|rc| Poller::Vlc(VlcPoller { rc })),
+            PlayerBackend::MpcHc => None,
+        }
+    };
+    let (mut poller, exited_early) = tokio::select! {
+        p = connect => (p, None),
+        status = child.wait() => (None, status.ok()),
     };
     // Without the control socket there is no position or duration, so the watched
     // judgement below would be made from stale values: a fully watched episode
     // would be written back as unplayed and rewound, and a resumed one could be
     // marked played after ten seconds.
     let tracked = poller.is_some();
-    loop {
+    while exited_early.is_none() {
         tokio::select! {
             _ = child.wait() => break,
             _ = tokio::time::sleep(poll_every) => {
@@ -721,10 +784,24 @@ pub async fn play_episode(
             position_secs: after.position_secs,
             duration_secs: after.duration_secs,
         });
-        return Err(AppError::Player(format!(
+        if let Some(status) = exited_early.filter(|s| !s.success()) {
+            let e = AppError::Player(format!(
+                "{} exited with {status} before its control socket opened",
+                backend.label()
+            ));
+            // Only a program that could not run hands over. One that ran and gave
+            // up (mpv exits 2 on a file it cannot play) would fail the same way in
+            // the next player, which would then bury this reason under its own.
+            return Err(if could_not_run(status) {
+                RunError::NotStarted(e)
+            } else {
+                RunError::Failed(e)
+            });
+        }
+        return Err(RunError::Failed(AppError::Player(format!(
             "could not reach {}'s control socket, so playback position was not tracked; this episode's progress is unchanged",
-            backend.as_str()
-        )));
+            backend.label()
+        ))));
     }
 
     let threshold = db.played_threshold()?;
@@ -769,7 +846,7 @@ pub async fn play_episode(
         duration_secs: after.duration_secs,
     });
     if let Some(e) = save_error {
-        return Err(e);
+        return Err(e.into());
     }
     Ok(())
 }
@@ -853,6 +930,15 @@ mod tests {
         match backend {
             PlayerBackend::Mpv => fixture(),
             PlayerBackend::Vlc => vlc_fixture(),
+            PlayerBackend::MpcHc => panic!("MPC-HC has no fake player"),
+        }
+    }
+
+    fn no_ipc_key(backend: PlayerBackend) -> &'static str {
+        match backend {
+            PlayerBackend::Mpv => "FAKE_MPV_NO_IPC",
+            PlayerBackend::Vlc => "FAKE_VLC_NO_IPC",
+            PlayerBackend::MpcHc => panic!("MPC-HC has no fake player"),
         }
     }
 
@@ -883,26 +969,13 @@ mod tests {
     struct NoSocketGuard(PlayerBackend);
     impl NoSocketGuard {
         fn set(backend: PlayerBackend) -> Self {
-            unsafe {
-                std::env::set_var(
-                    match backend {
-                        PlayerBackend::Mpv => "FAKE_MPV_NO_IPC",
-                        PlayerBackend::Vlc => "FAKE_VLC_NO_IPC",
-                    },
-                    "1",
-                )
-            };
+            unsafe { std::env::set_var(no_ipc_key(backend), "1") };
             NoSocketGuard(backend)
         }
     }
     impl Drop for NoSocketGuard {
         fn drop(&mut self) {
-            unsafe {
-                std::env::remove_var(match self.0 {
-                    PlayerBackend::Mpv => "FAKE_MPV_NO_IPC",
-                    PlayerBackend::Vlc => "FAKE_VLC_NO_IPC",
-                })
-            };
+            unsafe { std::env::remove_var(no_ipc_key(self.0)) };
         }
     }
 
@@ -1016,6 +1089,202 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, AppError::Player(_)));
+        assert_eq!(db.get_episode(id).unwrap().status, EpisodeStatus::Unplayed);
+    }
+
+    /// An executable that exits at once with `code`, the way a player with a
+    /// missing shared library (127) or an unplayable file (2) does.
+    fn exiting_player(dir: &std::path::Path, code: i32) -> PathBuf {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join("mpv");
+            std::fs::write(&path, format!("#!/bin/sh\necho 'player failed' >&2\nexit {code}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+        #[cfg(windows)]
+        {
+            let path = dir.join("mpv.cmd");
+            std::fs::write(&path, format!("@echo player failed 1>&2\r\n@exit /b {code}\r\n")).unwrap();
+            path
+        }
+    }
+
+    #[test]
+    fn start_failures_are_told_apart_from_a_player_giving_up() {
+        assert!(is_start_failure(Some(127)), "a missing shared library");
+        assert!(is_start_failure(Some(126)), "not executable");
+        assert!(is_start_failure(None), "killed by a signal");
+        assert!(is_start_failure(Some(0xC000_0135_u32 as i32)), "STATUS_DLL_NOT_FOUND");
+        assert!(is_start_failure(Some(0xC000_007B_u32 as i32)), "a 32/64-bit mismatch");
+        assert!(!is_start_failure(Some(2)), "mpv rejecting the file ran");
+        assert!(!is_start_failure(Some(1)));
+    }
+
+    fn broken_player(dir: &std::path::Path) -> PathBuf {
+        exiting_player(dir, 127)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_sockets_are_per_process() {
+        // Two app or test processes playing the same episode id must not share
+        // a socket: each removes the path at start and end, and could connect to
+        // the other's player.
+        let Endpoint::Unix(path) = Endpoint::for_run(PlayerBackend::Mpv, 7).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name, format!("{}-7.sock", std::process::id()));
+    }
+
+    #[tokio::test]
+    async fn a_player_that_rejects_the_file_is_not_followed_by_another() {
+        // mpv exits 2 for a file it cannot play. The player ran; another one would
+        // fail on the same file and bury mpv's reason under its own.
+        fake_vlc("99", "2.0");
+        let t = tempfile::tempdir().unwrap();
+        let (db, id) = seeded();
+        let notices = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let n = notices.clone();
+        let err = play_with_fallback(
+            db.clone(),
+            Arc::new(Player::new()),
+            id,
+            &[
+                (PlayerBackend::Mpv, exiting_player(t.path(), 2)),
+                (PlayerBackend::Vlc, PathBuf::from(vlc_fixture())),
+            ],
+            |_| {},
+            move |m| n.lock().unwrap().push(m),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("mpv exited with"), "{err}");
+        assert!(notices.lock().unwrap().is_empty());
+        assert_eq!(db.get_episode(id).unwrap().status, EpisodeStatus::Unplayed);
+    }
+
+    #[tokio::test]
+    async fn a_player_that_exits_failing_before_its_socket_reports_it_did_not_start() {
+        let t = tempfile::tempdir().unwrap();
+        let (db, id) = seeded();
+        let err = play_episode(
+            db.clone(),
+            Arc::new(Player::new()),
+            id,
+            PlayerBackend::Mpv,
+            broken_player(t.path()),
+            |_| {},
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("mpv exited with"), "{err}");
+        assert_eq!(db.get_episode(id).unwrap().status, EpisodeStatus::Unplayed);
+    }
+
+    #[tokio::test]
+    async fn fallback_moves_on_when_a_player_cannot_be_launched() {
+        fake_vlc("99", "2.0");
+        let (db, id) = seeded();
+        let notices = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let n = notices.clone();
+        play_with_fallback(
+            db.clone(),
+            Arc::new(Player::new()),
+            id,
+            &[
+                (PlayerBackend::Mpv, PathBuf::from("/nonexistent/mpv")),
+                (PlayerBackend::Vlc, PathBuf::from(vlc_fixture())),
+            ],
+            |_| {},
+            move |m| n.lock().unwrap().push(m),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+        assert_eq!(db.get_episode(id).unwrap().status, EpisodeStatus::Played);
+        let notices = notices.lock().unwrap();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("trying VLC"), "{notices:?}");
+        assert!(notices[0].starts_with("failed to launch mpv"), "no error-kind prefix: {notices:?}");
+    }
+
+    #[tokio::test]
+    async fn fallback_moves_on_when_a_player_exits_failing_before_its_socket() {
+        fake_vlc("99", "2.0");
+        let t = tempfile::tempdir().unwrap();
+        let (db, id) = seeded();
+        let notices = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let n = notices.clone();
+        play_with_fallback(
+            db.clone(),
+            Arc::new(Player::new()),
+            id,
+            &[
+                (PlayerBackend::Mpv, broken_player(t.path())),
+                (PlayerBackend::Vlc, PathBuf::from(vlc_fixture())),
+            ],
+            |_| {},
+            move |m| n.lock().unwrap().push(m),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+        assert_eq!(db.get_episode(id).unwrap().status, EpisodeStatus::Played);
+        let notices = notices.lock().unwrap();
+        assert!(notices[0].contains("mpv exited with"), "{notices:?}");
+    }
+
+    #[tokio::test]
+    async fn a_player_that_ran_untracked_is_not_followed_by_another() {
+        // The player opened and the user watched; only tracking failed. Launching a
+        // second player over that would replay the episode.
+        fake_mpv("99", "1.0");
+        let _guard = NoSocketGuard::set(PlayerBackend::Mpv);
+        // Should a loaded machine kill the fake and make it look like it never ran,
+        // the hand-over must not be able to succeed and hide that behind an Ok.
+        let _vlc_guard = NoSocketGuard::set(PlayerBackend::Vlc);
+        let (db, id) = seeded();
+        let notices = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let n = notices.clone();
+        let err = play_with_fallback(
+            db.clone(),
+            Arc::new(Player::new()),
+            id,
+            &[
+                (PlayerBackend::Mpv, PathBuf::from(fixture())),
+                (PlayerBackend::Vlc, PathBuf::from(vlc_fixture())),
+            ],
+            |_| {},
+            move |m| n.lock().unwrap().push(m),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("could not reach mpv's control socket"), "{err}");
+        assert!(notices.lock().unwrap().is_empty());
+        assert_eq!(db.get_episode(id).unwrap().status, EpisodeStatus::Unplayed);
+    }
+
+    #[tokio::test]
+    async fn mpc_hc_is_refused_before_launch_and_leaves_the_player_free() {
+        let (db, id) = seeded();
+        let player = Arc::new(Player::new());
+        let err = play_episode(
+            db.clone(),
+            player.clone(),
+            id,
+            PlayerBackend::MpcHc,
+            "/bin/true",
+            |_| {},
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("arrives with Windows support"), "{err}");
+        assert_eq!(player.current(), None);
         assert_eq!(db.get_episode(id).unwrap().status, EpisodeStatus::Unplayed);
     }
 
@@ -1476,28 +1745,20 @@ mod tests {
     }
 
     #[test]
-    fn player_backend_defaults_to_mpv_and_parses_vlc() {
+    fn player_command_defaults_per_player_and_honours_setting() {
         let db = crate::db::Db::open_memory().unwrap();
-        assert_eq!(player_backend(&db), PlayerBackend::Mpv);
-        db.set_setting("player_backend", "vlc").unwrap();
-        assert_eq!(player_backend(&db), PlayerBackend::Vlc);
-        db.set_setting("player_backend", "VLC").unwrap();
-        assert_eq!(player_backend(&db), PlayerBackend::Vlc);
-        db.set_setting("player_backend", "junk").unwrap();
-        assert_eq!(player_backend(&db), PlayerBackend::Mpv);
-        assert_eq!(PlayerBackend::parse(""), PlayerBackend::Mpv);
-        assert_eq!(PlayerBackend::parse("   "), PlayerBackend::Mpv);
-        assert_eq!(PlayerBackend::parse(" vlc "), PlayerBackend::Vlc);
-    }
-
-    #[test]
-    fn vlc_binary_defaults_to_vlc_and_honours_setting() {
-        let db = crate::db::Db::open_memory().unwrap();
-        assert_eq!(vlc_binary(&db), "vlc");
+        assert_eq!(player_command(&db, PlayerBackend::Vlc), "vlc");
+        assert_eq!(player_command(&db, PlayerBackend::MpcHc), "mpc-hc64");
         db.set_setting("vlc_path", "/usr/bin/vlc").unwrap();
-        assert_eq!(vlc_binary(&db), "/usr/bin/vlc");
+        assert_eq!(player_command(&db, PlayerBackend::Vlc), "/usr/bin/vlc");
         db.set_setting("vlc_path", "").unwrap();
-        assert_eq!(vlc_binary(&db), "vlc");
+        assert_eq!(player_command(&db, PlayerBackend::Vlc), "vlc");
+        // Explorer's "Copy as path" wraps the path in quotes.
+        db.set_setting("vlc_path", " \"C:\\Program Files\\VideoLAN\\VLC\\vlc.exe\" ").unwrap();
+        assert_eq!(
+            player_command(&db, PlayerBackend::Vlc),
+            "C:\\Program Files\\VideoLAN\\VLC\\vlc.exe"
+        );
     }
 
     #[test]
@@ -1756,7 +2017,7 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            matches!(err, AppError::Player(ref m) if m.contains("failed to launch vlc")),
+            matches!(err, AppError::Player(ref m) if m.contains("failed to launch VLC")),
             "{err:?}"
         );
         assert_eq!(db.get_episode(id).unwrap().status, EpisodeStatus::Unplayed);

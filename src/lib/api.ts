@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import type { PlayerChoice } from './playerSettings';
 
 export type EpisodeStatus = 'unplayed' | 'playing' | 'played' | 'missing';
 export interface AppError { kind: 'Io' | 'Db' | 'Parse' | 'Network' | 'Player'; message: string }
@@ -115,6 +116,10 @@ export interface SyncStatus {
   roots: SyncRootMap[]; known_libraries: string[]; devices: SyncDevice[];
   last_read_at: number | null; last_write_at: number | null; unreachable_since: number | null; error: string | null;
 }
+/** Mirrors `player_detect::DetectedPlayer`: one player, found or not, in Automatic's order. */
+export interface DetectedPlayer {
+  player: Exclude<PlayerChoice, 'auto'>; label: string; path: string | null; supported: boolean; looked: string[];
+}
 export interface BatchRangeArg { first: number; last: number; resolution?: string | null }
 export interface TorrentAddArgs {
   torrentUrl?: string | null; infoHash?: string | null;
@@ -128,7 +133,8 @@ export type SettingsMap = Record<string, string> & {
   auto_scan_interval_mins?: string;
   mpv_path?: string;
   vlc_path?: string;
-  player_backend?: 'mpv' | 'vlc';
+  mpc_hc_path?: string;
+  player_backend?: PlayerChoice;
   played_threshold?: string;
   library_sort?: ShowSort;
   dlna_name?: string;
@@ -154,6 +160,7 @@ export const api = {
   listShows: (filter = '', sort: ShowSort = 'title') => invoke<ShowCard[]>('list_shows', { filter, sort }),
   getShow: (id: number) => invoke<ShowDetail>('get_show', { id }),
   play: (episodeId: number) => invoke<void>('play', { episodeId }),
+  detectPlayers: () => invoke<DetectedPlayer[]>('detect_players'),
   setStatus: (episodeId: number, status: EpisodeStatus) => invoke<void>('set_status', { episodeId, status }),
   rematch: (showId: number, matchId: number | null, source: MetadataSource | null = null) =>
     invoke<ShowDetail>('rematch', { showId, matchId, source }),
