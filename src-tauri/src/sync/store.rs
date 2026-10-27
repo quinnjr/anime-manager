@@ -225,9 +225,11 @@ fn episode_value_with(c: &Connection, episode_id: i64, missing_as_prev: bool) ->
 /// own value (not this machine's row) means two machines detecting the same move
 /// publish the same thing under the same stamp, so they cannot disagree. The old
 /// record stays (a disappearance deletes nothing); with no old record, or a
-/// tombstone there, nothing is carried. A carried record that wins is applied.
+/// tombstone there, nothing is carried. A carried record that wins is applied,
+/// so like `apply_for_episode` this waits while sync is off (joining offers the
+/// moved row's own state when it is turned back on).
 pub fn carry_moved_episode(c: &Connection, episode_id: i64, old_path: &str) -> Result<()> {
-    if device_id(c)?.is_none() {
+    if !enabled(c)? {
         return Ok(());
     }
     let Some((library, relpath)) = locate(c, old_path)? else { return Ok(()) };

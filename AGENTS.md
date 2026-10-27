@@ -92,7 +92,8 @@ changes nothing publishes nothing (`set_setting`, `set_status`, `publish_episode
 Settings saves only edited fields, and an unchanged value with a fresh stamp would revert a newer
 edit made elsewhere. Records keep mirroring local writes while sync is off once a device id
 exists (`record_local` gates on the id, not `sync_enabled`), or re-enabling would re-apply stale
-records over edits made while off; only the scan-time `apply_for_episode` stays gated on enabled.
+records over edits made while off; only what a scan applies (`apply_for_episode`, a move's carry)
+stays gated on enabled, since a root mapped while off has not yet offered its own state.
 **Apply** (`sync::apply`) writes live tables with its own SQL and never republishes: going through
 the db.rs methods would stamp every incoming record afresh and the machines would echo each other
 forever.
