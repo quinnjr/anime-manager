@@ -92,8 +92,7 @@ pub fn prepare(dir: &Path, create: bool) -> FolderState {
             if entries.next().is_some() {
                 return FolderState::Foreign;
             }
-            let body = format!("{{\"format\":{FORMAT}}}");
-            if fs::write(dir.join(MARKER), body).is_err() {
+            if write_atomically(&dir.join(MARKER), format!("{{\"format\":{FORMAT}}}").as_bytes()).is_err() {
                 return FolderState::Unreachable;
             }
             ensure_devices()
@@ -109,31 +108,58 @@ fn device_path(dir: &Path, device_id: &str) -> Result<std::path::PathBuf> {
     Ok(dir.join(DEVICES).join(format!("{device_id}.json")))
 }
 
-/// Writes `devices/<id>.json.tmp`, fsyncs, then renames over the real file, so
-/// a reader sees the old file or the new one, never a half-written one.
-pub fn write_own(dir: &Path, f: &DeviceFile) -> Result<()> {
+/// Writes `<path>.tmp`, fsyncs, then renames over `path`, so a reader sees the
+/// old file or the new one, never a half-written one.
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    let path = device_path(dir, &f.device_id)?;
-    let tmp = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec(f).map_err(|e| crate::error::AppError::Parse(e.to_string()))?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
     let mut out = fs::File::create(&tmp)?;
-    out.write_all(&bytes)?;
+    out.write_all(bytes)?;
     out.sync_all()?;
     drop(out);
-    if let Err(e) = fs::rename(&tmp, &path) {
+    if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(e.into());
     }
     Ok(())
 }
 
-/// `(device id, file name)` for every `devices/*.json`.
+/// Writes this device's file atomically (`devices/<id>.json.tmp`, fsync, rename).
+pub fn write_own(dir: &Path, f: &DeviceFile) -> Result<()> {
+    let bytes = serde_json::to_vec(f).map_err(|e| crate::error::AppError::Parse(e.to_string()))?;
+    write_atomically(&device_path(dir, &f.device_id)?, &bytes)
+}
+
+fn seen_of(meta: &fs::Metadata) -> Seen {
+    Seen {
+        mtime: meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0),
+        size: meta.len(),
+    }
+}
+
+/// The (mtime, size) of this device's own file, if it is there.
+pub fn own_seen(dir: &Path, device_id: &str) -> Option<Seen> {
+    fs::metadata(device_path(dir, device_id).ok()?).ok().map(|m| seen_of(&m))
+}
+
+/// `(device id, file name)` for every `devices/*.json`. Dot-files are skipped:
+/// sync tools and editors leave hidden temporaries there that are no device's.
 fn device_files(dir: &Path) -> Vec<(String, std::path::PathBuf)> {
     let Ok(rd) = fs::read_dir(dir.join(DEVICES)) else { return Vec::new() };
     let mut out: Vec<_> = rd
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
+            if name.starts_with('.') {
+                return None;
+            }
             let id = name.strip_suffix(".json")?.to_string();
             Some((id, e.path()))
         })
@@ -147,11 +173,12 @@ fn parse(path: &Path) -> Option<DeviceFile> {
     (f.format <= FORMAT).then_some(f)
 }
 
-/// Reads every other device's file, skipping our own, `*.tmp`, and any file
-/// whose (mtime, size) matches `cache`. A file that fails to parse (typically
-/// caught mid-write on a network share) or has a newer format is reported in
-/// `skipped` and not cached, so the next call retries it. An unreadable
-/// `devices/` yields an empty result; reachability is `prepare`'s job.
+/// Reads every other device's file, skipping our own, `*.tmp`, dot-files, and
+/// any file whose (mtime, size) matches `cache`. A file whose metadata cannot be
+/// read, that fails to parse (typically caught mid-write on a network share),
+/// has a newer format, or names a different device than its file name is
+/// reported in `skipped` and not cached, so the next call retries it. An
+/// unreadable `devices/` yields an empty result; reachability is `prepare`'s job.
 pub fn read_others(dir: &Path, own_id: &str, cache: &mut HashMap<String, Seen>) -> ReadResult {
     let mut res = ReadResult::default();
     for (id, path) in device_files(dir) {
@@ -159,31 +186,29 @@ pub fn read_others(dir: &Path, own_id: &str, cache: &mut HashMap<String, Seen>) 
             continue;
         }
         let name = format!("{id}.json");
-        let Ok(meta) = fs::metadata(&path) else { continue };
-        let seen = Seen {
-            mtime: meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as i64)
-                .unwrap_or(0),
-            size: meta.len(),
+        let Ok(meta) = fs::metadata(&path) else {
+            res.skipped.push(name);
+            continue;
         };
+        let seen = seen_of(&meta);
         if cache.get(&id) == Some(&seen) {
             continue;
         }
         match parse(&path) {
-            Some(f) => {
+            // A file renamed or copied under another device's name would make its records
+            // look like that device's; trust neither.
+            Some(f) if f.device_id == id => {
                 cache.insert(id, seen);
                 res.files.push(f);
             }
-            None => res.skipped.push(name),
+            _ => res.skipped.push(name),
         }
     }
     res
 }
 
 /// `(id, name, written_at)` for every parseable device file, own included.
+#[cfg(test)]
 pub fn list_devices(dir: &Path) -> Vec<(String, String, i64)> {
     device_files(dir)
         .into_iter()
@@ -328,6 +353,50 @@ mod tests {
         assert!(read_others(d.path(), "b", &mut cache).files.is_empty());
         write_own(d.path(), &file("a", 9)).unwrap();
         assert_eq!(read_others(d.path(), "b", &mut cache).files.len(), 1);
+    }
+
+    #[test]
+    fn same_size_rewrite_is_picked_up_by_mtime() {
+        let d = ready();
+        let p = d.path().join("devices/a.json");
+        let mut f = file("a", 1);
+        f.device_name = "aaaa".into();
+        fs::write(&p, serde_json::to_vec(&f).unwrap()).unwrap();
+        let set_mtime = |secs: u64| {
+            let t = UNIX_EPOCH + std::time::Duration::from_secs(secs);
+            fs::File::options().write(true).open(&p).unwrap().set_modified(t).unwrap();
+        };
+        set_mtime(1_700_000_000);
+        let mut cache = HashMap::new();
+        assert_eq!(read_others(d.path(), "b", &mut cache).files.len(), 1);
+        f.device_name = "bbbb".into();
+        fs::write(&p, serde_json::to_vec(&f).unwrap()).unwrap();
+        set_mtime(1_700_000_001);
+        let r = read_others(d.path(), "b", &mut cache);
+        assert_eq!(r.files.iter().map(|f| f.device_name.as_str()).collect::<Vec<_>>(), vec!["bbbb"]);
+    }
+
+    #[test]
+    fn dot_files_are_ignored_and_a_misnamed_file_is_skipped() {
+        let d = ready();
+        fs::write(d.path().join("devices/.a.json"), "{").unwrap();
+        fs::write(d.path().join("devices/.syncthing.c.json.tmp"), "{").unwrap();
+        fs::write(d.path().join("devices/c.json"), serde_json::to_vec(&file("a", 1)).unwrap()).unwrap();
+        let mut cache = HashMap::new();
+        let r = read_others(d.path(), "b", &mut cache);
+        assert!(r.files.is_empty());
+        assert_eq!(r.skipped, vec!["c.json".to_string()]);
+        assert!(cache.is_empty());
+        assert_eq!(list_device_ids(d.path()), vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn marker_is_written_without_a_leftover_temp_file() {
+        let d = ready();
+        let names: Vec<String> =
+            fs::read_dir(d.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        assert!(!names.iter().any(|n| n.ends_with(".tmp")), "{names:?}");
+        assert_eq!(fs::read_to_string(d.path().join(MARKER)).unwrap(), format!("{{\"format\":{FORMAT}}}"));
     }
 
     #[test]
