@@ -3971,7 +3971,7 @@ mod tests {
             assert!(table_exists(c, "sync_records"));
             assert!(table_exists(c, "sync_libraries"));
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            assert_eq!(v, 10);
+            assert_eq!(v, SCHEMA_VERSION);
             Ok(())
         })
         .unwrap();
@@ -3990,7 +3990,7 @@ mod tests {
                 "SELECT COUNT(*) FROM shows WHERE parsed_title = 'Keep'", [], |r| r.get(0))?;
             assert_eq!(n, 1, "existing rows survive");
             let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            assert_eq!(v, 10);
+            assert_eq!(v, SCHEMA_VERSION);
             Ok(())
         })
         .unwrap();

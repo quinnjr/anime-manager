@@ -86,13 +86,22 @@ commands above them: a write path that forgets to publish silently stops syncing
 beside the SQL is the only place every caller passes through. `publish_show_match` and
 `publish_show_title_override` are separate so a write re-stamps only the field it changed;
 re-stamping the sibling would let an old title override beat a newer one on another machine.
+`publish_setting` is the settings allow-list gate: any name off `SYNCED_SETTINGS` publishes
+nothing, so secrets and arming flags cannot leak through a generic `set_setting`. A write that
+changes nothing publishes nothing (`set_setting`, `set_status`, `publish_episode` compare first):
+Settings saves only edited fields, and an unchanged value with a fresh stamp would revert a newer
+edit made elsewhere. Records keep mirroring local writes while sync is off once a device id
+exists (`record_local` gates on the id, not `sync_enabled`), or re-enabling would re-apply stale
+records over edits made while off; only the scan-time `apply_for_episode` stays gated on enabled.
 **Apply** (`sync::apply`) writes live tables with its own SQL and never republishes: going through
 the db.rs methods would stamp every incoming record afresh and the machines would echo each other
 forever.
 
-**Paths.** A scan-detected move carries the old record's stamp to the new path, never a fresh one,
-and publishes nothing when the old path had no record: a move is not a judgement, and a fresh stamp
-would beat a real watch made elsewhere. A Rename moves the record and tombstones the old path.
+**Paths.** A scan-detected move carries the old record, value and stamp both, to the new path,
+never a fresh stamp and never this machine's row, and carries nothing when the old path had no
+record or a tombstone: a move is not a judgement, a fresh stamp would beat a real watch made
+elsewhere, and two machines detecting one move must publish the same thing. A Rename moves the
+record (a playing or missing row moves its old record's value) and tombstones the old path.
 Unmapped roots publish nothing and are not matched.
 
 **Rounds and joining.** A round merges the share and applies the result in one transaction; a
@@ -103,7 +112,16 @@ missing rows publishing `prev_status`), then apply, all in one transaction. A ne
 match, override or `llm_model` therefore never overrides the share, while its more recently watched
 episodes still win on real viewing times. The poller (`sync_commands::spawn_poller`) flushes
 pending local writes on a debounced 3 s tick and runs a read round every 30 s; window focus
-triggers `sync_now`.
+triggers `sync_now` with `force_write: false` (the Sync now button forces the write).
+`sync_status` reads a `RuntimeView` snapshot, never the runtime lock a round holds through
+folder I/O, so a hung share cannot freeze Settings.
+
+**Folder safety.** Only `sync_configure` may initialise a folder (`folder::prepare(dir, create)`),
+and only one newly chosen: rounds treat a folder without the marker as unreachable, because the
+sync folder may be the mount point and an unmounted share is an empty directory there. Records
+stamped more than a day ahead (`MAX_AHEAD_MS`) are refused before they are observed, so one bad
+clock cannot drag every machine forward. A change to this machine's own device file that it did
+not write is reported as a copied database (two machines sharing a device id).
 
 **Fold survivor.** `merge_duplicate_shows` picks the survivor by most `merge` pins, ties broken
 on `parsed_title`; only a group with no pins at all falls back to episode count first. Never row
