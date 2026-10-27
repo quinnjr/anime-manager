@@ -532,3 +532,66 @@ fn unmounted_share_at_the_mount_point_is_unreachable_not_reinitialised() {
     assert!(!sync::flush(&a.db, &mut a.rt, true).unwrap());
     assert!(!s.path().join("devices").exists());
 }
+
+/// Both machines fold the same pair before reading each other, in opposite directions
+/// (each keeps the row with more episodes locally). Each cycle repeats that: both scan
+/// and fold from the same synced state, then exchange. They must settle on one
+/// survivor and stay there.
+fn concurrent_folds_converge(k_on_a: u32, l_on_a: u32, k_on_b: u32, l_on_b: u32) {
+    let files = |k: u32, l: u32| -> Vec<String> {
+        (1..=k)
+            .map(|n| format!("Bloom Into You/Bloom Into You - {n:02}.mkv"))
+            .chain((1..=l).map(|n| format!("Yagate Kimi ni Naru/Yagate Kimi ni Naru - {n:02}.mkv")))
+            .collect()
+    };
+    let (fa, fb) = (files(k_on_a, l_on_a), files(k_on_b, l_on_b));
+    let s = share();
+    let mut a = Machine::joined(s.path(), "dev-a", &fa.iter().map(String::as_str).collect::<Vec<_>>());
+    let mut b = Machine::joined(s.path(), "dev-b", &fb.iter().map(String::as_str).collect::<Vec<_>>());
+    for m in [&a, &b] {
+        m.match_show("Bloom Into You", 42);
+        m.match_show("Yagate Kimi ni Naru", 42);
+    }
+    a.db.merge_duplicate_shows().unwrap();
+    b.db.merge_duplicate_shows().unwrap();
+    assert_ne!(a.show_titles(), b.show_titles(), "the folds really went opposite ways");
+    let cycle = |a: &mut Machine, b: &mut Machine| {
+        a.round();
+        b.round();
+        a.round();
+        for m in [a, b] {
+            m.scan();
+            m.db.merge_duplicate_shows().unwrap();
+        }
+    };
+    for _ in 0..4 {
+        cycle(&mut a, &mut b);
+    }
+    a.round();
+    b.round();
+    assert_eq!(a.show_titles().len(), 1, "{:?}", a.show_titles());
+    assert_eq!(a.show_titles(), b.show_titles());
+    let (oa, ob) = (a.ov_stamps(), b.ov_stamps());
+    assert_eq!(oa, ob);
+    for _ in 0..3 {
+        cycle(&mut a, &mut b);
+        a.round();
+        b.round();
+        assert_eq!(a.show_titles(), b.show_titles());
+        assert_eq!(a.show_titles().len(), 1);
+    }
+    assert_eq!(a.ov_stamps(), oa, "stayed converged: no override re-stamped");
+    assert_eq!(b.ov_stamps(), ob);
+}
+
+#[test]
+fn concurrent_opposite_folds_converge() {
+    // A pins 3 files to "Bloom Into You", B pins 2 to "Yagate Kimi ni Naru".
+    concurrent_folds_converge(5, 3, 2, 3);
+}
+
+#[test]
+fn concurrent_opposite_folds_with_equal_pins_converge() {
+    // Each side pins two files the other way, so the pin counts tie.
+    concurrent_folds_converge(5, 2, 2, 3);
+}

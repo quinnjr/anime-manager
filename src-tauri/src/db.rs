@@ -1057,10 +1057,13 @@ impl Db {
     /// app already knows they are the same thing, so no model is needed to say so.
     ///
     /// The survivor must be the same row on every synced machine, or two machines with different
-    /// episode counts fold in opposite directions and undo each other forever. So the order is:
-    /// the title most already pinned by a `merge` override (a fold another machine published
-    /// outranks local counts), then the row carrying the most episodes so the smaller row's
-    /// episodes move the shorter distance, then `parsed_title`, which unlike a row id is the
+    /// episode counts fold in opposite directions and undo each other forever. Once any `merge`
+    /// pin names a title in the group, a fold has already been decided somewhere: the survivor is
+    /// the title most pinned, ties broken on `parsed_title`, and local episode counts no longer
+    /// count, since they differ per machine and two machines that folded opposite ways before
+    /// reading each other would otherwise keep re-pinning in opposite directions. Only a group
+    /// nobody has folded yet prefers the row carrying the most episodes (the smaller row's
+    /// episodes move the shorter distance), then `parsed_title`, which unlike a row id is the
     /// same everywhere. A title the user set by hand always wins, and any artwork or metadata
     /// only the loser had is carried over rather than dropped. Returns how many rows were folded away.
     pub fn merge_duplicate_shows(&self) -> Result<usize> {
@@ -1076,19 +1079,30 @@ impl Db {
 
             let mut folded = 0usize;
             for (source, ext_id) in groups {
-                let ids: Vec<i64> = {
+                // (id, parsed_title, merge pins naming it, episodes)
+                let mut rows: Vec<(i64, String, i64, i64)> = {
                     let mut st = tx.prepare(
-                        "SELECT s.id FROM shows s WHERE s.match_source = ?1 AND s.anilist_id = ?2
-                         ORDER BY (SELECT COUNT(*) FROM parse_overrides po
-                                   WHERE po.source = 'merge' AND po.title = s.parsed_title) DESC,
-                                  (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id = se.id
-                                   WHERE se.show_id = s.id) DESC, s.parsed_title ASC")?;
-                    st.query_map(params![source, ext_id], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
+                        "SELECT s.id, s.parsed_title,
+                                (SELECT COUNT(*) FROM parse_overrides po
+                                 WHERE po.source = 'merge' AND po.title = s.parsed_title),
+                                (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id = se.id
+                                 WHERE se.show_id = s.id)
+                         FROM shows s WHERE s.match_source = ?1 AND s.anilist_id = ?2")?;
+                    st.query_map(params![source, ext_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                        .collect::<std::result::Result<_, _>>()?
                 };
+                if rows.iter().any(|r| r.2 > 0) {
+                    rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+                } else {
+                    rows.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.1.cmp(&b.1)));
+                }
+                let ids: Vec<i64> = rows.into_iter().map(|r| r.0).collect();
                 let Some((&keep, losers)) = ids.split_first() else { continue };
 
+                // The survivor's (title override, (canonical title, cover url, total episodes)).
+                type Carried = (Option<String>, (Option<String>, Option<String>, Option<i64>));
                 for &loser in losers {
-                    let carried = |tx: &Connection| -> Result<(Option<String>, (Option<String>, Option<String>, Option<i64>))> {
+                    let carried = |tx: &Connection| -> Result<Carried> {
                         Ok(tx.query_row(
                             "SELECT user_title_override, canonical_title, cover_url, total_episodes FROM shows WHERE id = ?1",
                             params![keep],
@@ -1960,6 +1974,26 @@ mod tests {
         assert!(db.get_show(sid(&db, "K")).is_ok());
         let left: i64 = db.with(|c| Ok(c.query_row("SELECT COUNT(*) FROM shows WHERE parsed_title = 'L'", [], |r| r.get(0))?)).unwrap();
         assert_eq!(left, 0, "the fuller row is the one folded away");
+    }
+
+    #[test]
+    fn fold_ignores_episode_counts_once_a_merge_pin_exists() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/Alpha/1.mkv", 1, 1)).unwrap();
+        for n in 1..=5 {
+            db.upsert_episode(&pn("Beta", 1, n), &rf(&format!("/lib/Beta/{n}.mkv"), 1, 1)).unwrap();
+        }
+        db.set_anilist(sid(&db, "Alpha"), &hit(7)).unwrap();
+        db.set_anilist(sid(&db, "Beta"), &hit(7)).unwrap();
+        // Two machines folded opposite ways: one pin each, so the pins tie and the title decides.
+        db.set_override(&ParseOverride { title: "Alpha".into(), ..ov("/lib/Elsewhere/a.mkv", "merge") }).unwrap();
+        db.set_override(&ParseOverride { title: "Beta".into(), ..ov("/lib/Elsewhere/b.mkv", "merge") }).unwrap();
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+        let left: Vec<String> = db.with(|c| {
+            let mut st = c.prepare("SELECT parsed_title FROM shows")?;
+            Ok(st.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?)
+        }).unwrap();
+        assert_eq!(left, vec!["Alpha".to_string()], "the fuller row must not win once pins exist");
     }
 
     #[test]

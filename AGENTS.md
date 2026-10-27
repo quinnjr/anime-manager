@@ -105,9 +105,10 @@ episodes still win on real viewing times. The poller (`sync_commands::spawn_poll
 pending local writes on a debounced 3 s tick and runs a read round every 30 s; window focus
 triggers `sync_now`.
 
-**Fold survivor.** `merge_duplicate_shows` picks the survivor by most `merge` pins, then episode
-count, then `parsed_title`; never row id, which differs per machine, or two machines would each
-fold toward their own row and undo the other.
+**Fold survivor.** `merge_duplicate_shows` picks the survivor by most `merge` pins, ties broken
+on `parsed_title`; only a group with no pins at all falls back to episode count first. Never row
+id or, once a fold exists anywhere, local episode counts: both differ per machine, and two machines
+that folded opposite ways before reading each other would keep re-pinning against each other.
 
 **Local only.** Roots, `sync_libraries`, the sync folder, device id/name/clock, player paths, DLNA,
 `torrent_path_map`, scan interval, the secrets `llm_api_key` and `torrent_password`, covers,
@@ -167,7 +168,10 @@ state splits. Two mechanisms close that, in order of trust:
 
 - `db::merge_duplicate_shows` folds rows already matched to the same `(match_source, anilist_id)`.
   That is evidence, not a guess, so it needs no model and runs automatically after every matching
-  pass. The survivor is picked the same way on every synced machine, or machines with different episode counts would undo each other's folds: most `merge` pins on its title first, then most episodes, then `parsed_title` ascending (never row id); a `user_title_override` and any artwork or
+  pass. The survivor is picked the same way on every synced machine, or machines with different
+  episode counts would undo each other's folds: once any `merge` pin names a title in the group,
+  most pins wins and `parsed_title` ascending breaks a tie; a group nobody has folded yet prefers
+  most episodes, then `parsed_title` (never row id). A `user_title_override` and any artwork or
   counts only a folded row carried are kept. Seasons are `UNIQUE(show_id, number)`, so episodes
   move season by season into the survivor's season of that number rather than the season row moving.
   Rows with no shared id are deliberately left alone — titles alone are not evidence.
