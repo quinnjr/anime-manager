@@ -1,4 +1,5 @@
 import type { LinkedBatch, LinkedTo, TorrentEntry } from '$lib/api';
+import { isWithin } from './paths';
 
 /** Sending-state key for a pack send, shared by the strip button and the
  *  send itself so the busy state always engages. */
@@ -86,11 +87,7 @@ export function isSavePathInsideRoots(savePath: string | null | undefined, roots
   if (!savePath) return true;
   return roots
     .filter((r) => r.trim() !== '')
-    .some((r) => {
-      const root = r.trim().replace(/\/+$/, '') || '/';
-      if (root === '/') return savePath.startsWith('/');
-      return savePath === root || savePath.startsWith(root + '/');
-    });
+    .some((r) => isWithin(savePath, r.trim()));
 }
 
 /** Transfer rate as a row label: `—` when idle, one decimal above a MiB/s. */

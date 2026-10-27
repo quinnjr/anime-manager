@@ -5,8 +5,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::process::Command;
 
 pub struct Player {
@@ -108,6 +107,92 @@ pub fn vlc_volume_pct(steps: i64) -> f64 {
     steps.clamp(0, VLC_STEPS_MAX) as f64 * 100.0 / VLC_STEPS_FOR_FULL_VOLUME
 }
 
+/// Keep a console-subsystem child (`mpv.com`, a `.cmd` wrapper, the version probe) from
+/// opening a console window: the app is a GUI process with no console of its own to lend.
+/// The player's own video window is unaffected.
+pub fn no_console_window(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
+/// Where Windows installers put each player when they leave `PATH` alone, which the
+/// official VLC installer always does. Tried after `PATH`, in order.
+#[cfg(windows)]
+fn windows_install_dirs(name: &str) -> Vec<PathBuf> {
+    let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
+    let mut out = Vec::new();
+    match name {
+        "vlc" => {
+            for k in ["ProgramFiles", "ProgramFiles(x86)"] {
+                if let Some(p) = env(k) {
+                    out.push(p.join("VideoLAN").join("VLC").join("vlc.exe"));
+                }
+            }
+        }
+        "mpv" => {
+            if let Some(p) = env("ProgramFiles") {
+                out.push(p.join("mpv").join("mpv.exe"));
+            }
+            if let Some(p) = env("USERPROFILE") {
+                out.push(p.join("scoop").join("apps").join("mpv").join("current").join("mpv.exe"));
+            }
+            if let Some(p) = env("LOCALAPPDATA") {
+                out.push(p.join("Programs").join("mpv").join("mpv.exe"));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Resolve a configured player binary to a file. A bare name is looked up on `PATH`
+/// (honouring `PATHEXT` on Windows) and then, on Windows, in the players' default install
+/// directories; an explicit path must exist as given. `None` means nothing was found.
+pub fn locate_binary(bin: &str) -> Option<PathBuf> {
+    let p = std::path::Path::new(bin);
+    if bin.is_empty() {
+        return None;
+    }
+    if p.components().count() > 1 || p.is_absolute() {
+        return p.is_file().then(|| p.to_path_buf());
+    }
+    #[cfg(windows)]
+    let exts: Vec<String> = if p.extension().is_some() {
+        vec![String::new()]
+    } else {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    #[cfg(not(windows))]
+    let exts = vec![String::new()];
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            for ext in &exts {
+                let cand = dir.join(format!("{bin}{ext}"));
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    return windows_install_dirs(&bin.to_ascii_lowercase())
+        .into_iter()
+        .find(|c| c.is_file());
+    #[cfg(not(windows))]
+    None
+}
+
 /// Fails fast when the file vanished. Called synchronously from `commands::play` for the
 /// toast and defensively at the top of `play_episode` for direct callers.
 pub fn ensure_file_present(path: &str) -> Result<()> {
@@ -164,23 +249,119 @@ fn vlc_state_args(state: Option<&ShowPlayerState>) -> Vec<String> {
     args
 }
 
-fn socket_path(episode_id: i64) -> PathBuf {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    let dir = base.join("anime-manager");
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join(format!("{episode_id}.sock"))
+/// Where a player's control channel listens. mpv's JSON IPC is a unix socket
+/// on Linux and a named pipe on Windows; VLC's RC interface is a unix socket on
+/// Linux, but its Windows build has no `--rc-unix`, so there it is loopback TCP.
+#[derive(Debug, Clone)]
+enum Endpoint {
+    #[cfg(unix)]
+    Unix(PathBuf),
+    #[cfg(windows)]
+    Pipe(String),
+    #[cfg(windows)]
+    Tcp(std::net::SocketAddr),
 }
 
-/// Retry connecting to a unix socket until `timeout` elapses. Both backends
-/// bind their control socket a moment after launch, so one shared retry loop
-/// serves `Ipc::connect` and `VlcRc::connect` alike.
-async fn connect_unix(path: &PathBuf, timeout: Duration) -> Option<UnixStream> {
+impl Endpoint {
+    /// The control endpoint for one run of `backend` playing `episode_id`.
+    fn for_run(backend: PlayerBackend, episode_id: i64) -> std::io::Result<Endpoint> {
+        #[cfg(unix)]
+        {
+            let _ = backend;
+            let base = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/tmp"));
+            let dir = base.join("anime-manager");
+            let _ = std::fs::create_dir_all(&dir);
+            Ok(Endpoint::Unix(dir.join(format!("{episode_id}.sock"))))
+        }
+        #[cfg(windows)]
+        match backend {
+            // The pid keeps a pipe held by a stuck earlier instance from being reused.
+            PlayerBackend::Mpv => Ok(Endpoint::Pipe(format!(
+                r"\\.\pipe\anime-manager-{}-{episode_id}",
+                std::process::id()
+            ))),
+            // Ask the OS for a free loopback port and hand it to VLC. The port is released
+            // before VLC binds it; losing that race only costs the run its tracking (the
+            // untracked path in play_episode), never a wrong write.
+            PlayerBackend::Vlc => {
+                let l = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+                Ok(Endpoint::Tcp(l.local_addr()?))
+            }
+        }
+    }
+
+    /// The flags that tell the player to listen here.
+    fn player_args(&self, backend: PlayerBackend) -> Vec<String> {
+        match (backend, self) {
+            #[cfg(unix)]
+            (PlayerBackend::Mpv, Endpoint::Unix(p)) => {
+                vec![format!("--input-ipc-server={}", p.display())]
+            }
+            #[cfg(unix)]
+            (PlayerBackend::Vlc, Endpoint::Unix(p)) => {
+                vec!["--rc-unix".into(), p.display().to_string()]
+            }
+            #[cfg(windows)]
+            (PlayerBackend::Mpv, Endpoint::Pipe(name)) => {
+                vec![format!("--input-ipc-server={name}")]
+            }
+            // --rc-quiet stops VLC on Windows opening a console window for the RC interface.
+            #[cfg(windows)]
+            (PlayerBackend::Vlc, Endpoint::Tcp(addr)) => {
+                vec!["--rc-host".into(), addr.to_string(), "--rc-quiet".into()]
+            }
+            #[cfg(windows)]
+            _ => unreachable!("for_run picks the endpoint kind per backend"),
+        }
+    }
+
+    /// Remove what a previous run left behind. Only a unix socket outlives its server.
+    fn clean(&self) {
+        #[cfg(unix)]
+        if let Endpoint::Unix(p) = self {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    async fn connect_once(&self) -> Option<Conn> {
+        match self {
+            #[cfg(unix)]
+            Endpoint::Unix(p) => tokio::net::UnixStream::connect(p)
+                .await
+                .ok()
+                .map(|s| Box::new(s) as Conn),
+            #[cfg(windows)]
+            Endpoint::Pipe(name) => tokio::net::windows::named_pipe::ClientOptions::new()
+                .open(name)
+                .ok()
+                .map(|s| Box::new(s) as Conn),
+            #[cfg(windows)]
+            Endpoint::Tcp(addr) => tokio::net::TcpStream::connect(addr)
+                .await
+                .ok()
+                .map(|s| Box::new(s) as Conn),
+        }
+    }
+}
+
+/// A connected control channel, whatever transport the platform uses.
+trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
+type Conn = Box<dyn Duplex>;
+
+/// Retry connecting to the control endpoint until `timeout` elapses. Both
+/// backends bind it a moment after launch, so one shared retry loop serves
+/// `Ipc::connect` and `VlcRc::connect` alike.
+async fn connect_control(
+    ep: &Endpoint,
+    timeout: Duration,
+) -> Option<(ReadHalf<Conn>, WriteHalf<Conn>)> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Ok(s) = UnixStream::connect(path).await {
-            return Some(s);
+        if let Some(s) = ep.connect_once().await {
+            return Some(tokio::io::split(s));
         }
         if tokio::time::Instant::now() >= deadline {
             return None;
@@ -190,15 +371,14 @@ async fn connect_unix(path: &PathBuf, timeout: Duration) -> Option<UnixStream> {
 }
 
 struct Ipc {
-    write: tokio::net::unix::OwnedWriteHalf,
-    read: BufReader<tokio::net::unix::OwnedReadHalf>,
+    write: WriteHalf<Conn>,
+    read: BufReader<ReadHalf<Conn>>,
     next_id: u64,
 }
 
 impl Ipc {
-    async fn connect(path: &PathBuf, timeout: Duration) -> Option<Ipc> {
-        let s = connect_unix(path, timeout).await?;
-        let (r, w) = s.into_split();
+    async fn connect(ep: &Endpoint, timeout: Duration) -> Option<Ipc> {
+        let (r, w) = connect_control(ep, timeout).await?;
         Some(Ipc {
             write: w,
             read: BufReader::new(r),
@@ -260,18 +440,17 @@ fn is_bool_reply(s: &str) -> bool {
     )
 }
 
-/// VLC remote-control client over a unix socket. The RC interface is
+/// VLC remote-control client over its control socket. The RC interface is
 /// line-oriented plain text: one command per line, one reply line back, so a
 /// query is just a write plus a bounded read that skips async broadcasts.
 struct VlcRc {
-    write: tokio::net::unix::OwnedWriteHalf,
-    read: BufReader<tokio::net::unix::OwnedReadHalf>,
+    write: WriteHalf<Conn>,
+    read: BufReader<ReadHalf<Conn>>,
 }
 
 impl VlcRc {
-    async fn connect(path: &PathBuf, timeout: Duration) -> Option<VlcRc> {
-        let s = connect_unix(path, timeout).await?;
-        let (r, w) = s.into_split();
+    async fn connect(ep: &Endpoint, timeout: Duration) -> Option<VlcRc> {
+        let (r, w) = connect_control(ep, timeout).await?;
         Some(VlcRc {
             write: w,
             read: BufReader::new(r),
@@ -435,25 +614,25 @@ pub async fn play_episode(
         None => None,
     };
     player.claim(episode_id)?;
-    let sock = socket_path(episode_id);
-    let _ = std::fs::remove_file(&sock);
+    let sock = Endpoint::for_run(backend, episode_id).map_err(|e| {
+        player.release();
+        AppError::Player(format!("could not set up {}'s control socket: {e}", backend.as_str()))
+    })?;
+    sock.clean();
 
     // VLC keeps its normal window through the extra RC interface; `--intf rc`
     // would replace the GUI with a console, which is not what playback wants.
-    let mut child = match backend {
-        PlayerBackend::Mpv => Command::new(bin)
-            .arg(format!("--input-ipc-server={}", sock.display()))
+    let mut cmd = Command::new(bin);
+    match backend {
+        PlayerBackend::Mpv => cmd
+            .args(sock.player_args(backend))
             .arg(format!("--start={}", ep.position_secs))
             .arg("--force-window")
-            .args(mpv_state_args(saved.as_ref()))
-            .arg(&ep.path)
-            .kill_on_drop(false)
-            .spawn(),
-        PlayerBackend::Vlc => Command::new(bin)
+            .args(mpv_state_args(saved.as_ref())),
+        PlayerBackend::Vlc => cmd
             .arg("--extraintf")
             .arg("rc")
-            .arg("--rc-unix")
-            .arg(sock.display().to_string())
+            .args(sock.player_args(backend))
             .arg("--play-and-exit")
             // VLC takes integer seconds, so round rather than truncate: rounding
             // halves the max resume error (0.5s instead of ~1s).
@@ -461,12 +640,11 @@ pub async fn play_episode(
                 "--start-time={}",
                 ep.position_secs.max(0.0).round() as i64
             ))
-            .args(vlc_state_args(saved.as_ref()))
-            .arg(&ep.path)
-            .kill_on_drop(false)
-            .spawn(),
-    }
-    .map_err(|e| {
+            .args(vlc_state_args(saved.as_ref())),
+    };
+    cmd.arg(&ep.path).kill_on_drop(false);
+    no_console_window(cmd.as_std_mut());
+    let mut child = cmd.spawn().map_err(|e| {
         player.release();
         AppError::Player(format!("failed to launch {}: {e}", backend.as_str()))
     })?;
@@ -519,7 +697,7 @@ pub async fn play_episode(
             }
         }
     }
-    let _ = std::fs::remove_file(&sock);
+    sock.clean();
     player.release();
 
     if !tracked {
@@ -643,8 +821,22 @@ mod tests {
         fake(PlayerBackend::Mpv, stop_at, runtime)
     }
 
+    /// A fake player launcher: the script itself on unix, its `.cmd` wrapper on
+    /// Windows, where CreateProcess cannot run a `.py` directly.
+    fn fake_bin(name: &str) -> String {
+        let ext = if cfg!(windows) { "cmd" } else { "py" };
+        format!("{}/tests/fixtures/{name}.{ext}", env!("CARGO_MANIFEST_DIR"))
+    }
+
     fn fixture() -> String {
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake_mpv.py").to_string()
+        fake_bin("fake_mpv")
+    }
+
+    /// A real file for the fakes to "play", in the platform temp dir.
+    fn fake_media() -> PathBuf {
+        let p = std::env::temp_dir().join("anime-manager-fake.mkv");
+        let _ = std::fs::write(&p, b"fake");
+        p
     }
 
     fn fake_vlc(stop_at: &str, runtime: &str) {
@@ -652,7 +844,7 @@ mod tests {
     }
 
     fn vlc_fixture() -> String {
-        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake_vlc.py").to_string()
+        fake_bin("fake_vlc")
     }
 
     fn fixture_for(backend: PlayerBackend) -> String {
@@ -719,7 +911,7 @@ mod tests {
             .unwrap();
         db.set_setting("vlc_path", &fixture_for(PlayerBackend::Vlc))
             .unwrap();
-        let _ = std::fs::write("/tmp/fake.mkv", b"fake");
+        let media = fake_media();
         let p = ParsedName {
             title: "S".into(),
             season: 1,
@@ -729,7 +921,7 @@ mod tests {
             crc: None,
         };
         let f = RawFile {
-            path: PathBuf::from("/tmp/fake.mkv"),
+            path: media,
             size: 1,
             mtime: 1,
             stem: "".into(),
@@ -830,7 +1022,7 @@ mod tests {
         fake_mpv("99", "1.0");
         let db = Arc::new(Db::open_memory().unwrap());
         db.set_setting("mpv_path", &fixture()).unwrap();
-        let missing = PathBuf::from("/tmp/anime-manager-test-missing.mkv");
+        let missing = std::env::temp_dir().join("anime-manager-test-missing.mkv");
         let _ = std::fs::remove_file(&missing);
         let p = ParsedName {
             title: "Gone".into(),
@@ -914,7 +1106,7 @@ mod tests {
         use crate::sync::{keys::SyncKey, store};
         fake_mpv("99", "1.0");
         let (db, id) = seeded();
-        let root = db.add_root("/tmp").unwrap();
+        let root = db.add_root(std::env::temp_dir().to_str().unwrap()).unwrap();
         db.with(|c| {
             c.execute_batch(
                 "INSERT OR REPLACE INTO settings(key,value) VALUES ('sync_enabled','1'),('sync_device_id','dev-a')",
@@ -924,7 +1116,7 @@ mod tests {
         })
         .unwrap();
         db.set_status(id, EpisodeStatus::Played).unwrap();
-        let key = SyncKey::Episode { library: "Anime".into(), relpath: "fake.mkv".into() };
+        let key = SyncKey::Episode { library: "Anime".into(), relpath: "anime-manager-fake.mkv".into() };
         let record = || db.with(|c| store::get(c, &key)).unwrap();
         let (before_ep, before_rec) = (db.get_episode(id).unwrap(), record());
         assert!(before_rec.is_some(), "positive control: marking watched published");
@@ -1209,8 +1401,8 @@ mod tests {
 
     #[test]
     fn ensure_file_present_rejects_missing_path_with_player_error() {
-        let err =
-            ensure_file_present("/tmp/anime-manager-test-definitely-missing.mkv").unwrap_err();
+        let missing = std::env::temp_dir().join("anime-manager-test-definitely-missing.mkv");
+        let err = ensure_file_present(missing.to_str().unwrap()).unwrap_err();
         assert!(
             matches!(err, AppError::Player(ref m) if m.contains("could not open") && m.contains("file not found")),
             "{err:?}"
@@ -1218,8 +1410,7 @@ mod tests {
     }
     #[test]
     fn ensure_file_present_accepts_existing_path() {
-        let _ = std::fs::write("/tmp/fake.mkv", b"fake");
-        ensure_file_present("/tmp/fake.mkv").unwrap();
+        ensure_file_present(fake_media().to_str().unwrap()).unwrap();
     }
 
     fn state(

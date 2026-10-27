@@ -3,6 +3,7 @@
   import { playback } from '$lib/stores/playback.svelte';
   import { toasts } from '$lib/stores/toasts.svelte';
   import { revealItemInDir } from '@tauri-apps/plugin-opener';
+  import { basename } from '$lib/paths';
 
   let { episode, highlighted = false, onRename }: { episode: Episode; highlighted?: boolean; onRename: () => void } = $props();
 
@@ -14,7 +15,7 @@
   // State reads on the left rule: yellow is unwatched, teal is in flight,
   // spent grey is done, and red is a file that is no longer there.
   const rule = { unplayed: 'bg-sub', playing: 'bg-live', played: 'bg-edge', missing: 'bg-alarm' };
-  const file = $derived(episode.path.split('/').pop() ?? '');
+  const file = $derived(basename(episode.path));
   const mins = $derived(dur ? Math.round(dur / 60) : null);
 
   async function play() { try { await api.play(episode.id); } catch (e) { toasts.error(e); } }

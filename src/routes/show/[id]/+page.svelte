@@ -51,7 +51,7 @@
   // A save path outside every library root never scans back in; say so before
   // the user sends anything there, not after the files land out of reach.
   // Inside check mirrors the backend rule (commands::path_inside_roots):
-  // path == root OR startsWith(root + '/'), so a path equal to a root is inside.
+  // path == root or under it on a separator boundary, so a path equal to a root is inside.
   const outsideRoots = $derived(
     prefs?.save_path && rootPaths.length > 0
       && !isSavePathInsideRoots(prefs.save_path, rootPaths)
