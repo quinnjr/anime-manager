@@ -2,7 +2,7 @@
 //! relative to the mapped root) so machines mounting the share at different
 //! paths agree on which file a record is about.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
 
 use crate::error::Result;
@@ -93,19 +93,27 @@ fn trim_root(root: &str) -> &str {
     root.trim_end_matches(['/', '\\'])
 }
 
+/// The separators a root's paths use. A backslash is a separator only under a
+/// Windows-style root; on Linux it is an ordinary file-name character.
+fn separators(root: &str) -> &'static [char] {
+    if backslash_style(root) { &['/', '\\'] } else { &['/'] }
+}
+
 /// The part of `abs` below `root`, split on a separator boundary.
 fn strip_root<'a>(root: &str, abs: &'a str) -> Option<&'a str> {
+    let seps = separators(root);
     let rest = abs.strip_prefix(trim_root(root))?;
-    if !rest.starts_with(['/', '\\']) {
+    if !rest.starts_with(seps) {
         return None;
     }
-    let rest = rest.trim_start_matches(['/', '\\']);
+    let rest = rest.trim_start_matches(seps);
     (!rest.is_empty()).then_some(rest)
 }
 
 /// Path of `abs` below `root`, always `/`-separated; None when not under it.
 pub fn to_relpath(root: &str, abs: &str) -> Option<String> {
-    strip_root(root, abs).map(|r| r.replace('\\', "/"))
+    let rest = strip_root(root, abs)?;
+    Some(if backslash_style(root) { rest.replace('\\', "/") } else { rest.to_string() })
 }
 
 /// Inverse of `to_relpath`, using the root's own separator style.
@@ -146,11 +154,7 @@ pub fn resolve(c: &Connection, library: &str, relpath: &str) -> Result<Option<St
             [library],
             |r| r.get(0),
         )
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            e => Err(e),
-        })?;
+        .optional()?;
     Ok(root.map(|r| to_abs(&r, relpath)))
 }
 
@@ -197,6 +201,27 @@ mod tests {
         assert_eq!(to_abs("/mnt/nas/Anime/", "Show/01.mkv"), "/mnt/nas/Anime/Show/01.mkv");
         assert_eq!(to_relpath("/mnt/nas/Anime", "/mnt/nas/AnimeX/a.mkv"), None);
         assert_eq!(to_relpath("/mnt/nas/Anime", "/mnt/nas/Anime"), None);
+    }
+
+    #[test]
+    fn backslash_is_a_file_name_character_under_a_slash_root() {
+        assert_eq!(to_relpath("/mnt/a", "/mnt/a/Show/A\\B.mkv").as_deref(), Some("Show/A\\B.mkv"));
+        assert_eq!(to_relpath("/mnt/a", "/mnt/a\\x.mkv"), None);
+        assert_eq!(to_abs("/mnt/a", "Show/A\\B.mkv"), "/mnt/a/Show/A\\B.mkv");
+    }
+
+    #[test]
+    fn locate_and_resolve_with_a_backslash_root() {
+        let db = Db::open_memory().unwrap();
+        map(&db, "Z:\\Anime\\", "Anime");
+        db.with(|c| {
+            let (lib, rel) = locate(c, "Z:\\Anime\\Show\\01.mkv")?.unwrap();
+            assert_eq!((lib.as_str(), rel.as_str()), ("Anime", "Show/01.mkv"));
+            assert_eq!(resolve(c, &lib, &rel)?.as_deref(), Some("Z:\\Anime\\Show\\01.mkv"));
+            assert_eq!(locate(c, "Z:\\AnimeX\\a.mkv")?, None);
+            Ok(())
+        })
+        .unwrap();
     }
 
     fn map(db: &Db, path: &str, lib: &str) {
