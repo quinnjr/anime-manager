@@ -2128,14 +2128,24 @@ mod tests {
     }
 
     #[test]
-    fn disabled_sync_publishes_nothing() {
+    fn sync_never_set_up_publishes_nothing() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", "Anime");
+        db.with(|c| Ok(c.execute("DELETE FROM settings WHERE key IN ('sync_enabled', 'sync_device_id')", [])?)).unwrap();
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/a1.mkv", 1, 1)).unwrap();
+        db.set_status(only_episode(&db), EpisodeStatus::Played).unwrap();
+        let n: i64 = db.with(|c| Ok(c.query_row("SELECT COUNT(*) FROM sync_records", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn sync_turned_off_still_records_local_writes() {
         let db = Db::open_memory().unwrap();
         sync_on(&db, "/lib", "Anime");
         db.with(|c| Ok(c.execute("UPDATE settings SET value='0' WHERE key='sync_enabled'", [])?)).unwrap();
         db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/a1.mkv", 1, 1)).unwrap();
         db.set_status(only_episode(&db), EpisodeStatus::Played).unwrap();
-        let n: i64 = db.with(|c| Ok(c.query_row("SELECT COUNT(*) FROM sync_records", [], |r| r.get(0))?)).unwrap();
-        assert_eq!(n, 0);
+        assert_eq!(ep_record(&db, "a1.mkv").unwrap().value.unwrap()["status"], "played");
     }
 
     #[test]

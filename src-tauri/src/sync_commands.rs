@@ -535,6 +535,29 @@ mod tests {
     }
 
     #[test]
+    fn edits_made_while_sync_is_off_survive_re_enabling() {
+        let share = tempfile::tempdir().unwrap();
+        let mut a = M::new(&SHOW);
+        a.map();
+        a.configure(share.path(), "a").unwrap();
+        let show = a.db.with(|c| Ok(c.query_row("SELECT id FROM shows", [], |r| r.get::<_, i64>(0))?)).unwrap();
+        a.db.set_title_override(show, Some("X")).unwrap();
+        sync::flush(&a.db, &mut a.rt, true).unwrap();
+        configure_with(&a.db, &mut a.rt, share.path().to_str().unwrap(), false, "a").unwrap();
+        a.db.set_title_override(show, Some("Y")).unwrap();
+        a.configure(share.path(), "a").unwrap();
+        assert_eq!(a.db.get_show(show).unwrap().display_title, "Y", "re-enabling reverted an edit made while off");
+        let id = a.db.get_setting("sync_device_id").unwrap().unwrap();
+        let own = folder::read_others(share.path(), "", &mut std::collections::HashMap::new())
+            .files
+            .into_iter()
+            .find(|f| f.device_id == id)
+            .unwrap();
+        let key = crate::sync::keys::SyncKey::ShowTitleOverride { title: "Show".into() }.encode();
+        assert_eq!(own.records[&key].v, Some(serde_json::json!("Y")), "the edit made while off is published");
+    }
+
+    #[test]
     fn failed_join_leaves_sync_off_and_disable_needs_no_name() {
         let share = tempfile::tempdir().unwrap();
         let mut a = M::new(&SHOW);

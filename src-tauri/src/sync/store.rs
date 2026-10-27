@@ -79,9 +79,11 @@ fn row_to_record(key: String, value: Option<String>, stamp: String) -> Result<Re
 }
 
 /// Local write: stamp with the persisted clock, upsert, persist the clock.
-/// A no-op (`Ok(false)`) when sync is not enabled.
+/// A no-op (`Ok(false)`) only until sync has first been set up (no device id).
+/// Turning sync off does not stop it: records keep mirroring local truth, or
+/// re-enabling would re-apply the stale ones and undo edits made while off.
 pub fn record_local(c: &Connection, key: &SyncKey, value: Option<Value>) -> Result<bool> {
-    if !enabled(c)? {
+    if device_id(c)?.is_none() {
         return Ok(false);
     }
     let stamp = tick_now(c)?;
@@ -201,7 +203,7 @@ fn episode_value_with(c: &Connection, episode_id: i64, missing_as_prev: bool) ->
 /// another machine already published for the new path. The old record stays
 /// (a disappearance deletes nothing); with no old record nothing is published.
 pub fn carry_moved_episode(c: &Connection, episode_id: i64, old_path: &str) -> Result<()> {
-    if !enabled(c)? {
+    if device_id(c)?.is_none() {
         return Ok(());
     }
     let Some((library, relpath)) = locate(c, old_path)? else { return Ok(()) };
@@ -469,11 +471,24 @@ mod tests {
     }
 
     #[test]
-    fn record_local_noop_when_disabled() {
+    fn record_local_noop_before_sync_was_set_up() {
         let db = Db::open_memory().unwrap();
         db.with(|c| {
+            c.execute("INSERT INTO settings(key, value) VALUES ('sync_enabled','1')", [])?;
             assert!(!record_local(c, &key(), Some(json!(1)))?);
             assert!(all(c)?.is_empty());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn record_local_keeps_recording_while_sync_is_off() {
+        let db = Db::open_memory().unwrap();
+        db.with(|c| {
+            c.execute("INSERT INTO settings(key, value) VALUES ('sync_device_id','dev-a')", [])?;
+            assert!(record_local(c, &key(), Some(json!(1)))?);
+            assert_eq!(get(c, &key())?.unwrap().value, Some(json!(1)));
             Ok(())
         })
         .unwrap();
@@ -490,17 +505,6 @@ mod tests {
             let b = get(c, &key())?.unwrap();
             assert!(b.stamp > a.stamp);
             assert_eq!(b.value, Some(json!(2)));
-            Ok(())
-        })
-        .unwrap();
-    }
-
-    #[test]
-    fn record_local_errors_without_device_id() {
-        let db = Db::open_memory().unwrap();
-        db.with(|c| {
-            c.execute("INSERT INTO settings(key, value) VALUES ('sync_enabled','1')", [])?;
-            assert!(record_local(c, &key(), None).is_err());
             Ok(())
         })
         .unwrap();

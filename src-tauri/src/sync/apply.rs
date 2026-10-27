@@ -338,8 +338,10 @@ fn apply_key(c: &Connection, key: &SyncKey) -> Result<()> {
 /// show, season, torrent-pin, prefs and rss records naming its show, so a first scan of a file
 /// already watched elsewhere shows it watched and arrives with its match and pins.
 ///
-/// Does nothing while sync is off: records stop tracking local writes then, and re-applying
-/// them on every scan would undo the user's own changes.
+/// Does nothing while sync is off. Records keep mirroring local writes then, but a root
+/// mapped while off has never offered its existing state (`map_root` and `join` do that
+/// first, and both run only while on), so applying the share's records on a scan would
+/// overwrite that root's local viewing before it could compete. Re-enabling runs `join`.
 pub fn apply_for_episode(c: &Connection, episode_id: i64) -> Result<()> {
     if !store::enabled(c)? {
         return Ok(());

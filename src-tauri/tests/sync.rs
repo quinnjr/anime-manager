@@ -24,7 +24,8 @@ struct Machine {
 
 impl Machine {
     /// A machine with `files` on disk under its own root, configured for `share`
-    /// but not yet enabled, so state made before `enable` is a newcomer's old state.
+    /// but never yet enabled (no device id, as before a first configure), so state
+    /// made before `enable` is a newcomer's old state.
     fn new(share: &Path, id: &str, files: &[&str]) -> Machine {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(format!("mnt-{id}"));
@@ -37,7 +38,6 @@ impl Machine {
             c.execute("INSERT INTO sync_libraries(root_id, library) VALUES (?1, 'Anime')", [r.id])?;
             for (k, v) in [
                 ("sync_folder", share.to_str().unwrap()),
-                ("sync_device_id", id),
                 ("sync_device_name", &format!("name-{id}")),
             ] {
                 c.execute("INSERT INTO settings(key, value) VALUES (?1, ?2)", params![k, v])?;
@@ -48,7 +48,9 @@ impl Machine {
         Machine { db, rt: SyncRuntime::default(), root, id: id.into(), _dir: dir }
     }
 
+    /// What a first configure does: issue the device id, then turn sync on.
     fn enable(&self) {
+        self.db.set_setting_unpublished("sync_device_id", &self.id).unwrap();
         self.db.set_setting_unpublished("sync_enabled", "1").unwrap();
     }
 
