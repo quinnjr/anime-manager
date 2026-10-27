@@ -270,6 +270,28 @@ pub fn publish_episode(c: &Connection, episode_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// A row `reset_playing` just turned from playing to unplayed. When its record says
+/// played, the row goes back to played (keeping its local position) and nothing is
+/// published: playback interrupted by a crash is no judgement, and "unplayed" must never
+/// be published over "played" from here. Otherwise the last polled position is the
+/// newest thing known, so it is published when it differs from the record's (or there
+/// is no record); left unpublished, an older record would overwrite it on the next scan.
+pub fn settle_after_crash(c: &Connection, episode_id: i64) -> Result<()> {
+    let Some((key, value)) = episode_value(c, episode_id)? else { return Ok(()) };
+    let record = get(c, &key)?.and_then(|r| r.value);
+    if let Some(r) = &record {
+        if r.get("status").and_then(Value::as_str) == Some("played") {
+            c.execute("UPDATE episodes SET status = 'played' WHERE id = ?1", [episode_id])?;
+            return Ok(());
+        }
+        if r.get("position_secs") == value.get("position_secs") && r.get("duration_secs") == value.get("duration_secs") {
+            return Ok(());
+        }
+    }
+    record_local(c, &key, Some(value))?;
+    Ok(())
+}
+
 /// Write a null record for the path's episode key (`kind_ep`) or override key.
 /// A no-op when the path is not under a mapped root.
 pub fn tombstone_path(c: &Connection, kind_ep: bool, abs_path: &str) -> Result<()> {

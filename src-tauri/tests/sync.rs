@@ -623,11 +623,19 @@ fn far_future_records_are_refused_and_never_observed() {
     let mut b = Machine::joined(s.path(), "dev-b", &SHOW);
     let ahead = sync::clock::now_ms() + 2 * sync::MAX_AHEAD_MS;
     foreign_file(s.path(), "dev-x", &sync::clock::Stamp { physical_ms: ahead, counter: 0, device: "dev-x".into() }.encode());
+    for _ in 0..2 {
+        // The warning lasts while the file is wrong: the refused file is not cached as seen.
+        b.round();
+        assert_eq!(b.status(SHOW[0]), "unplayed");
+        assert_eq!(b.record(&ep_key(SHOW[0])), None);
+        let err = b.rt.error.clone().expect("refusal reported");
+        assert!(err.contains("a day ahead") && err.contains("name-dev-x"), "{err}");
+    }
+    // Once fixed, the same file is read again and its record lands.
+    foreign_file(s.path(), "dev-x", &sync::clock::Stamp { physical_ms: 1_000, counter: 0, device: "dev-x".into() }.encode());
     b.round();
-    assert_eq!(b.status(SHOW[0]), "unplayed");
-    assert_eq!(b.record(&ep_key(SHOW[0])), None);
-    let err = b.rt.error.clone().expect("refusal reported");
-    assert!(err.contains("a day ahead") && err.contains("name-dev-x"), "{err}");
+    assert_eq!(b.status(SHOW[0]), "played");
+    assert_eq!(b.rt.error, None);
     b.watch(SHOW[1]);
     let stamp = b.record(&ep_key(SHOW[1])).unwrap().stamp;
     assert!(stamp.physical_ms < ahead, "the clock was dragged forward");
@@ -638,10 +646,12 @@ fn records_with_unreadable_stamps_are_reported() {
     let s = share();
     let mut b = Machine::joined(s.path(), "dev-b", &SHOW);
     foreign_file(s.path(), "dev-x", "not-a-stamp");
-    b.round();
-    assert_eq!(b.record(&ep_key(SHOW[0])), None);
-    let err = b.rt.error.clone().expect("bad stamp reported");
-    assert!(err.contains("unreadable stamp"), "{err}");
+    for _ in 0..2 {
+        b.round();
+        assert_eq!(b.record(&ep_key(SHOW[0])), None);
+        let err = b.rt.error.clone().expect("bad stamp reported");
+        assert!(err.contains("unreadable stamp"), "{err}");
+    }
 }
 
 #[test]

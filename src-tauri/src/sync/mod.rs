@@ -174,6 +174,7 @@ fn read(rt: &mut SyncRuntime, cfg: &Config) -> Vec<Record> {
     let (mut bad, mut ahead): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
     let mut out = Vec::new();
     for f in res.files {
+        let id = f.device_id.clone();
         let (mut n_bad, mut n_ahead) = (0, 0);
         for (key, w) in f.records {
             match Stamp::parse(&w.s) {
@@ -188,6 +189,11 @@ fn read(rt: &mut SyncRuntime, cfg: &Config) -> Vec<Record> {
         }
         if n_ahead > 0 {
             ahead.push(format!("{n_ahead} from {}", f.device_name));
+        }
+        // A file with refused records is not cached as seen, so it is read again every
+        // round: the warning lasts until it is fixed, and the fixed file is then merged.
+        if n_bad + n_ahead > 0 {
+            rt.cache.remove(&id);
         }
     }
     if !bad.is_empty() {
@@ -287,7 +293,7 @@ pub fn round(db: &Db, rt: &mut SyncRuntime, force_write: bool) -> Result<RoundOu
 
 /// Join per the spec's "Joining and first run": what the share holds beats a
 /// newcomer's old state. Everything is read and merged first; then local state
-/// is offered (`publish_existing`) and only then is the merged view applied.
+/// is offered (`publish_existing_in`) and only then is the merged view applied.
 /// Applying before publishing would overwrite a more recent local viewing with
 /// the share's older one before it had a chance to compete on its real time.
 pub fn join(db: &Db, rt: &mut SyncRuntime) -> Result<RoundOutcome> {

@@ -941,9 +941,9 @@ impl Db {
         })
     }
 
-    /// After a crash mid-playback, a `playing` row decays to unplayed. Its last polled position
-    /// is the newest thing known about it, so it is published: left unpublished, an older
-    /// record would overwrite it the next time a scan applied records to the file.
+    /// After a crash mid-playback, a `playing` row decays to unplayed, or back to played when
+    /// its synced record says it was watched (R21): a crash must never unwatch an episode on
+    /// every machine. See `sync::store::settle_after_crash` for what is published.
     pub fn reset_playing(&self) -> Result<usize> {
         self.with(|c| {
             let ids: Vec<i64> = {
@@ -952,7 +952,7 @@ impl Db {
             };
             c.execute("UPDATE episodes SET status='unplayed' WHERE status='playing'", [])?;
             for &id in &ids {
-                crate::sync::store::publish_episode(c, id)?;
+                crate::sync::store::settle_after_crash(c, id)?;
             }
             Ok(ids.len())
         })
@@ -2248,11 +2248,48 @@ mod tests {
         sync_on(&db, "/lib", LIB);
         db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/a.mkv", 1, 1)).unwrap();
         let id = only_episode(&db);
+        db.set_position(id, 100.0, Some(1400.0)).unwrap();
+        db.set_status(id, EpisodeStatus::Played).unwrap();
+        db.set_status(id, EpisodeStatus::Unplayed).unwrap();
         db.set_status(id, EpisodeStatus::Playing).unwrap();
         db.set_position(id, 600.0, Some(1400.0)).unwrap();
         assert_eq!(db.reset_playing().unwrap(), 1);
         let v = ep_record(&db, "a.mkv").unwrap().value.unwrap();
         assert_eq!((v["status"].as_str(), v["position_secs"].as_f64()), (Some("unplayed"), Some(600.0)));
+    }
+
+    #[test]
+    fn crash_while_playing_a_watched_episode_keeps_it_watched() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/a.mkv", 1, 1)).unwrap();
+        let id = only_episode(&db);
+        db.set_status(id, EpisodeStatus::Played).unwrap();
+        let (rec, seq) = (ep_record(&db, "a.mkv").unwrap(), db.with(crate::sync::store::max_seq).unwrap());
+        db.set_status(id, EpisodeStatus::Playing).unwrap();
+        db.set_position(id, 300.0, Some(1400.0)).unwrap();
+        assert_eq!(db.reset_playing().unwrap(), 1);
+        let ep = db.get_episode(id).unwrap();
+        assert_eq!((ep.status, ep.position_secs), (EpisodeStatus::Played, 300.0), "watched, local position kept");
+        assert_eq!(ep_record(&db, "a.mkv").unwrap(), rec, "nothing published over the played record");
+        assert_eq!(db.with(crate::sync::store::max_seq).unwrap(), seq);
+    }
+
+    #[test]
+    fn crash_with_an_unchanged_position_publishes_nothing() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/a.mkv", 1, 1)).unwrap();
+        let id = only_episode(&db);
+        db.set_position(id, 100.0, Some(1400.0)).unwrap();
+        db.set_status(id, EpisodeStatus::Played).unwrap();
+        db.set_position(id, 100.0, Some(1400.0)).unwrap();
+        db.set_status(id, EpisodeStatus::Unplayed).unwrap();
+        let rec = ep_record(&db, "a.mkv").unwrap();
+        db.set_status(id, EpisodeStatus::Playing).unwrap();
+        db.set_position(id, 100.0, Some(1400.0)).unwrap();
+        db.reset_playing().unwrap();
+        assert_eq!(ep_record(&db, "a.mkv").unwrap(), rec);
     }
 
     #[test]
