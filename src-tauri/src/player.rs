@@ -523,14 +523,15 @@ pub async fn play_episode(
     player.release();
 
     if !tracked {
-        // Restore the pre-playback state untouched and tell the user why nothing was recorded.
-        let before = db.get_episode(episode_id)?;
-        db.set_status(
+        // Restore the status captured before launch, untouched, and tell the user why nothing
+        // was recorded. Reading it back now would see `playing` and write `unplayed`, which
+        // unwatches a watched episode and, with sync on, publishes that everywhere.
+        db.restore_status(
             episode_id,
-            if before.status == EpisodeStatus::Playing {
+            if ep.status == EpisodeStatus::Playing {
                 EpisodeStatus::Unplayed
             } else {
-                before.status
+                ep.status
             },
         )?;
         let after = db.get_episode(episode_id)?;
@@ -906,6 +907,46 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, AppError::Player(_)));
         first.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn untracked_playback_of_a_watched_episode_keeps_it_watched_and_publishes_nothing() {
+        use crate::sync::{keys::SyncKey, store};
+        fake_mpv("99", "1.0");
+        let (db, id) = seeded();
+        let root = db.add_root("/tmp").unwrap();
+        db.with(|c| {
+            c.execute_batch(
+                "INSERT OR REPLACE INTO settings(key,value) VALUES ('sync_enabled','1'),('sync_device_id','dev-a')",
+            )?;
+            c.execute("INSERT INTO sync_libraries(root_id, library) VALUES (?1, 'Anime')", [root.id])?;
+            Ok(())
+        })
+        .unwrap();
+        db.set_status(id, EpisodeStatus::Played).unwrap();
+        let key = SyncKey::Episode { library: "Anime".into(), relpath: "fake.mkv".into() };
+        let record = || db.with(|c| store::get(c, &key)).unwrap();
+        let (before_ep, before_rec) = (db.get_episode(id).unwrap(), record());
+        assert!(before_rec.is_some(), "positive control: marking watched published");
+        let before_seq = db.with(store::max_seq).unwrap();
+        let _guard = NoSocketGuard::set(PlayerBackend::Mpv);
+        play_episode(
+            db.clone(),
+            Arc::new(Player::new()),
+            id,
+            PlayerBackend::Mpv,
+            &fixture(),
+            |_| {},
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        let ep = db.get_episode(id).unwrap();
+        assert_eq!(ep.status, EpisodeStatus::Played, "watched stays watched");
+        assert_eq!((ep.position_secs, ep.duration_secs, ep.last_played_at),
+            (before_ep.position_secs, before_ep.duration_secs, before_ep.last_played_at));
+        assert_eq!(record(), before_rec, "no new record stamp");
+        assert_eq!(db.with(store::max_seq).unwrap(), before_seq);
     }
 
     #[tokio::test]

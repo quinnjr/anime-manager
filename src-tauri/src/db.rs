@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS rss_feeds (
 // rss_feeds, gated on `v < 7`). This migration must not reuse it: a v7 database would hit the
 // early return above, never add the player-state columns, and break playback with
 // "no such column: player_volume". This is the v7 -> v8 step on top of develop.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// v9 DDL, shared by fresh-schema creation, the version-gated upgrade, and the
 /// unconditional self-heal below — one definition so the three can never drift.
@@ -105,6 +105,16 @@ const TORRENT_BATCHES_DDL: &str =
        show_id INTEGER NOT NULL REFERENCES shows(id) ON DELETE CASCADE,
        season INTEGER NOT NULL, first INTEGER NOT NULL, last INTEGER NOT NULL,
        resolution TEXT, added_at INTEGER NOT NULL);";
+
+/// v10 DDL (library sync), shared like `TORRENT_BATCHES_DDL`: fresh creation, upgrade and
+/// self-heal all run this one definition. `value` is JSON text, NULL for a tombstone; `seq`
+/// rises on every upsert so the poller can spot changes not yet written out.
+const SYNC_DDL: &str =
+    "CREATE TABLE IF NOT EXISTS sync_records (
+       key TEXT PRIMARY KEY, value TEXT, stamp TEXT NOT NULL, seq INTEGER NOT NULL);
+     CREATE TABLE IF NOT EXISTS sync_libraries (
+       root_id INTEGER PRIMARY KEY REFERENCES roots(id) ON DELETE CASCADE,
+       library TEXT NOT NULL UNIQUE);";
 
 /// Bring an existing database up to `SCHEMA_VERSION`. Fresh databases get the current shape
 /// from SCHEMA directly; older ones are altered in place so no user data is lost.
@@ -189,6 +199,8 @@ fn upgrade(conn: &Connection) -> Result<()> {
     // instead of failing every pack pin silently, forever. Idempotent, and
     // single-episode pins are untouched either way.
     conn.execute_batch(TORRENT_BATCHES_DDL)?;
+    // v10 sync tables: additive, so same unconditional self-heal.
+    conn.execute_batch(SYNC_DDL)?;
     // rename_log's foreign key cannot be altered in place; rebuild the table when it still
     // carries the old NOT NULL / ON DELETE CASCADE definition.
     let sql: String = conn
@@ -221,6 +233,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // SCHEMA so fresh installs, upgrades, and the self-heal share one
     // definition that cannot drift.
     conn.execute_batch(TORRENT_BATCHES_DDL)?;
+    conn.execute_batch(SYNC_DDL)?;
     upgrade(conn)?;
     Ok(())
 }
@@ -373,7 +386,24 @@ impl Db {
         })
     }
 
+    /// Write a setting, publishing it (when allow-listed) only if the value actually changed.
+    /// Settings saves every field at once: re-stamping the ones left alone would revert a
+    /// change another machine made to them since the page loaded.
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.with(|c| {
+            let n = c.execute(
+                "INSERT INTO settings(key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE value IS NOT excluded.value",
+                params![key, value])?;
+            if n > 0 {
+                crate::sync::store::publish_setting(c, key)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Write a setting without recording it: applying a remote value must not echo it back out.
+    pub fn set_setting_unpublished(&self, key: &str, value: &str) -> Result<()> {
         self.with(|c| {
             c.execute("INSERT INTO settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 params![key, value])?;
@@ -381,9 +411,12 @@ impl Db {
         })
     }
 
+    /// Delete a setting; a tombstone is published only when a row was actually removed.
     pub fn delete_setting(&self, key: &str) -> Result<()> {
         self.with(|c| {
-            c.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+            if c.execute("DELETE FROM settings WHERE key = ?1", params![key])? > 0 {
+                crate::sync::store::publish_setting(c, key)?;
+            }
             Ok(())
         })
     }
@@ -402,7 +435,9 @@ impl Db {
         f: &crate::scanner::RawFile,
     ) -> Result<Upsert> {
         let path = path_to_str(&f.path)?;
-        self.with(|c| {
+        // One savepoint: the row change, the records applied to it and a carried move
+        // land together, or a failed apply would leave a moved row with no carried record.
+        self.with(|c| crate::sync::store::atomically(c, || {
             c.execute("INSERT OR IGNORE INTO shows(parsed_title, created_at) VALUES (?1, ?2)", params![p.title, now()])?;
             let show_id: i64 = c.query_row("SELECT id FROM shows WHERE parsed_title = ?1", params![p.title], |r| r.get(0))?;
             c.execute("INSERT OR IGNORE INTO seasons(show_id, number) VALUES (?1, ?2)", params![show_id, p.season])?;
@@ -425,6 +460,8 @@ impl Db {
 
             match existing {
                 Some(id) => {
+                    let old_path: String =
+                        c.query_row("SELECT path FROM episodes WHERE id = ?1", params![id], |r| r.get(0))?;
                     // A file that comes back is restored to whatever the user had judged it to be,
                     // never blanket-reset to unplayed; 'playing' is a runtime state, so it decays.
                     c.execute(
@@ -432,16 +469,26 @@ impl Db {
                          status = CASE WHEN status='missing' THEN {REVIVE_MISSING_SQL} ELSE status END,
                          prev_status = NULL WHERE id=?1"),
                         params![id, season_id, p.episode, path, f.size as i64, f.mtime, p.release_group, p.resolution, p.crc])?;
+                    // An incoming record for this path lands first, so a move publishes the merged state.
+                    crate::sync::apply::apply_for_episode(c, id)?;
+                    // A scan-detected move: the new path carries the state under the old
+                    // record's stamp. The old path's record is left alone, since another
+                    // machine may still have the file there.
+                    if old_path != path {
+                        crate::sync::store::carry_moved_episode(c, id, &old_path)?;
+                    }
                     Ok(Upsert::Updated)
                 }
                 None => {
                     c.execute(
                         "INSERT INTO episodes(season_id, number, path, size, mtime, release_group, resolution, crc) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                         params![season_id, p.episode, path, f.size as i64, f.mtime, p.release_group, p.resolution, p.crc])?;
+                    // A file watched on another machine arrives watched, with its show's match and pins.
+                    crate::sync::apply::apply_for_episode(c, c.last_insert_rowid())?;
                     Ok(Upsert::Added)
                 }
             }
-        })
+        }))
     }
 
     /// Record that a path exists on disk but is not readable yet: an incomplete download at
@@ -512,7 +559,7 @@ impl Db {
                  ON CONFLICT(path) DO UPDATE SET title=excluded.title, season=excluded.season, number=excluded.number,
                  kind=excluded.kind, source=excluded.source, created_at=excluded.created_at",
                 params![o.path, o.title, o.season, o.number, o.kind, o.source, now()])?;
-            Ok(())
+            crate::sync::store::publish_override(c, &o.path)
         })
     }
 
@@ -528,10 +575,18 @@ impl Db {
     /// library and strands renamed files.
     pub fn clear_overrides(&self, source: &str) -> Result<usize> {
         self.with(|c| {
-            Ok(c.execute(
+            let paths: Vec<String> = {
+                let mut st = c.prepare("SELECT path FROM parse_overrides WHERE source = ?1")?;
+                st.query_map(params![source], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
+            };
+            let n = c.execute(
                 "DELETE FROM parse_overrides WHERE source = ?1",
                 params![source],
-            )?)
+            )?;
+            for p in &paths {
+                crate::sync::store::publish_override(c, p)?;
+            }
+            Ok(n)
         })
     }
 
@@ -583,10 +638,13 @@ impl Db {
                 .map(str::trim)
                 .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case(title))
             {
-                c.execute(
+                let named = c.execute(
                     "UPDATE seasons SET title = ?2 WHERE id = ?1 AND title IS NULL",
                     params![season_id, st],
                 )?;
+                if named > 0 {
+                    crate::sync::store::publish_season_title(c, show_id, season)?;
+                }
             }
             c.execute(
                 "UPDATE episodes SET season_id = ?2, number = ?3 WHERE id = ?1",
@@ -785,12 +843,36 @@ impl Db {
         })
     }
 
+    /// Set an episode's status. Setting the status it already has leaves the row alone, so
+    /// re-marking a watched episode neither rewinds it nor re-stamps its synced record (a fresh
+    /// stamp for an unchanged judgement could beat a real change made on another machine).
     pub fn set_status(&self, id: i64, status: EpisodeStatus) -> Result<()> {
         self.with(|c| {
-            let reset_pos = status == EpisodeStatus::Played;
-            c.execute("UPDATE episodes SET status=?2, position_secs = CASE WHEN ?3 THEN 0 ELSE position_secs END WHERE id=?1",
-                params![id, status.as_str(), reset_pos])?;
+            let old: Option<String> =
+                c.query_row("SELECT status FROM episodes WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
+            if old.as_deref() != Some(status.as_str()) {
+                let reset_pos = status == EpisodeStatus::Played;
+                c.execute("UPDATE episodes SET status=?2, position_secs = CASE WHEN ?3 THEN 0 ELSE position_secs END,
+                           last_played_at = CASE WHEN ?3 THEN ?4 ELSE last_played_at END WHERE id=?1",
+                    params![id, status.as_str(), reset_pos, now()])?;
+            }
+            // Publishes only when the value differs from the stored record (a playback exit's
+            // position, say), never an unchanged one.
+            if matches!(status, EpisodeStatus::Played | EpisodeStatus::Unplayed) {
+                crate::sync::store::publish_episode(c, id)?;
+            }
             Ok(())
+        })
+    }
+
+    /// Put back the status an episode had before a playback that recorded nothing. Position
+    /// and timestamps are untouched and nothing is published: the synced record never saw
+    /// `playing`. A record that arrived while it played (apply skips a playing row) lands now.
+    pub fn restore_status(&self, id: i64, status: EpisodeStatus) -> Result<()> {
+        self.with(|c| {
+            c.execute("UPDATE episodes SET status = ?2 WHERE id = ?1 AND status = 'playing'",
+                params![id, status.as_str()])?;
+            crate::sync::apply::apply_for_episode(c, id)
         })
     }
 
@@ -859,12 +941,20 @@ impl Db {
         })
     }
 
+    /// After a crash mid-playback, a `playing` row decays to unplayed, or back to played when
+    /// its synced record says it was watched (R21): a crash must never unwatch an episode on
+    /// every machine. See `sync::store::settle_after_crash` for what is published.
     pub fn reset_playing(&self) -> Result<usize> {
         self.with(|c| {
-            Ok(c.execute(
-                "UPDATE episodes SET status='unplayed' WHERE status='playing'",
-                [],
-            )?)
+            let ids: Vec<i64> = {
+                let mut st = c.prepare("SELECT id FROM episodes WHERE status = 'playing'")?;
+                st.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
+            };
+            c.execute("UPDATE episodes SET status='unplayed' WHERE status='playing'", [])?;
+            for &id in &ids {
+                crate::sync::store::settle_after_crash(c, id)?;
+            }
+            Ok(ids.len())
         })
     }
 
@@ -907,7 +997,7 @@ impl Db {
                     hit.episodes
                 ],
             )?;
-            Ok(())
+            crate::sync::store::publish_show_match(c, show_id)
         })
     }
 
@@ -915,7 +1005,7 @@ impl Db {
     pub fn clear_anilist(&self, show_id: i64) -> Result<()> {
         self.with(|c| {
             c.execute("UPDATE shows SET anilist_id=NULL, canonical_title=NULL, cover_url=NULL, cover_path=NULL, total_episodes=NULL, anilist_cleared=1, match_source=NULL WHERE id=?1", params![show_id])?;
-            Ok(())
+            crate::sync::store::publish_show_match(c, show_id)
         })
     }
 
@@ -937,7 +1027,7 @@ impl Db {
                 "UPDATE shows SET user_title_override = ?2 WHERE id = ?1",
                 params![show_id, t],
             )?;
-            Ok(())
+            crate::sync::store::publish_show_title_override(c, show_id)
         })
     }
 
@@ -976,8 +1066,15 @@ impl Db {
     /// splitting its watched state. Once both have been matched to the same provider entry the
     /// app already knows they are the same thing, so no model is needed to say so.
     ///
-    /// The survivor is the row carrying the most episodes, so the smaller row's episodes move the
-    /// shorter distance; a title the user set by hand always wins, and any artwork or metadata
+    /// The survivor must be the same row on every synced machine, or two machines with different
+    /// episode counts fold in opposite directions and undo each other forever. Once any `merge`
+    /// pin names a title in the group, a fold has already been decided somewhere: the survivor is
+    /// the title most pinned, ties broken on `parsed_title`, and local episode counts no longer
+    /// count, since they differ per machine and two machines that folded opposite ways before
+    /// reading each other would otherwise keep re-pinning in opposite directions. Only a group
+    /// nobody has folded yet prefers the row carrying the most episodes (the smaller row's
+    /// episodes move the shorter distance), then `parsed_title`, which unlike a row id is the
+    /// same everywhere. A title the user set by hand always wins, and any artwork or metadata
     /// only the loser had is carried over rather than dropped. Returns how many rows were folded away.
     pub fn merge_duplicate_shows(&self) -> Result<usize> {
         self.with(|c| {
@@ -992,16 +1089,49 @@ impl Db {
 
             let mut folded = 0usize;
             for (source, ext_id) in groups {
-                let ids: Vec<i64> = {
+                // (id, parsed_title, merge pins naming it, episodes)
+                let mut rows: Vec<(i64, String, i64, i64)> = {
                     let mut st = tx.prepare(
-                        "SELECT s.id FROM shows s WHERE s.match_source = ?1 AND s.anilist_id = ?2
-                         ORDER BY (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id = se.id
-                                   WHERE se.show_id = s.id) DESC, s.id ASC")?;
-                    st.query_map(params![source, ext_id], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
+                        "SELECT s.id, s.parsed_title,
+                                (SELECT COUNT(*) FROM parse_overrides po
+                                 WHERE po.source = 'merge' AND po.title = s.parsed_title),
+                                (SELECT COUNT(*) FROM episodes e JOIN seasons se ON e.season_id = se.id
+                                 WHERE se.show_id = s.id)
+                         FROM shows s WHERE s.match_source = ?1 AND s.anilist_id = ?2")?;
+                    st.query_map(params![source, ext_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                        .collect::<std::result::Result<_, _>>()?
                 };
+                if rows.iter().any(|r| r.2 > 0) {
+                    rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+                } else {
+                    rows.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.1.cmp(&b.1)));
+                }
+                let ids: Vec<i64> = rows.into_iter().map(|r| r.0).collect();
                 let Some((&keep, losers)) = ids.split_first() else { continue };
 
+                // The survivor's (title override, (canonical title, cover url, total episodes)).
+                type Carried = (Option<String>, (Option<String>, Option<String>, Option<i64>));
                 for &loser in losers {
+                    let carried = |tx: &Connection| -> Result<Carried> {
+                        Ok(tx.query_row(
+                            "SELECT user_title_override, canonical_title, cover_url, total_episodes FROM shows WHERE id = ?1",
+                            params![keep],
+                            |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?)
+                    };
+                    let column = |tx: &Connection, sql: &str| -> Result<Vec<String>> {
+                        let mut st = tx.prepare(sql)?;
+                        Ok(st.query_map(params![loser], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?)
+                    };
+                    // What the loser hands over, read before it moves: only these records change.
+                    let loser_links = column(&tx, "SELECT info_hash FROM torrent_links WHERE show_id = ?1")?;
+                    let loser_batches = column(&tx, "SELECT info_hash FROM torrent_batches WHERE show_id = ?1")?;
+                    let loser_feeds = column(&tx, "SELECT label FROM rss_feeds WHERE show_id = ?1")?;
+                    let keep_before = carried(&tx)?;
+                    let moved: Vec<String> = {
+                        let mut st = tx.prepare(
+                            "SELECT e.path FROM episodes e JOIN seasons se ON e.season_id = se.id WHERE se.show_id = ?1")?;
+                        st.query_map(params![loser], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
+                    };
                     // Pin every moved file to the survivor's title before it moves. Without this
                     // the fold lasts until the next scan: the files still parse to the folded
                     // row's title, `upsert_episode` recreates that row and the episodes walk back
@@ -1017,6 +1147,9 @@ impl Db {
                          WHERE se.show_id = ?2
                          ON CONFLICT(path) DO UPDATE SET title = excluded.title, source = 'merge'",
                         params![keep, loser, now()])?;
+                    for path in &moved {
+                        crate::sync::store::publish_override(&tx, path)?;
+                    }
                     // Seasons are UNIQUE(show_id, number), so episodes move season by season into
                     // the survivor's season of the same number rather than the season row moving.
                     let numbers: Vec<i64> = {
@@ -1052,7 +1185,7 @@ impl Db {
                     tx.execute("UPDATE OR IGNORE torrent_batches SET show_id = ?1 WHERE show_id = ?2",
                         params![keep, loser])?;
                     tx.execute("DELETE FROM torrent_batches WHERE show_id = ?1", params![loser])?;
-                    tx.execute(
+                    let prefs_copied = tx.execute(
                         "INSERT OR IGNORE INTO torrent_prefs(show_id, save_path, category)
                          SELECT ?1, save_path, category FROM torrent_prefs WHERE show_id = ?2",
                         params![keep, loser])?;
@@ -1072,6 +1205,17 @@ impl Db {
                         params![keep, loser])?;
                     tx.execute("DELETE FROM shows WHERE id = ?1", params![loser])?;
                     folded += 1;
+                    // Re-record only what the fold changed on the survivor. A tombstone or an
+                    // untouched value here would carry this machine's silence over a decision
+                    // another device made.
+                    use crate::sync::store;
+                    for h in &loser_links { store::publish_torrent_link(&tx, h)?; }
+                    for h in &loser_batches { store::publish_torrent_batch(&tx, h)?; }
+                    for l in &loser_feeds { store::publish_rss(&tx, l)?; }
+                    if prefs_copied > 0 { store::publish_prefs(&tx, keep)?; }
+                    let keep_after = carried(&tx)?;
+                    if keep_after.0 != keep_before.0 { store::publish_show_title_override(&tx, keep)?; }
+                    if keep_after.1 != keep_before.1 { store::publish_show_match(&tx, keep)?; }
                 }
             }
             tx.commit()?;
@@ -1148,7 +1292,16 @@ impl Db {
 
     pub fn update_episode_path(&self, id: i64, path: &str) -> Result<()> {
         self.with(|c| {
+            let old: Option<String> =
+                c.query_row("SELECT path FROM episodes WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
             c.execute("UPDATE episodes SET path=?2 WHERE id=?1", params![id, path])?;
+            if let Some(old) = old.filter(|o| o != path) {
+                // A playing or missing row has no value of its own to publish; the judgement
+                // its old record holds moves to the new path instead of being dropped.
+                crate::sync::store::move_episode_record(c, id, &old, path)?;
+            } else {
+                crate::sync::store::publish_episode(c, id)?;
+            }
             Ok(())
         })
     }
@@ -1157,14 +1310,21 @@ impl Db {
     /// (and does not linger on the old path, where it would capture an unrelated future file).
     pub fn move_override(&self, old_path: &str, new_path: &str) -> Result<()> {
         self.with(|c| {
-            c.execute(
+            let replaced = c.execute(
                 "DELETE FROM parse_overrides WHERE path = ?1",
                 params![new_path],
             )?;
-            c.execute(
+            let moved = c.execute(
                 "UPDATE parse_overrides SET path = ?2 WHERE path = ?1",
                 params![old_path, new_path],
             )?;
+            // Only a path whose override row changed has anything to publish.
+            if moved > 0 {
+                crate::sync::store::publish_override(c, old_path)?;
+            }
+            if moved > 0 || replaced > 0 {
+                crate::sync::store::publish_override(c, new_path)?;
+            }
             Ok(())
         })
     }
@@ -1224,7 +1384,7 @@ impl Db {
         self.with(|c| {
             c.execute("INSERT OR REPLACE INTO torrent_links(info_hash, show_id, season, number, added_at) VALUES (?1,?2,?3,?4,?5)",
                 params![info_hash, link.show_id, link.season, link.number, link.added_at])?;
-            Ok(())
+            crate::sync::store::publish_torrent_link(c, &info_hash)
         })
     }
 
@@ -1241,7 +1401,10 @@ impl Db {
     pub fn remove_torrent_link(&self, info_hash: &str) -> Result<()> {
         let info_hash = normalize_hash(info_hash);
         self.with(|c| {
-            c.execute("DELETE FROM torrent_links WHERE info_hash = ?1", params![info_hash])?;
+            // Only a row that existed has anything to retract.
+            if c.execute("DELETE FROM torrent_links WHERE info_hash = ?1", params![info_hash])? > 0 {
+                crate::sync::store::publish_torrent_link(c, &info_hash)?;
+            }
             Ok(())
         })
     }
@@ -1253,7 +1416,7 @@ impl Db {
         self.with(|c| {
             c.execute("INSERT OR REPLACE INTO torrent_batches(info_hash, show_id, season, first, last, resolution, added_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
                 params![info_hash, batch.show_id, batch.season, batch.first, batch.last, batch.resolution, batch.added_at])?;
-            Ok(())
+            crate::sync::store::publish_torrent_batch(c, &info_hash)
         })
     }
 
@@ -1269,7 +1432,10 @@ impl Db {
     pub fn remove_batch_link(&self, info_hash: &str) -> Result<()> {
         let info_hash = normalize_hash(info_hash);
         self.with(|c| {
-            c.execute("DELETE FROM torrent_batches WHERE info_hash = ?1", params![info_hash])?;
+            // Only a row that existed has anything to retract.
+            if c.execute("DELETE FROM torrent_batches WHERE info_hash = ?1", params![info_hash])? > 0 {
+                crate::sync::store::publish_torrent_batch(c, &info_hash)?;
+            }
             Ok(())
         })
     }
@@ -1299,7 +1465,7 @@ impl Db {
         self.with(|c| {
             c.execute("INSERT OR REPLACE INTO torrent_prefs(show_id, save_path, category) VALUES (?1,?2,?3)",
                 params![show_id, save_path, category])?;
-            Ok(())
+            crate::sync::store::publish_prefs(c, show_id)
         })
     }
 
@@ -1309,7 +1475,7 @@ impl Db {
         self.with(|c| {
             c.execute("INSERT OR REPLACE INTO rss_feeds(label, show_id, added_at) VALUES (?1,?2,?3)",
                 params![label, show_id, now()])?;
-            Ok(())
+            crate::sync::store::publish_rss(c, label)
         })
     }
 
@@ -1320,7 +1486,10 @@ impl Db {
 
     pub fn remove_rss_feed(&self, label: &str) -> Result<()> {
         self.with(|c| {
-            c.execute("DELETE FROM rss_feeds WHERE label = ?1", params![label])?;
+            // Only a row that existed has anything to retract.
+            if c.execute("DELETE FROM rss_feeds WHERE label = ?1", params![label])? > 0 {
+                crate::sync::store::publish_rss(c, label)?;
+            }
             Ok(())
         })
     }
@@ -1562,7 +1731,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(volume, 12.5, "the pre-existing column's data must survive");
-        assert_eq!(version, 9);
+        assert_eq!(version, SCHEMA_VERSION);
         conn.prepare(
             "SELECT player_volume, window_width, window_height, window_maximized, window_fullscreen FROM shows",
         )
@@ -1651,6 +1820,562 @@ mod tests {
             dirs: vec![],
         }
     }
+    fn sync_on(db: &Db, root: &str, library: &str) {
+        let r = db.add_root(root).unwrap();
+        db.with(|c| {
+            c.execute_batch(
+                "INSERT OR REPLACE INTO settings(key,value) VALUES ('sync_enabled','1'),('sync_device_id','dev-a')",
+            )?;
+            c.execute("INSERT INTO sync_libraries(root_id, library) VALUES (?1, ?2)", params![r.id, library])?;
+            Ok(())
+        })
+        .unwrap();
+    }
+    /// The library every sync test maps its root to.
+    const LIB: &str = "Anime";
+    fn ep_key(path_rel: &str) -> crate::sync::keys::SyncKey {
+        crate::sync::keys::SyncKey::Episode { library: LIB.into(), relpath: path_rel.into() }
+    }
+    fn ep_record(db: &Db, rel: &str) -> Option<crate::sync::store::Record> {
+        db.with(|c| crate::sync::store::get(c, &ep_key(rel))).unwrap()
+    }
+    fn only_episode(db: &Db) -> i64 {
+        db.with(|c| Ok(c.query_row("SELECT id FROM episodes", [], |r| r.get(0))?)).unwrap()
+    }
+
+    fn sid(db: &Db, title: &str) -> i64 {
+        db.with(|c| Ok(c.query_row("SELECT id FROM shows WHERE parsed_title = ?1", [title], |r| r.get(0))?)).unwrap()
+    }
+    fn seed_show(db: &Db) {
+        db.upsert_episode(&pn("Show", 1, 1), &rf("/lib/Show/a.mkv", 1, 1)).unwrap();
+    }
+    fn hit(id: i64) -> MetadataHit {
+        MetadataHit { id, source: "anilist".into(), title_romaji: "Show R".into(), title_english: None, cover_url: None, episodes: Some(12) }
+    }
+    fn ov(path: &str, source: &str) -> ParseOverride {
+        ParseOverride { path: path.into(), title: "Show".into(), season: 1, number: 1, kind: "episode".into(), source: source.into() }
+    }
+    fn link(db: &Db, hash: &str) -> TorrentLink {
+        TorrentLink { info_hash: hash.into(), show_id: sid(db, "Show"), season: 1, number: 2, added_at: 0 }
+    }
+    fn batch(db: &Db, hash: &str) -> TorrentBatch {
+        TorrentBatch { info_hash: hash.into(), show_id: sid(db, "Show"), season: 1, first: 1, last: 12, resolution: Some("1080p".into()), added_at: 0 }
+    }
+    fn seq_of(db: &Db, key: &crate::sync::keys::SyncKey) -> Option<i64> {
+        db.with(|c| Ok(c.query_row("SELECT seq FROM sync_records WHERE key = ?1", [key.encode()], |r| r.get(0)).optional()?)).unwrap()
+    }
+
+    #[test]
+    fn every_synced_write_publishes() {
+        use crate::sync::keys::SyncKey as K;
+        type Case = (&'static str, fn(&Db), fn(&Db), K, bool);
+        let ovk = |rel: &str| K::Override { library: LIB.into(), relpath: rel.into() };
+        let cases: Vec<Case> = vec![
+            ("set_override", |_| {}, |d| d.set_override(&ov("/lib/Show/a.mkv", "llm")).unwrap(), ovk("Show/a.mkv"), false),
+            ("move_override new", |d| d.set_override(&ov("/lib/Show/a.mkv", "llm")).unwrap(),
+                |d| d.move_override("/lib/Show/a.mkv", "/lib/Show/b.mkv").unwrap(), ovk("Show/b.mkv"), false),
+            ("move_override old", |d| d.set_override(&ov("/lib/Show/a.mkv", "llm")).unwrap(),
+                |d| d.move_override("/lib/Show/a.mkv", "/lib/Show/b.mkv").unwrap(), ovk("Show/a.mkv"), true),
+            ("clear_overrides", |d| d.set_override(&ov("/lib/Show/a.mkv", "llm")).unwrap(),
+                |d| { d.clear_overrides("llm").unwrap(); }, ovk("Show/a.mkv"), true),
+            ("reassign_episode season title", seed_show,
+                |d| { d.reassign_episode("/lib/Show/a.mkv", "Show", 2, 1, Some("Show G")).unwrap(); },
+                K::SeasonTitle { title: "Show".into(), season: 2 }, false),
+            ("merge_duplicate_shows override", |d| {
+                    d.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/Alpha/a.mkv", 1, 1)).unwrap();
+                    d.upsert_episode(&pn("Beta", 1, 1), &rf("/lib/Beta/b.mkv", 1, 1)).unwrap();
+                    d.set_anilist(sid(d, "Alpha"), &hit(7)).unwrap();
+                    d.set_anilist(sid(d, "Beta"), &hit(7)).unwrap();
+                }, |d| { d.merge_duplicate_shows().unwrap(); }, ovk("Beta/b.mkv"), false),
+            ("merge_duplicate_shows survivor", |d| {
+                    d.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/Alpha/a.mkv", 1, 1)).unwrap();
+                    d.upsert_episode(&pn("Beta", 1, 1), &rf("/lib/Beta/b.mkv", 1, 1)).unwrap();
+                    d.set_anilist(sid(d, "Alpha"), &hit(7)).unwrap();
+                    d.set_anilist(sid(d, "Beta"), &hit(7)).unwrap();
+                    d.set_title_override(sid(d, "Beta"), Some("Mine")).unwrap();
+                }, |d| { d.merge_duplicate_shows().unwrap(); }, K::ShowTitleOverride { title: "Alpha".into() }, false),
+            ("set_anilist", seed_show, |d| d.set_anilist(sid(d, "Show"), &hit(7)).unwrap(),
+                K::ShowMatch { title: "Show".into() }, false),
+            ("clear_anilist", seed_show, |d| d.clear_anilist(sid(d, "Show")).unwrap(),
+                K::ShowMatch { title: "Show".into() }, false),
+            ("set_title_override", seed_show, |d| d.set_title_override(sid(d, "Show"), Some("Mine")).unwrap(),
+                K::ShowTitleOverride { title: "Show".into() }, false),
+            ("clear title override", |d| { seed_show(d); d.set_title_override(sid(d, "Show"), Some("Mine")).unwrap() },
+                |d| d.set_title_override(sid(d, "Show"), None).unwrap(), K::ShowTitleOverride { title: "Show".into() }, true),
+            ("add_torrent_link", seed_show, |d| d.add_torrent_link(&link(d, "abc")).unwrap(),
+                K::TorrentLink { info_hash: "abc".into() }, false),
+            ("remove_torrent_link", |d| { seed_show(d); d.add_torrent_link(&link(d, "abc")).unwrap() },
+                |d| d.remove_torrent_link("ABC").unwrap(), K::TorrentLink { info_hash: "abc".into() }, true),
+            ("add_batch_link", seed_show, |d| d.add_batch_link(&batch(d, "abc")).unwrap(),
+                K::TorrentBatch { info_hash: "abc".into() }, false),
+            ("remove_batch_link", |d| { seed_show(d); d.add_batch_link(&batch(d, "abc")).unwrap() },
+                |d| d.remove_batch_link("abc").unwrap(), K::TorrentBatch { info_hash: "abc".into() }, true),
+            ("set_prefs", seed_show, |d| d.set_prefs(sid(d, "Show"), Some("/tv"), Some("anime")).unwrap(),
+                K::TorrentPrefs { title: "Show".into() }, false),
+            ("add_rss_feed", seed_show, |d| d.add_rss_feed("animemgr:Show", sid(d, "Show")).unwrap(),
+                K::Rss { label: "animemgr:Show".into() }, false),
+            ("remove_rss_feed", |d| { seed_show(d); d.add_rss_feed("animemgr:Show", sid(d, "Show")).unwrap() },
+                |d| d.remove_rss_feed("animemgr:Show").unwrap(), K::Rss { label: "animemgr:Show".into() }, true),
+            ("set_setting", |_| {}, |d| d.set_setting("played_threshold", "0.8").unwrap(),
+                K::Setting { name: "played_threshold".into() }, false),
+            ("delete_setting", |d| d.set_setting("llm_model", "m").unwrap(),
+                |d| d.delete_setting("llm_model").unwrap(), K::Setting { name: "llm_model".into() }, true),
+        ];
+        for (name, prep, write, key, tombstone) in cases {
+            let db = Db::open_memory().unwrap();
+            sync_on(&db, "/lib", LIB);
+            prep(&db);
+            let before = db.with(crate::sync::store::max_seq).unwrap();
+            write(&db);
+            let seq = seq_of(&db, &key).unwrap_or_else(|| panic!("{name}: no record for {key:?}"));
+            assert!(seq > before, "{name}: record was not written by the write");
+            let rec = db.with(|c| crate::sync::store::get(c, &key)).unwrap().unwrap();
+            assert_eq!(rec.value.is_none(), tombstone, "{name}: {:?}", rec.value);
+        }
+    }
+
+    #[test]
+    fn show_records_use_parsed_title_and_clear_is_non_null() {
+        use crate::sync::keys::SyncKey as K;
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        seed_show(&db);
+        let id = sid(&db, "Show");
+        db.set_anilist(id, &hit(7)).unwrap();
+        db.set_title_override(id, Some("Mine")).unwrap();
+        let get = |k: K| db.with(|c| crate::sync::store::get(c, &k)).unwrap().unwrap().value;
+        let m = get(K::ShowMatch { title: "Show".into() }).unwrap();
+        assert_eq!(m["match_source"], "anilist");
+        assert_eq!(m["anilist_id"], 7);
+        assert_eq!(m["canonical_title"], "Show R");
+        assert_eq!(m["anilist_cleared"], 0);
+        assert_eq!(get(K::ShowTitleOverride { title: "Show".into() }), Some(serde_json::json!("Mine")));
+        db.clear_anilist(id).unwrap();
+        let m = get(K::ShowMatch { title: "Show".into() }).unwrap();
+        assert_eq!(m["anilist_cleared"], 1);
+        assert!(m["match_source"].is_null());
+    }
+
+    #[test]
+    fn match_and_title_override_publish_independently() {
+        use crate::sync::keys::SyncKey as K;
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        seed_show(&db);
+        let id = sid(&db, "Show");
+        db.set_anilist(id, &hit(7)).unwrap();
+        db.clear_anilist(id).unwrap();
+        assert_eq!(seq_of(&db, &K::ShowTitleOverride { title: "Show".into() }), None);
+        db.set_title_override(id, Some("Mine")).unwrap();
+        let before = seq_of(&db, &K::ShowMatch { title: "Show".into() });
+        db.set_title_override(id, None).unwrap();
+        assert_eq!(seq_of(&db, &K::ShowMatch { title: "Show".into() }), before);
+    }
+
+    fn fold_pair(db: &Db) {
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/Alpha/a.mkv", 1, 1)).unwrap();
+        db.upsert_episode(&pn("Beta", 1, 1), &rf("/lib/Beta/b.mkv", 1, 1)).unwrap();
+        db.set_anilist(sid(db, "Alpha"), &hit(7)).unwrap();
+        db.set_anilist(sid(db, "Beta"), &hit(7)).unwrap();
+    }
+
+    #[test]
+    fn fold_prefers_title_already_pinned() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("K", 1, 1), &rf("/lib/K/1.mkv", 1, 1)).unwrap();
+        db.upsert_episode(&pn("K", 1, 2), &rf("/lib/K/2.mkv", 1, 1)).unwrap();
+        for n in 1..=5 {
+            db.upsert_episode(&pn("L", 1, n), &rf(&format!("/lib/L/{n}.mkv"), 1, 1)).unwrap();
+        }
+        db.set_anilist(sid(&db, "K"), &hit(7)).unwrap();
+        db.set_anilist(sid(&db, "L"), &hit(7)).unwrap();
+        // Another machine already folded a path into K, so K is the title everyone converges on.
+        db.set_override(&ParseOverride { title: "K".into(), ..ov("/lib/Elsewhere/x.mkv", "merge") }).unwrap();
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+        assert!(db.get_show(sid(&db, "K")).is_ok());
+        let left: i64 = db.with(|c| Ok(c.query_row("SELECT COUNT(*) FROM shows WHERE parsed_title = 'L'", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(left, 0, "the fuller row is the one folded away");
+    }
+
+    #[test]
+    fn fold_ignores_episode_counts_once_a_merge_pin_exists() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/Alpha/1.mkv", 1, 1)).unwrap();
+        for n in 1..=5 {
+            db.upsert_episode(&pn("Beta", 1, n), &rf(&format!("/lib/Beta/{n}.mkv"), 1, 1)).unwrap();
+        }
+        db.set_anilist(sid(&db, "Alpha"), &hit(7)).unwrap();
+        db.set_anilist(sid(&db, "Beta"), &hit(7)).unwrap();
+        // Two machines folded opposite ways: one pin each, so the pins tie and the title decides.
+        db.set_override(&ParseOverride { title: "Alpha".into(), ..ov("/lib/Elsewhere/a.mkv", "merge") }).unwrap();
+        db.set_override(&ParseOverride { title: "Beta".into(), ..ov("/lib/Elsewhere/b.mkv", "merge") }).unwrap();
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+        let left: Vec<String> = db.with(|c| {
+            let mut st = c.prepare("SELECT parsed_title FROM shows")?;
+            Ok(st.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?)
+        }).unwrap();
+        assert_eq!(left, vec!["Alpha".to_string()], "the fuller row must not win once pins exist");
+    }
+
+    #[test]
+    fn fold_tie_breaks_on_parsed_title() {
+        let db = Db::open_memory().unwrap();
+        // Zulu gets the lower row id, so the old `s.id ASC` tie-break would keep it.
+        db.upsert_episode(&pn("Zulu", 1, 1), &rf("/lib/Zulu/z.mkv", 1, 1)).unwrap();
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/Alpha/a.mkv", 1, 1)).unwrap();
+        db.set_anilist(sid(&db, "Zulu"), &hit(7)).unwrap();
+        db.set_anilist(sid(&db, "Alpha"), &hit(7)).unwrap();
+        assert!(sid(&db, "Zulu") < sid(&db, "Alpha"));
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+        let titles: Vec<String> = db.with(|c| {
+            let mut st = c.prepare("SELECT parsed_title FROM shows")?;
+            Ok(st.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?)
+        }).unwrap();
+        assert_eq!(titles, vec!["Alpha".to_string()]);
+    }
+
+    #[test]
+    fn fold_publishes_the_moved_override_with_the_survivors_title() {
+        use crate::sync::keys::SyncKey as K;
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        fold_pair(&db);
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+        let rec = db.with(|c| crate::sync::store::get(c, &K::Override { library: "Anime".into(), relpath: "Beta/b.mkv".into() }))
+            .unwrap().unwrap();
+        assert_eq!(rec.value.unwrap()["title"], "Alpha");
+    }
+
+    #[test]
+    fn fold_publishes_no_tombstone_for_state_it_did_not_remove() {
+        use crate::sync::keys::SyncKey as K;
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        fold_pair(&db);
+        assert_eq!(db.merge_duplicate_shows().unwrap(), 1);
+        for k in [K::TorrentPrefs { title: "Alpha".into() }, K::ShowTitleOverride { title: "Alpha".into() }] {
+            assert_eq!(seq_of(&db, &k), None, "{k:?}");
+        }
+    }
+
+    #[test]
+    fn fold_publishes_a_carried_over_title_override_and_prefs() {
+        use crate::sync::keys::SyncKey as K;
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        fold_pair(&db);
+        let beta = sid(&db, "Beta");
+        db.set_title_override(beta, Some("Mine")).unwrap();
+        db.set_prefs(beta, Some("/tv"), Some("anime")).unwrap();
+        db.merge_duplicate_shows().unwrap();
+        let get = |k: K| db.with(|c| crate::sync::store::get(c, &k)).unwrap().unwrap().value;
+        assert_eq!(get(K::ShowTitleOverride { title: "Alpha".into() }), Some(serde_json::json!("Mine")));
+        assert_eq!(get(K::TorrentPrefs { title: "Alpha".into() }).unwrap()["save_path"], "/tv");
+    }
+
+    #[test]
+    fn season_title_published_only_when_written() {
+        use crate::sync::keys::SyncKey as K;
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        seed_show(&db);
+        let key = K::SeasonTitle { title: "Show".into(), season: 2 };
+        db.reassign_episode("/lib/Show/a.mkv", "Show", 2, 1, Some("Show G")).unwrap();
+        let first = seq_of(&db, &key).unwrap();
+        db.reassign_episode("/lib/Show/a.mkv", "Show", 2, 1, Some("Other")).unwrap();
+        assert_eq!(seq_of(&db, &key), Some(first));
+        db.reassign_episode("/lib/Show/a.mkv", "Show", 3, 1, None).unwrap();
+        assert_eq!(seq_of(&db, &K::SeasonTitle { title: "Show".into(), season: 3 }), None);
+    }
+
+    #[test]
+    fn secrets_and_flags_never_published() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        for k in ["llm_api_key", "torrent_password", "llm_test_ok", "torrent_test_ok", "mpv_path", "torrent_path_map"] {
+            db.set_setting(k, "x").unwrap();
+            db.delete_setting(k).unwrap();
+        }
+        db.set_setting_unpublished("played_threshold", "0.7").unwrap();
+        let n: i64 = db.with(|c| Ok(c.query_row("SELECT COUNT(*) FROM sync_records", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(n, 0);
+        db.set_setting("played_threshold", "0.8").unwrap();
+        assert!(seq_of(&db, &crate::sync::keys::SyncKey::Setting { name: "played_threshold".into() }).is_some(),
+            "positive control: an allow-listed setting does publish");
+    }
+
+    #[test]
+    fn unmapped_override_path_publishes_nothing() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        db.set_override(&ov("/elsewhere/a.mkv", "llm")).unwrap();
+        let n: i64 = db.with(|c| Ok(c.query_row("SELECT COUNT(*) FROM sync_records", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(n, 0);
+        db.set_override(&ov("/lib/a.mkv", "llm")).unwrap();
+        let n: i64 = db.with(|c| Ok(c.query_row("SELECT COUNT(*) FROM sync_records", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(n, 1, "positive control: a mapped path does publish");
+    }
+
+    #[test]
+    fn set_status_publishes_played_and_unplayed_only() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/Alpha/a1.mkv", 1, 1)).unwrap();
+        let id = only_episode(&db);
+        db.set_status(id, EpisodeStatus::Played).unwrap();
+        let v = ep_record(&db, "Alpha/a1.mkv").unwrap().value.unwrap();
+        assert_eq!(v["status"], "played");
+        assert!(v["last_played_at"].is_i64());
+        db.set_position(id, 321.0, Some(1400.0)).unwrap();
+        db.set_status(id, EpisodeStatus::Unplayed).unwrap();
+        let rec = ep_record(&db, "Alpha/a1.mkv").unwrap();
+        let v = rec.value.as_ref().unwrap();
+        assert_eq!((v["status"].as_str(), v["position_secs"].as_f64(), v["duration_secs"].as_f64()),
+            (Some("unplayed"), Some(321.0), Some(1400.0)));
+        for s in [EpisodeStatus::Playing, EpisodeStatus::Missing] {
+            db.set_status(id, s).unwrap();
+            assert_eq!(ep_record(&db, "Alpha/a1.mkv").unwrap(), rec);
+        }
+    }
+
+    #[test]
+    fn saving_an_unchanged_setting_does_not_restamp() {
+        use crate::sync::keys::SyncKey as K;
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        let key = K::Setting { name: "llm_model".into() };
+        db.set_setting("llm_model", "m").unwrap();
+        let first = seq_of(&db, &key).unwrap();
+        db.set_setting("llm_model", "m").unwrap();
+        assert_eq!(seq_of(&db, &key), Some(first), "re-saving the same value re-stamped it");
+        db.set_setting("llm_model", "n").unwrap();
+        let second = seq_of(&db, &key).unwrap();
+        assert!(second > first, "positive control: a changed value publishes");
+        db.delete_setting("llm_model").unwrap();
+        let tomb = seq_of(&db, &key).unwrap();
+        assert!(tomb > second);
+        db.delete_setting("llm_model").unwrap();
+        assert_eq!(seq_of(&db, &key), Some(tomb), "deleting an absent setting re-stamped it");
+        db.delete_setting("played_threshold").unwrap();
+        assert_eq!(seq_of(&db, &K::Setting { name: "played_threshold".into() }), None);
+    }
+
+    #[test]
+    fn setting_an_unchanged_status_does_not_restamp() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/Alpha/a1.mkv", 1, 1)).unwrap();
+        let id = only_episode(&db);
+        db.set_status(id, EpisodeStatus::Played).unwrap();
+        db.with(|c| Ok(c.execute("UPDATE episodes SET last_played_at = 5 WHERE id = ?1", [id])?)).unwrap();
+        db.set_status(id, EpisodeStatus::Unplayed).unwrap();
+        let rec = ep_record(&db, "Alpha/a1.mkv").unwrap();
+        db.set_status(id, EpisodeStatus::Unplayed).unwrap();
+        assert_eq!(ep_record(&db, "Alpha/a1.mkv").unwrap(), rec, "same status, same record");
+        db.set_status(id, EpisodeStatus::Played).unwrap();
+        let played = ep_record(&db, "Alpha/a1.mkv").unwrap();
+        assert!(played.stamp > rec.stamp, "positive control: a real change publishes");
+        let at = db.get_episode(id).unwrap().last_played_at;
+        db.set_status(id, EpisodeStatus::Played).unwrap();
+        assert_eq!(ep_record(&db, "Alpha/a1.mkv").unwrap(), played);
+        assert_eq!(db.get_episode(id).unwrap().last_played_at, at, "re-marking does not bump the time");
+    }
+
+    #[test]
+    fn unmapped_root_publishes_nothing() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/other/a1.mkv", 1, 1)).unwrap();
+        db.set_status(only_episode(&db), EpisodeStatus::Played).unwrap();
+        let n: i64 = db.with(|c| Ok(c.query_row("SELECT COUNT(*) FROM sync_records", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(n, 0);
+        db.update_episode_path(only_episode(&db), "/lib/a1.mkv").unwrap();
+        assert!(ep_record(&db, "a1.mkv").is_some(), "positive control: under the mapped root it publishes");
+    }
+
+    #[test]
+    fn sync_never_set_up_publishes_nothing() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        db.with(|c| Ok(c.execute("DELETE FROM settings WHERE key IN ('sync_enabled', 'sync_device_id')", [])?)).unwrap();
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/a1.mkv", 1, 1)).unwrap();
+        db.set_status(only_episode(&db), EpisodeStatus::Played).unwrap();
+        let n: i64 = db.with(|c| Ok(c.query_row("SELECT COUNT(*) FROM sync_records", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(n, 0);
+        db.set_setting_unpublished("sync_device_id", "dev-a").unwrap();
+        db.set_status(only_episode(&db), EpisodeStatus::Unplayed).unwrap();
+        assert!(ep_record(&db, "a1.mkv").is_some(), "positive control: once set up it publishes");
+    }
+
+    #[test]
+    fn sync_turned_off_still_records_local_writes() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        db.with(|c| Ok(c.execute("UPDATE settings SET value='0' WHERE key='sync_enabled'", [])?)).unwrap();
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/a1.mkv", 1, 1)).unwrap();
+        db.set_status(only_episode(&db), EpisodeStatus::Played).unwrap();
+        assert_eq!(ep_record(&db, "a1.mkv").unwrap().value.unwrap()["status"], "played");
+    }
+
+    #[test]
+    fn rename_moves_record_and_tombstones_old() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/old.mkv", 1, 1)).unwrap();
+        let id = only_episode(&db);
+        db.set_status(id, EpisodeStatus::Played).unwrap();
+        db.update_episode_path(id, "/lib/new.mkv").unwrap();
+        assert_eq!(ep_record(&db, "new.mkv").unwrap().value.unwrap()["status"], "played");
+        assert_eq!(ep_record(&db, "old.mkv").unwrap().value, None);
+    }
+
+    #[test]
+    fn renaming_a_missing_episode_moves_its_judgement() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/old.mkv", 1, 1)).unwrap();
+        let id = only_episode(&db);
+        db.set_status(id, EpisodeStatus::Played).unwrap();
+        db.with(|c| Ok(c.execute("UPDATE episodes SET prev_status = status, status = 'missing' WHERE id = ?1", [id])?)).unwrap();
+        db.update_episode_path(id, "/lib/new.mkv").unwrap();
+        assert_eq!(ep_record(&db, "new.mkv").unwrap().value.unwrap()["status"], "played");
+        assert_eq!(ep_record(&db, "old.mkv").unwrap().value, None);
+    }
+
+    #[test]
+    fn reset_playing_publishes_the_last_polled_position() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/a.mkv", 1, 1)).unwrap();
+        let id = only_episode(&db);
+        db.set_position(id, 100.0, Some(1400.0)).unwrap();
+        db.set_status(id, EpisodeStatus::Played).unwrap();
+        db.set_status(id, EpisodeStatus::Unplayed).unwrap();
+        db.set_status(id, EpisodeStatus::Playing).unwrap();
+        db.set_position(id, 600.0, Some(1400.0)).unwrap();
+        assert_eq!(db.reset_playing().unwrap(), 1);
+        let v = ep_record(&db, "a.mkv").unwrap().value.unwrap();
+        assert_eq!((v["status"].as_str(), v["position_secs"].as_f64()), (Some("unplayed"), Some(600.0)));
+    }
+
+    #[test]
+    fn crash_while_playing_a_watched_episode_keeps_it_watched() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/a.mkv", 1, 1)).unwrap();
+        let id = only_episode(&db);
+        db.set_status(id, EpisodeStatus::Played).unwrap();
+        let (rec, seq) = (ep_record(&db, "a.mkv").unwrap(), db.with(crate::sync::store::max_seq).unwrap());
+        db.set_status(id, EpisodeStatus::Playing).unwrap();
+        db.set_position(id, 300.0, Some(1400.0)).unwrap();
+        assert_eq!(db.reset_playing().unwrap(), 1);
+        let ep = db.get_episode(id).unwrap();
+        assert_eq!((ep.status, ep.position_secs), (EpisodeStatus::Played, 300.0), "watched, local position kept");
+        assert_eq!(ep_record(&db, "a.mkv").unwrap(), rec, "nothing published over the played record");
+        assert_eq!(db.with(crate::sync::store::max_seq).unwrap(), seq);
+    }
+
+    #[test]
+    fn crash_with_an_unchanged_position_publishes_nothing() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/a.mkv", 1, 1)).unwrap();
+        let id = only_episode(&db);
+        db.set_position(id, 100.0, Some(1400.0)).unwrap();
+        db.set_status(id, EpisodeStatus::Played).unwrap();
+        db.set_position(id, 100.0, Some(1400.0)).unwrap();
+        db.set_status(id, EpisodeStatus::Unplayed).unwrap();
+        let rec = ep_record(&db, "a.mkv").unwrap();
+        db.set_status(id, EpisodeStatus::Playing).unwrap();
+        db.set_position(id, 100.0, Some(1400.0)).unwrap();
+        db.reset_playing().unwrap();
+        assert_eq!(ep_record(&db, "a.mkv").unwrap(), rec);
+    }
+
+    #[test]
+    fn move_override_publishes_only_rows_that_existed() {
+        use crate::sync::keys::SyncKey as K;
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        db.move_override("/lib/a.mkv", "/lib/b.mkv").unwrap();
+        for rel in ["a.mkv", "b.mkv"] {
+            assert_eq!(seq_of(&db, &K::Override { library: LIB.into(), relpath: rel.into() }), None, "{rel}");
+        }
+        db.set_override(&ov("/lib/b.mkv", "llm")).unwrap();
+        db.move_override("/lib/a.mkv", "/lib/b.mkv").unwrap();
+        let rec = db.with(|c| crate::sync::store::get(c, &K::Override { library: LIB.into(), relpath: "b.mkv".into() })).unwrap();
+        assert_eq!(rec.unwrap().value, None, "the replaced override at the new path is retracted");
+        assert_eq!(seq_of(&db, &K::Override { library: LIB.into(), relpath: "a.mkv".into() }), None);
+    }
+
+    #[test]
+    fn fold_leaves_the_survivors_own_pins_alone() {
+        use crate::sync::keys::SyncKey as K;
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        fold_pair(&db);
+        let pin = |hash: &str, show: &str| TorrentLink { info_hash: hash.into(), show_id: sid(&db, show), season: 1, number: 1, added_at: 0 };
+        db.add_torrent_link(&pin("keep", "Alpha")).unwrap();
+        db.add_torrent_link(&pin("lose", "Beta")).unwrap();
+        let (keep, lose) = (K::TorrentLink { info_hash: "keep".into() }, K::TorrentLink { info_hash: "lose".into() });
+        let (k0, l0) = (seq_of(&db, &keep), seq_of(&db, &lose));
+        db.merge_duplicate_shows().unwrap();
+        assert_eq!(seq_of(&db, &keep), k0, "the survivor's own pin did not move");
+        assert!(seq_of(&db, &lose) > l0);
+        let v = db.with(|c| crate::sync::store::get(c, &lose)).unwrap().unwrap().value.unwrap();
+        assert_eq!(v["title"], "Alpha");
+    }
+
+    #[test]
+    fn scan_detected_move_carries_nothing_over_a_tombstone() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/nope/a.mkv", 5, 7)).unwrap();
+        db.with(|c| crate::sync::store::tombstone_path(c, true, "/lib/nope/a.mkv")).unwrap();
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/nope/b.mkv", 5, 7)).unwrap();
+        assert_eq!(ep_record(&db, "nope/b.mkv"), None);
+    }
+
+    #[test]
+    fn scan_detected_move_carries_the_records_value_not_the_local_row() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/nope/a.mkv", 5, 7)).unwrap();
+        db.set_status(only_episode(&db), EpisodeStatus::Played).unwrap();
+        let old = ep_record(&db, "nope/a.mkv").unwrap();
+        // The local row drifted from its record without publishing.
+        db.with(|c| Ok(c.execute("UPDATE episodes SET position_secs = 77", [])?)).unwrap();
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/nope/b.mkv", 5, 7)).unwrap();
+        let moved = ep_record(&db, "nope/b.mkv").unwrap();
+        assert_eq!((moved.value.clone(), moved.stamp.clone()), (old.value.clone(), old.stamp));
+        assert_eq!(db.get_episode(only_episode(&db)).unwrap().position_secs, 0.0, "the carried record was applied");
+    }
+
+    #[test]
+    fn scan_detected_move_keeps_old_record() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/nope/a.mkv", 5, 7)).unwrap();
+        db.set_status(only_episode(&db), EpisodeStatus::Played).unwrap();
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/nope/b.mkv", 5, 7)).unwrap();
+        let (moved, old) = (ep_record(&db, "nope/b.mkv").unwrap(), ep_record(&db, "nope/a.mkv").unwrap());
+        assert_eq!(moved.value.unwrap()["status"], "played");
+        assert_eq!(old.value.unwrap()["status"], "played");
+        // The old record's stamp, never a fresh one: the scan may predate a newer record
+        // another machine published for the new path.
+        assert_eq!(moved.stamp, old.stamp);
+    }
+
+    #[test]
+    fn scan_detected_move_without_record_publishes_nothing() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib", LIB);
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/nope/a.mkv", 5, 7)).unwrap();
+        db.upsert_episode(&pn("Alpha", 1, 1), &rf("/lib/nope/b.mkv", 5, 7)).unwrap();
+        assert_eq!(ep_record(&db, "nope/b.mkv"), None);
+        assert_eq!(ep_record(&db, "nope/a.mkv"), None);
+    }
+
     /// The id of the show whose display title contains `title` (fixture titles are unique).
     fn show_id(db: &Db, title: &str) -> i64 {
         db.list_shows(title, ShowSort::Title).unwrap()[0].id
@@ -3257,13 +3982,74 @@ mod tests {
         let version: i64 = db
             .with(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, SCHEMA_VERSION);
         assert!(db.torrent_link("aaa").unwrap().is_some(), "single pins survive");
         db.add_batch_link(&TorrentBatch {
             info_hash: "bbb".into(), show_id, season: 1,
             first: 1, last: 12, resolution: None, added_at: 0,
         }).unwrap();
         assert_eq!(db.batch_link("bbb").unwrap().expect("batch stored").last, 12);
+    }
+
+    fn table_exists(c: &Connection, name: &str) -> bool {
+        c.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            params![name],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    }
+
+    #[test]
+    fn migrate_creates_sync_tables() {
+        let db = Db::open_memory().unwrap();
+        db.with(|c| {
+            assert!(table_exists(c, "sync_records"));
+            assert!(table_exists(c, "sync_libraries"));
+            let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            assert_eq!(v, SCHEMA_VERSION);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn v9_database_upgrades_to_sync_tables() {
+        let db = Db::open_memory().unwrap();
+        db.with(|c| {
+            c.execute("INSERT INTO shows (parsed_title, created_at) VALUES ('Keep', 0)", [])?;
+            c.execute_batch("DROP TABLE sync_records; DROP TABLE sync_libraries; PRAGMA user_version = 9;")?;
+            migrate(c)?;
+            assert!(table_exists(c, "sync_records"));
+            assert!(table_exists(c, "sync_libraries"));
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM shows WHERE parsed_title = 'Keep'", [], |r| r.get(0))?;
+            assert_eq!(n, 1, "existing rows survive");
+            let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            assert_eq!(v, SCHEMA_VERSION);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn sync_libraries_cascade_with_root() {
+        let db = Db::open_memory().unwrap();
+        let root = db.add_root("/mnt/a").unwrap();
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO sync_libraries (root_id, library) VALUES (?1, 'lib')",
+                params![root.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        db.remove_root(root.id).unwrap();
+        let n: i64 = db
+            .with(|c| Ok(c.query_row("SELECT COUNT(*) FROM sync_libraries", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]
@@ -3288,7 +4074,7 @@ mod tests {
         let version: i64 = db
             .with(|c| Ok(c.query_row("PRAGMA user_version", [], |r| r.get(0))?))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, SCHEMA_VERSION);
         for table in ["torrent_links", "torrent_prefs", "rss_feeds", "torrent_batches"] {
             let n: i64 = db
                 .with(|c| {
@@ -3329,7 +4115,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9, "a v7 database advances to the current version");
+        assert_eq!(version, SCHEMA_VERSION, "a v7 database advances to the current version");
         conn.prepare(
             "SELECT player_volume, window_width, window_height, window_maximized, window_fullscreen FROM shows",
         )

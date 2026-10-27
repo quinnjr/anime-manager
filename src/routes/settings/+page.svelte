@@ -8,11 +8,13 @@
   } from '$lib/api';
   import { toasts } from '$lib/stores/toasts.svelte';
   import { isTestedFlag } from '$lib/llmModels';
+  import SyncSettings from '$lib/components/SyncSettings.svelte';
   import ModelPickerModal from '$lib/components/ModelPickerModal.svelte';
   import { matching } from '$lib/stores/matching.svelte';
   import { DEFAULT_AUTO_SCAN_MINS, parseValidatedAutoScanMins } from '$lib/autoScan';
   import { normalizePlayerBackend, playerSaveValue, DEFAULT_MPV_PATH, DEFAULT_VLC_PATH } from '$lib/playerSettings';
   import { scanSlot } from '$lib/stores/scan.svelte';
+  import { editedSettings } from '$lib/settingsForm';
 
   let roots = $state<Root[]>([]);
   let status = $state<LibraryStatus | null>(null);
@@ -52,6 +54,10 @@
       torrentBaseUrl.trim().toLowerCase().startsWith('http://') &&
       !torrentAllowCleartext
   );
+
+  // What the fields held when loaded or last saved. Save writes only what differs, so a
+  // synced setting changed on another machine since the page opened is not reverted.
+  let savedValues: Record<string, string> = {};
 
   let dlnaRunning = $state(false);
   let dlnaPort = $state(0);
@@ -97,6 +103,7 @@
       torrentAllowCleartext = s.torrent_allow_cleartext === 'true';
       torrentTested = isTestedFlag(s.torrent_test_ok);
       provider = LLM_PROVIDERS.find((p) => p.baseUrl === llmBaseUrl)?.id ?? 'custom';
+      savedValues = formValues();
       dlnaName = s.dlna_name ?? '';
       dlnaPortField = s.dlna_port ?? '28987';
       try {
@@ -183,30 +190,42 @@
     if (p && p.baseUrl) llmBaseUrl = p.baseUrl;
   }
 
+  /** Every saved field as the value Save writes, in write order. */
+  function formValues(): Record<string, string> {
+    const v: Record<string, string> = {
+      mpv_path: mpvPath.trim(),
+      vlc_path: vlcPath.trim(),
+      player_backend: playerSaveValue(playerBackend),
+      played_threshold: String(Number(threshold)),
+      auto_scan_interval_mins: String(parseValidatedAutoScanMins(autoScanMins) ?? autoScanMins),
+      llm_api_key: llmKey.trim(),
+      llm_model: llmModel.trim(),
+      llm_base_url: llmBaseUrl.trim(),
+      llm_assist_on_scan: llmOnScan ? 'true' : 'false',
+      llm_delay_ms: String(Math.max(0, Number(llmDelay) || 0))
+    };
+    // A blank field leaves the stored URL alone so an ordinary Save never
+    // disconnects a configured instance; Disconnect clears the pair explicitly.
+    const torrentUrl = torrentBaseUrl.trim();
+    if (torrentUrl) v.torrent_base_url = torrentUrl;
+    v.torrent_password = torrentPassword.trim();
+    // A bad pair fails loudly here and the stored mapping is left alone.
+    v.torrent_path_map = torrentPathMap.trim();
+    v.torrent_allow_cleartext = torrentAllowCleartext ? 'true' : 'false';
+    return v;
+  }
+
   async function saveAll(): Promise<boolean> {
     const t = Number(threshold);
     if (!(t > 0 && t <= 1)) { toasts.push('error', 'Played threshold must be between 0 and 1'); return false; }
     const autoMins = parseValidatedAutoScanMins(autoScanMins);
     if (autoMins === null) { toasts.push('error', 'Auto-scan interval must be a whole number of minutes (0 turns it off)'); return false; }
     try {
-      await api.setSetting('mpv_path', mpvPath.trim());
-      await api.setSetting('vlc_path', vlcPath.trim());
-      await api.setSetting('player_backend', playerSaveValue(playerBackend));
-      await api.setSetting('played_threshold', String(t));
-      await api.setSetting('auto_scan_interval_mins', String(autoMins));
-      await api.setSetting('llm_api_key', llmKey.trim());
-      await api.setSetting('llm_model', llmModel.trim());
-      await api.setSetting('llm_base_url', llmBaseUrl.trim());
-      await api.setSetting('llm_assist_on_scan', llmOnScan ? 'true' : 'false');
-      await api.setSetting('llm_delay_ms', String(Math.max(0, Number(llmDelay) || 0)));
-      // A blank field leaves the stored URL alone so an ordinary Save never
-      // disconnects a configured instance; Disconnect clears the pair explicitly.
-      const torrentUrl = torrentBaseUrl.trim();
-      if (torrentUrl) await api.setSetting('torrent_base_url', torrentUrl);
-      await api.setSetting('torrent_password', torrentPassword.trim());
-      // A bad pair fails loudly here and the stored mapping is left alone.
-      await api.setSetting('torrent_path_map', torrentPathMap.trim());
-      await api.setSetting('torrent_allow_cleartext', torrentAllowCleartext ? 'true' : 'false');
+      const values = formValues();
+      for (const [key, value] of editedSettings(savedValues, values)) {
+        await api.setSetting(key, value);
+        savedValues[key] = value;
+      }
       await refreshTestFlag();
       await refreshTorrentFlag();
       toasts.push('success', 'Settings saved');
@@ -268,6 +287,8 @@
       await api.setSetting('torrent_password', '');
       torrentBaseUrl = '';
       torrentPassword = '';
+      delete savedValues.torrent_base_url;
+      savedValues.torrent_password = '';
       await refreshTorrentFlag();
       toasts.push('success', 'Disconnected from rustorrent.');
     } catch (e) { toasts.error(e); }
@@ -571,6 +592,8 @@
       <span>Allow unencrypted credentials over http (needed for a plain-LAN instance)</span>
     </label>
   </section>
+
+  <SyncSettings />
 
   <!-- Destructive-ish maintenance, kept last and apart -->
   <section class="mb-10">

@@ -13,6 +13,8 @@ pub mod parser;
 pub mod player;
 pub mod rename;
 pub mod scanner;
+pub mod sync;
+pub mod sync_commands;
 pub mod torrent;
 pub mod torrent_commands;
 
@@ -77,6 +79,12 @@ pub fn run() {
             matching: Arc::new(llm::AssistQueue::default()),
             assist: Arc::new(llm::AssistQueue::default()),
             dlna: commands::DlnaState::default(),
+            sync: Arc::new(std::sync::Mutex::new(sync::SyncRuntime::default())),
+            sync_view: Arc::new(std::sync::Mutex::new(sync::RuntimeView::default())),
+        })
+        .setup(|app| {
+            sync_commands::spawn_poller(app.handle().clone());
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::add_root,
@@ -122,6 +130,11 @@ pub fn run() {
             torrent_commands::torrent_rss_list,
             torrent_commands::torrent_rss_toggle,
             torrent_commands::torrent_rss_remove,
+            sync_commands::sync_status,
+            sync_commands::sync_configure,
+            sync_commands::sync_map_root,
+            sync_commands::sync_now,
+            sync_commands::sync_forget_device,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
