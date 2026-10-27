@@ -60,11 +60,13 @@ struct Marker {
     format: u32,
 }
 
-/// Creates the marker and `devices/` when the folder is empty or already
-/// marked. A non-empty folder without a marker is someone else's and is left
-/// untouched; a missing one is unreachable, never "empty" (an unmounted share
-/// must not be initialised under its mount point).
-pub fn prepare(dir: &Path) -> FolderState {
+/// Checks the folder and, when `create`, initialises an empty one with the
+/// marker and `devices/`. Only configuring sync passes `create`: a round that
+/// finds no marker reports Unreachable, because the sync folder may itself be
+/// the mount point, and an unmounted share is an empty directory there that
+/// must never be initialised on the local disk. A non-empty folder without a
+/// marker is someone else's and is left untouched; a missing one is unreachable.
+pub fn prepare(dir: &Path, create: bool) -> FolderState {
     let Ok(meta) = fs::metadata(dir) else { return FolderState::Unreachable };
     if !meta.is_dir() {
         return FolderState::Unreachable;
@@ -83,6 +85,9 @@ pub fn prepare(dir: &Path) -> FolderState {
             Err(_) => FolderState::Foreign,
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if !create {
+                return FolderState::Unreachable;
+            }
             let Ok(mut entries) = fs::read_dir(dir) else { return FolderState::Unreachable };
             if entries.next().is_some() {
                 return FolderState::Foreign;
@@ -223,24 +228,33 @@ mod tests {
 
     fn ready() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
-        assert_eq!(prepare(d.path()), FolderState::Ready);
+        assert_eq!(prepare(d.path(), true), FolderState::Ready);
         d
     }
 
     #[test]
     fn prepare_marks_empty_folder() {
         let d = tempfile::tempdir().unwrap();
-        assert_eq!(prepare(d.path()), FolderState::Ready);
+        assert_eq!(prepare(d.path(), true), FolderState::Ready);
         assert!(d.path().join(MARKER).is_file());
         assert!(d.path().join("devices").is_dir());
-        assert_eq!(prepare(d.path()), FolderState::Ready);
+        assert_eq!(prepare(d.path(), true), FolderState::Ready);
+        assert_eq!(prepare(d.path(), false), FolderState::Ready);
+    }
+
+    #[test]
+    fn empty_folder_without_create_is_unreachable_and_untouched() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(prepare(d.path(), false), FolderState::Unreachable);
+        assert!(!d.path().join(MARKER).exists());
+        assert!(!d.path().join("devices").exists());
     }
 
     #[test]
     fn marked_folder_without_devices_dir_gets_one() {
         let d = tempfile::tempdir().unwrap();
         fs::write(d.path().join(MARKER), r#"{"format":1}"#).unwrap();
-        assert_eq!(prepare(d.path()), FolderState::Ready);
+        assert_eq!(prepare(d.path(), true), FolderState::Ready);
         assert!(d.path().join("devices").is_dir());
     }
 
@@ -248,7 +262,7 @@ mod tests {
     fn refuses_foreign_folder() {
         let d = tempfile::tempdir().unwrap();
         fs::write(d.path().join("notes.txt"), "hi").unwrap();
-        assert_eq!(prepare(d.path()), FolderState::Foreign);
+        assert_eq!(prepare(d.path(), true), FolderState::Foreign);
         assert!(!d.path().join(MARKER).exists());
         assert!(!d.path().join("devices").exists());
     }
@@ -257,25 +271,25 @@ mod tests {
     fn unparseable_marker_is_foreign() {
         let d = tempfile::tempdir().unwrap();
         fs::write(d.path().join(MARKER), "not json").unwrap();
-        assert_eq!(prepare(d.path()), FolderState::Foreign);
+        assert_eq!(prepare(d.path(), true), FolderState::Foreign);
     }
 
     #[test]
     fn newer_format_refused() {
         let d = tempfile::tempdir().unwrap();
         fs::write(d.path().join(MARKER), r#"{"format":2}"#).unwrap();
-        assert_eq!(prepare(d.path()), FolderState::NewerFormat(2));
+        assert_eq!(prepare(d.path(), true), FolderState::NewerFormat(2));
     }
 
     #[test]
     fn missing_folder_is_unreachable_not_empty() {
         let d = tempfile::tempdir().unwrap();
         let gone = d.path().join("nope");
-        assert_eq!(prepare(&gone), FolderState::Unreachable);
+        assert_eq!(prepare(&gone, true), FolderState::Unreachable);
         assert!(!gone.exists());
         let f = d.path().join("file");
         fs::write(&f, "x").unwrap();
-        assert_eq!(prepare(&f), FolderState::Unreachable);
+        assert_eq!(prepare(&f, true), FolderState::Unreachable);
     }
 
     #[test]

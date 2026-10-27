@@ -54,10 +54,12 @@ impl Machine {
         self.db.set_setting_unpublished("sync_enabled", "1").unwrap();
     }
 
-    /// Enable and join the share, as first enabling sync does.
+    /// Enable and join the share, as first enabling sync does (configuring is the
+    /// only step allowed to initialise an empty folder).
     fn joined(share: &Path, id: &str, files: &[&str]) -> Machine {
         let mut m = Machine::new(share, id, files);
         m.scan();
+        assert_eq!(folder::prepare(share, true), folder::FolderState::Ready);
         m.enable();
         sync::join(&m.db, &mut m.rt).unwrap();
         m
@@ -512,4 +514,21 @@ fn join_publishes_watched_file_that_is_missing() {
     assert_eq!(r.stamp.device, "dev-b");
     a.round();
     assert_eq!(a.status(SHOW[0]), "played");
+}
+
+#[test]
+fn unmounted_share_at_the_mount_point_is_unreachable_not_reinitialised() {
+    let s = share();
+    let mut a = Machine::joined(s.path(), "dev-a", &SHOW);
+    a.watch(SHOW[0]);
+    // The share is unmounted and the sync folder is the mount point: an empty directory.
+    fs::remove_dir_all(s.path().join("devices")).unwrap();
+    fs::remove_file(s.path().join(folder::MARKER)).unwrap();
+    let out = a.round();
+    assert!(!out.wrote);
+    assert!(a.rt.unreachable_since.is_some(), "an empty unmarked folder must read as unreachable");
+    assert!(!s.path().join(folder::MARKER).exists(), "a round must never create the marker");
+    assert!(!s.path().join("devices").exists());
+    assert!(!sync::flush(&a.db, &mut a.rt, true).unwrap());
+    assert!(!s.path().join("devices").exists());
 }

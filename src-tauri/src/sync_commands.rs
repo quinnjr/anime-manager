@@ -93,7 +93,10 @@ pub fn configure_with(db: &Db, rt: &mut SyncRuntime, folder: &str, enabled: bool
         if folder.is_empty() {
             return Err(fail("Choose the folder to sync through."));
         }
-        match folder::prepare(Path::new(folder)) {
+        // Only a newly chosen folder may be initialised. The configured one already holds a
+        // marker, so finding none there means its share is unmounted, not that it is empty.
+        let create = old_folder.as_deref() != Some(folder);
+        match folder::prepare(Path::new(folder), create) {
             FolderState::Ready => {}
             FolderState::Foreign => {
                 return Err(fail(
@@ -331,7 +334,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn other_device(dir: &Path, id: &str, libs: &[&str]) {
-        folder::prepare(dir);
+        folder::prepare(dir, true);
         let f = DeviceFile {
             format: folder::FORMAT,
             device_id: id.into(),
@@ -400,6 +403,19 @@ mod tests {
         assert!(err.to_string().contains("other files"), "{err}");
         assert!(!status_with(&db, &rt).unwrap().enabled);
         assert_eq!(db.get_setting("sync_device_id").unwrap(), None);
+    }
+
+    #[test]
+    fn re_enabling_an_unmounted_folder_does_not_initialise_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, mut rt) = enabled_db(dir.path());
+        let path = dir.path().to_str().unwrap();
+        configure_with(&db, &mut rt, path, false, "laptop").unwrap();
+        std::fs::remove_dir_all(dir.path().join("devices")).unwrap();
+        std::fs::remove_file(dir.path().join(folder::MARKER)).unwrap();
+        assert!(configure_with(&db, &mut rt, path, true, "laptop").is_err());
+        assert!(!dir.path().join(folder::MARKER).exists());
+        assert!(!status_with(&db, &rt).unwrap().enabled);
     }
 
     #[test]

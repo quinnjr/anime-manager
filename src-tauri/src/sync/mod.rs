@@ -76,7 +76,8 @@ fn config(db: &Db) -> Result<Option<Config>> {
 /// True when the folder can be used. An unreachable folder is a quiet status
 /// rather than an error, since a share drops off whenever a laptop leaves home.
 fn reachable(cfg: &Config, rt: &mut SyncRuntime) -> bool {
-    let state = folder::prepare(&cfg.folder);
+    // Never `create`: only configuring sync may initialise a folder.
+    let state = folder::prepare(&cfg.folder, false);
     if state == FolderState::Unreachable {
         rt.unreachable_since.get_or_insert_with(now);
         return false;
