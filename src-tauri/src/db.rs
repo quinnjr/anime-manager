@@ -535,10 +535,10 @@ impl Db {
             // Longest first, so a file under /lib/Anime/Movies is counted against that root
             // rather than against /lib/Anime.
             let mut order: Vec<usize> = (0..roots.len()).collect();
-            order.sort_by_key(|&i| std::cmp::Reverse(roots[i].trim_end_matches('/').len()));
+            order.sort_by_key(|&i| std::cmp::Reverse(crate::paths::trim_dir(&roots[i]).len()));
             let mut counts = vec![0usize; roots.len()];
             for i in order {
-                let prefix = format!("{}/", roots[i].trim_end_matches('/'));
+                let prefix = crate::paths::dir_prefix(&roots[i]);
                 counts[i] = tx.execute(
                     "UPDATE episodes SET prev_status = status, status = 'missing'
                      WHERE status != 'missing' AND substr(path, 1, length(?1)) = ?1
@@ -712,14 +712,15 @@ impl Db {
 
     /// (path, show parsed_title, season number, episode number) for files directly inside `folder`.
     pub fn episodes_in_folder(&self, folder: &str) -> Result<Vec<(String, String, u32, u32)>> {
-        let prefix = format!("{}/", folder.trim_end_matches('/'));
+        let prefix = crate::paths::dir_prefix(folder);
+        let sep = crate::paths::sep_of(folder).to_string();
         self.with(|c| {
             let mut st = c.prepare(
                 "SELECT e.path, s.parsed_title, se.number, e.number FROM episodes e
                  JOIN seasons se ON e.season_id = se.id JOIN shows s ON se.show_id = s.id
-                 WHERE substr(e.path, 1, length(?1)) = ?1 AND instr(substr(e.path, length(?1) + 1), '/') = 0
+                 WHERE substr(e.path, 1, length(?1)) = ?1 AND instr(substr(e.path, length(?1) + 1), ?2) = 0
                  ORDER BY e.path")?;
-            let rows = st.query_map(params![prefix], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u32, r.get::<_, i64>(3)? as u32)))?;
+            let rows = st.query_map(params![prefix, sep], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u32, r.get::<_, i64>(3)? as u32)))?;
             Ok(rows.collect::<std::result::Result<_, _>>()?)
         })
     }
@@ -3816,11 +3817,22 @@ mod tests {
 
     #[test]
     fn non_utf8_paths_are_reported_not_stored_lossily() {
-        use std::os::unix::ffi::OsStrExt;
         let dir = tempfile::tempdir().unwrap();
-        let bad = dir
-            .path()
-            .join(std::ffi::OsStr::from_bytes(b"Pok\xe9mon - 01.mkv"));
+        // Latin-1 bytes on Linux; on Windows an unpaired surrogate, which NTFS stores.
+        #[cfg(unix)]
+        let name = {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::OsStr::from_bytes(b"Pok\xe9mon - 01.mkv").to_os_string()
+        };
+        #[cfg(windows)]
+        let name = {
+            use std::os::windows::ffi::OsStringExt;
+            let mut w: Vec<u16> = "Pok".encode_utf16().collect();
+            w.push(0xD800);
+            w.extend("mon - 01.mkv".encode_utf16());
+            std::ffi::OsString::from_wide(&w)
+        };
+        let bad = dir.path().join(name);
         std::fs::write(&bad, b"x").unwrap();
         std::fs::write(dir.path().join("Good Show - 01.mkv"), b"x").unwrap();
         let db = Db::open_memory().unwrap();

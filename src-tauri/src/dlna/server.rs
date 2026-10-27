@@ -187,15 +187,13 @@ pub(crate) struct ServeCtx {
 /// and copied into every `ServeCtx` built by `run_on`. Global (rather than a
 /// `DlnaServer` field) so the production wiring stays a single `start_dlna`
 /// touch: `DlnaServer` is constructed literally in several restart paths.
-static DLNA_ERROR_SINK: std::sync::Mutex<
-    Option<std::sync::Arc<dyn Fn(crate::error::AppError) + Send + Sync>>,
-> = std::sync::Mutex::new(None);
+static DLNA_ERROR_SINK: std::sync::Mutex<Option<ErrorSink>> = std::sync::Mutex::new(None);
+
+type ErrorSink = std::sync::Arc<dyn Fn(crate::error::AppError) + Send + Sync>;
 
 /// Install (or clear with `None`) the played-marking error sink. Called from
 /// `start_dlna` only.
-pub fn set_dlna_error_sink(
-    sink: Option<std::sync::Arc<dyn Fn(crate::error::AppError) + Send + Sync>>,
-) {
+pub fn set_dlna_error_sink(sink: Option<ErrorSink>) {
     *DLNA_ERROR_SINK.lock().unwrap_or_else(|e| e.into_inner()) = sink;
 }
 
@@ -243,6 +241,7 @@ pub(crate) enum Backend {
     // is the sole constructor and is `#[cfg(test)]`). Kept on the shared enum
     // — rather than behind `#[cfg(test)]` — so the `serve_media` dispatch
     // compiles identically in both builds.
+    #[cfg_attr(not(test), allow(dead_code))]
     Static {
         data: std::sync::Arc<Vec<u8>>,
         mime: String,
@@ -252,6 +251,15 @@ pub(crate) enum Backend {
     },
 }
 
+/// Show title, season number, the episode, cover path, cover URL.
+type FoundEpisode = (
+    String,
+    u32,
+    crate::models::Episode,
+    Option<String>,
+    Option<String>,
+);
+
 /// One episode plus its show title, season number and cover references (so
 /// single-episode DIDL carries the same art as season listings): the row by
 /// id, then its show and season number, both direct queries. Read-only; a
@@ -259,18 +267,7 @@ pub(crate) enum Backend {
 /// genuine absence (probed first, so a missing id never surfaces as a 500);
 /// `Err` is a database failure the caller must surface as a 500, never a
 /// 404/701.
-fn find_episode(
-    db: &crate::db::Db,
-    episode_id: i64,
-) -> crate::error::Result<
-    Option<(
-        String,
-        u32,
-        crate::models::Episode,
-        Option<String>,
-        Option<String>,
-    )>,
-> {
+fn find_episode(db: &crate::db::Db, episode_id: i64) -> crate::error::Result<Option<FoundEpisode>> {
     let exists: bool = db.with(|c| {
         Ok(c.query_row(
             "SELECT EXISTS(SELECT 1 FROM episodes WHERE id=?1)",
@@ -295,7 +292,7 @@ fn find_episode(
 /// Database failure is `Err` (caller logs it and answers 500/501); genuine
 /// absence is `Ok(false)`.
 fn season_exists(db: &crate::db::Db, season_id: i64) -> crate::error::Result<bool> {
-    Ok(db.season_exists(season_id)?)
+    db.season_exists(season_id)
 }
 
 /// What a completed media GET reports back so the connection can apply
@@ -718,7 +715,7 @@ async fn route(
             let head = method == "HEAD";
             if remux && head {
                 serve_remux_head(
-                    &backend,
+                    backend,
                     id,
                     headers.get("range").map(|s| s.as_str()),
                     &[],
@@ -726,7 +723,7 @@ async fn route(
                 )
             } else if remux {
                 serve_remux(
-                    &backend,
+                    backend,
                     id,
                     headers.get("range").map(|s| s.as_str()),
                     &[],
@@ -734,7 +731,7 @@ async fn route(
                 )
                 .await
             } else {
-                serve_media(&backend, id, headers.get("range").map(|s| s.as_str()), &[])
+                serve_media(backend, id, headers.get("range").map(|s| s.as_str()), &[])
             }
         }
         ("POST", "/ctl/ContentDirectory") => {
@@ -744,7 +741,7 @@ async fn route(
             } else {
                 match &backend {
                     Backend::Db { db } => {
-                        (serve_browse(db, &body_str, ctx.ffmpeg, &ctx.base), None)
+                        (serve_browse(db, body_str, ctx.ffmpeg, &ctx.base), None)
                     }
                     Backend::Static { .. } => (soap_fault(701, "No such object"), None),
                 }
@@ -1733,6 +1730,8 @@ mod tests {
         drop(held);
     }
 
+    // The fakes are /bin/sh scripts, and Windows resolves `ffmpeg` only as ffmpeg.exe.
+    #[cfg(unix)]
     #[tokio::test]
     async fn remux_over_http_serves_mp4_and_marks_played() {
         use std::sync::Arc;
@@ -1798,6 +1797,8 @@ mod tests {
         let _ = std::fs::remove_file(&cached);
     }
 
+    // The fakes are /bin/sh scripts, and Windows resolves `ffmpeg` only as ffmpeg.exe.
+    #[cfg(unix)]
     #[tokio::test]
     async fn remux_failure_is_500() {
         use std::sync::Arc;

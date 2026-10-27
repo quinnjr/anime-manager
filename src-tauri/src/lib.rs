@@ -10,6 +10,7 @@ pub mod metadata;
 pub mod models;
 pub mod nyaa;
 pub mod parser;
+pub mod paths;
 pub mod player;
 pub mod rename;
 pub mod scanner;

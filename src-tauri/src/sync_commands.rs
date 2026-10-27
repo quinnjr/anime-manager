@@ -485,7 +485,8 @@ mod tests {
             map_root_with(&self.db, &mut self.rt, self.root_id, Some(LIB.into())).unwrap()
         }
         fn ep_id(&self, rel: &str) -> i64 {
-            let p = self.root.join(rel).to_str().unwrap().to_string();
+            // Component by component, so the stored path's own separator is matched on Windows.
+            let p = rel.split('/').fold(self.root.clone(), |p, c| p.join(c)).to_str().unwrap().to_string();
             self.db.with(|c| Ok(c.query_row("SELECT id FROM episodes WHERE path = ?1", [&p], |r| r.get(0))?)).unwrap()
         }
         fn watch(&self, rel: &str) {

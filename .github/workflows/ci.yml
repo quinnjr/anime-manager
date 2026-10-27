@@ -1,0 +1,184 @@
+name: CI
+
+# Tests on Linux and Windows, and builds the Windows installers, for every push to the
+# long-lived branches and every pull request, so a change that breaks either platform is
+# caught on the PR rather than on the release tag.
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # A required check on develop: any clippy warning fails it. Both platforms, since each
+  # compiles code the other cfg's out (unix sockets here, named pipes and CREATE_NO_WINDOW
+  # there). The job names are what branch protection matches on; renaming one silently
+  # drops the requirement.
+  clippy:
+    name: clippy (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-22.04
+            shell: bash
+          - name: windows
+            os: windows-latest
+            # pwsh: Git Bash's /usr/bin/link shadows the MSVC linker build scripts need.
+            shell: pwsh
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tauri system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            build-essential
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: clippy
+
+      - run: pnpm install --frozen-lockfile
+
+      # tauri's generate_context! reads `build/` even under `cargo clippy`.
+      - run: pnpm build
+
+      - name: Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+  linux:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            build-essential \
+            file
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: pnpm install --frozen-lockfile
+
+      # The frontend must be built before cargo: tauri's build script embeds `build/`.
+      - run: pnpm build
+
+      - name: Test
+        # Single-threaded: the player tests drive a fake mpv through process-global env vars.
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1
+          pnpm test
+          pnpm check
+
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-python@v5
+        with:
+          # The player tests launch the fake mpv/VLC fixtures through their .cmd wrappers.
+          python-version: '3.x'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm build
+
+      # cargo runs under pwsh, not bash: Git Bash puts its own /usr/bin/link ahead of the
+      # MSVC linker. One command per step, since pwsh only checks the last exit code.
+      - name: Test (Rust)
+        shell: pwsh
+        run: cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1
+
+      - name: Test (frontend)
+        shell: pwsh
+        run: pnpm test
+
+      - name: Check (frontend)
+        shell: pwsh
+        run: pnpm check
+
+      - name: Build installers
+        shell: pwsh
+        # Quoted, or pwsh splits nsis,msi into an array.
+        run: pnpm tauri build --bundles 'nsis,msi'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installers
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+          retention-days: 14

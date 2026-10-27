@@ -11,7 +11,7 @@ pnpm tauri build --no-bundle                                      # release bina
 cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1
 pnpm test                                                         # vitest
 pnpm check                                                        # svelte-check
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings   # required on PRs
 ```
 
 **The Rust suite must run single-threaded.** The player tests drive `src-tauri/tests/fixtures/fake_mpv.py` through process-global environment variables (`FAKE_MPV_STOP_AT`, `FAKE_MPV_RUNTIME`, `FAKE_MPV_NO_IPC`); running them in parallel makes them read each other's values.
@@ -19,6 +19,10 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets
 Single test: `cargo test --manifest-path src-tauri/Cargo.toml parser::tests::episode_word -- --test-threads=1`, or `pnpm test src/lib/keys.test.ts`.
 
 Requires Rust 1.88+ (let-chains are used in `commands.rs`, `db.rs`, `parser.rs`) and mpv on `$PATH`.
+
+On Windows, run cargo from PowerShell, not Git Bash: Git's `/usr/bin/link` shadows the MSVC
+linker and every build script fails to link. The player tests launch the fakes through
+`fake_mpv.cmd` / `fake_vlc.cmd`, which need `py` or `python` on `PATH`.
 
 ## Branching (git-flow)
 
@@ -59,7 +63,7 @@ scanner::scan_dir → per file: db.get_override() → parser::parse_with_confide
 
 **LLM assist** (`llm.rs`) is optional and off until an API key and model are set in Settings and a Test connection has succeeded against them (`llm_test_ok`); a failed test or a new key/endpoint/model disarms the background worker again, so a broken config is never pinged on scan. Any OpenAI-compatible provider works; `LLM_PROVIDERS` in `api.ts` presets the free-tier ones and `llm_models` (picked through `ModelPickerModal`) lists what the chosen provider offers, because free model ids rotate and a hard-coded default goes stale. Scans enqueue low-confidence folders into a single in-process `AssistQueue`; one background worker drains it. `next_or_finish()` pops and clears the running flag under one lock — that atomicity is what stops folders being stranded with no worker, and `RunGuard` clears the flag on panic. `inspect_show` takes the same guard so a manual inspect cannot race the worker.
 
-**Playback** (`player.rs`) spawns mpv with `--input-ipc-server` and polls position over the JSON IPC socket. If the socket never connects, the run writes nothing back and returns an error — position and duration are unknown, so any watched judgement would be made from stale values.
+**Playback** (`player.rs`) spawns mpv with `--input-ipc-server` and polls position over the JSON IPC socket. The control channel is an `Endpoint`: a unix socket on Linux; on Windows a named pipe for mpv and loopback TCP for VLC (`--rc-host`), because VLC's Windows build has no `--rc-unix`. `locate_binary` resolves a bare player name through `PATH` and, on Windows, the default install directories, since the VLC installer never touches `PATH`. If the socket never connects, the run writes nothing back and returns an error — position and duration are unknown, so any watched judgement would be made from stale values.
 
 **Frontend contract.** `src/lib/api.ts` is the only place that calls `invoke`; keep the TS interfaces in step with `models.rs`. Tauri maps camelCase JS args to snake_case Rust params automatically; a command taking a struct arg (e.g. `torrent_add(args: TorrentAddArgs)`) is invoked as `invoke('torrent_add', { args })`, and the struct carries `#[serde(rename_all = "camelCase")]` for its inner fields. Events (`scan-progress`, `library-changed`, `show-updated`, `playback-changed`, `llm-assist-progress`, `llm-assist`, `torrent-changed`, `sync-progress`, `error`) are subscribed in `+layout.svelte` and the route components. Stores are Svelte 5 runes in `.svelte.ts` files.
 
@@ -251,6 +255,22 @@ is a sequence, so numbering would decorate rather than inform.
 
 ## Platform quirks
 
+**Paths carry their own separator.** Stored paths are whatever the scanner produced, so a Windows
+install holds `Z:\Anime\Show\01.mkv`. Every prefix test and join goes through `paths.rs`
+(`dir_prefix`, `is_within`, `trim_dir`) — mirrored in `src/lib/paths.ts` — which reads the style
+from the string rather than `cfg(windows)`, so both rules are tested on every host and a
+backslash stays an ordinary file-name character in a Linux path. A hard-coded `'/'` in a prefix
+test is a bug on Windows that fails silently: missing-file detection simply never fires.
+`add_root` normalises a Windows root to backslashes; the torrent path map translates POSIX server
+paths to a Windows local side (`/downloads=Z:\Downloads`) and converts separators on the way.
+Sync relpaths are always `/`-separated on the wire.
+
+On Windows every child process (`ffmpeg`, `ffprobe`, the player) gets `CREATE_NO_WINDOW` via
+`player::no_console_window`, or a console window flashes up from the GUI app. The fake-ffmpeg DLNA
+tests and the DLNA port-probe tests are `#[cfg(unix)]`: the fakes are `/bin/sh` scripts that
+Windows' `ffmpeg.exe`-only PATH lookup cannot find, and Windows lets a wildcard bind coexist with
+a loopback one.
+
 WebKitGTK draws native widgets for form controls: a `<select>` honours `color` but ignores
 `background`, so paper-white text landed on the platform's near-white control and vanished.
 `select.field` in `app.css` sets `appearance: none` and draws its own chevron. Any new native
@@ -303,7 +323,14 @@ It prints one tab-separated line per file, `OK / title / S<n> / E<n> / group / p
 
 `scripts/build-release.sh` produces the `.deb`, `.rpm` and `.AppImage` into `dist/` with a
 `SHA256SUMS.txt`; `.github/workflows/release.yml` does the same on a `v*` tag push and uploads
-them to the GitHub release. Both run the test suites first.
+them to the GitHub release. Its `windows` job then builds the NSIS `-setup.exe` and `.msi` on
+`windows-latest` with a separate `SHA256SUMS-windows.txt`. Both run the test suites first.
+`.github/workflows/ci.yml` runs on every push to `develop`/`main` and every pull request:
+`clippy (linux)` and `clippy (windows)` with `-D warnings` (required checks on `develop`; their
+names are what branch protection matches, so renaming the job drops the requirement), the
+test suites on Linux and Windows, then the Windows installers as a workflow artifact, so a
+Windows break shows up on the PR rather than on the tag. Windows cargo steps run under `pwsh`,
+not bash, for the same `link` reason as locally.
 
 AppImage bundling needs two environment variables that the script sets and CI sets in part:
 

@@ -2,6 +2,7 @@
   import { api, type RenamePlan, type RenameTarget } from '$lib/api';
   import { toasts } from '$lib/stores/toasts.svelte';
   import ModalShell from '$lib/components/ModalShell.svelte';
+  import { basename } from '$lib/paths';
 
   let { target, open = $bindable(false), onDone }: { target: RenameTarget | null; open?: boolean; onDone: () => void } = $props();
   let plan = $state<RenamePlan | null>(null);
@@ -11,7 +12,7 @@
     if (!open) plan = null;
   });
 
-  const base = (p: string) => p.split('/').pop();
+  const base = basename;
 
   async function apply() {
     if (!plan) return;

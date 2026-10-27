@@ -26,6 +26,7 @@ pub(crate) use didl::{cover_file_name, mime_for, serve_cover_file};
 #[cfg(test)]
 pub(crate) use http::{Body, parse_range, serve_bytes_response, serve_file_response};
 #[cfg(test)]
+#[cfg_attr(windows, allow(unused_imports))] // their tests use unix-only fakes
 pub(crate) use remux::{
     build_ffmpeg_cmd, ensure_remux, ensure_remux_async, escape_filter_path, has_ass_subtitles,
     remux_seats, remux_tmp_path, sweep_stale_tmps,

@@ -1,6 +1,7 @@
 use crate::db::Db;
 use crate::error::{AppError, Result};
 use crate::http::{read_capped, send_with_retry, snippet};
+use crate::paths;
 use crate::models::{
     LinkedBatch, LinkedTo, LinkedTorrent, RssFeedConfig, RssFeedView, ShowSort, TorrentDetail,
     TorrentFile, TorrentInfo,
@@ -769,7 +770,9 @@ pub fn parse_path_map(raw: &str) -> Result<Vec<(String, String)>> {
         };
         let server = server.trim();
         let local = local.trim();
-        if server.is_empty() || local.is_empty() || !server.starts_with('/') || !local.starts_with('/') {
+        // The server is POSIX; the local side may be a Windows path
+        // (`Z:\Downloads`, `\\nas\Downloads`).
+        if server.is_empty() || local.is_empty() || !server.starts_with('/') || !paths::is_abs(local) {
             return Err(AppError::Parse(format!(
                 "bad path mapping pair '{trimmed}': both sides must be non-empty absolute paths"
             )));
@@ -779,21 +782,17 @@ pub fn parse_path_map(raw: &str) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-/// A stored prefix with trailing slashes removed (`/` stays `/`), so
-/// `/downloads/` and `/downloads` compare identically.
+/// A stored prefix with trailing separators removed (`/` stays `/`, `Z:\`
+/// stays `Z:\`), so `/downloads/` and `/downloads` compare identically.
 fn normalize_prefix(prefix: &str) -> &str {
-    let trimmed = prefix.trim_end_matches('/');
-    if trimmed.is_empty() { "/" } else { trimmed }
+    if prefix.is_empty() { "/" } else { paths::trim_dir(prefix) }
 }
 
-/// True when `prefix` (already normalized) matches `path` on a `/`
+/// True when `prefix` (already normalized) matches `path` on a separator
 /// boundary: the whole string, or followed by a separator. `/dl` never
 /// matches `/dl2/x`.
 fn boundary_match(path: &str, prefix: &str) -> bool {
-    if prefix == "/" {
-        return path.starts_with('/');
-    }
-    path == prefix || path.starts_with(&format!("{prefix}/"))
+    paths::is_within(path, prefix)
 }
 
 /// Translate `path` across the map in one direction. Longest matching
@@ -817,14 +816,22 @@ fn translate(path: &str, map: &[(String, String)], to_local: bool) -> String {
     let Some((from, to)) = best else {
         return path.to_string();
     };
-    let rest = &path[from.len()..];
+    let rest = path[from.len()..].trim_start_matches(paths::seps_of(from));
     if rest.is_empty() {
-        to.to_string()
-    } else if rest.starts_with('/') {
+        return to.to_string();
+    }
+    // The server is POSIX and the local side may be Windows, so the remainder
+    // is rewritten into the target's separator on the way across.
+    let sep = paths::sep_of(to);
+    let rest = match (paths::is_windows_abs(from), paths::is_windows_abs(to)) {
+        (false, true) => rest.replace('/', "\\"),
+        (true, false) => rest.replace('\\', "/"),
+        _ => rest.to_string(),
+    };
+    if to.ends_with(sep) {
         format!("{to}{rest}")
     } else {
-        // Only reachable via the `/` prefix, which consumed the leading slash.
-        format!("{to}/{rest}")
+        format!("{to}{sep}{rest}")
     }
 }
 
@@ -947,11 +954,15 @@ pub fn episode_in_torrent(
     files: &[TorrentFile],
     episode_path: &str,
 ) -> bool {
-    let base = save_path.trim_end_matches('/');
+    let base = paths::dir_prefix(save_path);
+    // Under a Windows save path the episode paths are Windows too: compare in `\` form.
+    let windows = paths::is_windows_abs(save_path);
+    let episode_path = if windows { episode_path.replace('/', "\\") } else { episode_path.to_string() };
     files.iter().any(|f| {
         let rel = f.path.replace('\\', "/");
         let rel = rel.trim_start_matches('/');
-        format!("{base}/{rel}") == episode_path
+        let rel = if windows { rel.replace('/', "\\") } else { rel.to_string() };
+        format!("{base}{rel}") == episode_path
     })
 }
 
@@ -1029,8 +1040,7 @@ pub fn default_save_path(db: &Db, show_id: i64) -> Result<String> {
         .iter()
         .find(|r| r.last_scan.as_ref().map(|s| s.readable).unwrap_or(true))
         .map(|r| {
-            let trimmed = r.path.trim_end_matches('/');
-            if trimmed.is_empty() { "/".to_string() } else { trimmed.to_string() }
+            normalize_prefix(&r.path).to_string()
         })
         .ok_or_else(|| AppError::Parse("no library root to save into".into()))
 }
@@ -1882,6 +1892,33 @@ mod tests {
         let local2 = map_to_local(server2, &map);
         assert_eq!(local2, "/mnt/nas/Downloads/Anime/Y/g.mkv");
         assert_eq!(map_to_server(&local2, &map), server2);
+    }
+
+    #[test]
+    fn map_translates_to_and_from_a_windows_client() {
+        let map = parse_path_map(r"/downloads=Z:\Downloads, /media/anime=\\nas\anime\").unwrap();
+        assert_eq!(map_to_local("/downloads/Anime/X/f.mkv", &map), r"Z:\Downloads\Anime\X\f.mkv");
+        assert_eq!(map_to_server(r"Z:\Downloads\Anime\X\f.mkv", &map), "/downloads/Anime/X/f.mkv");
+        assert_eq!(map_to_local("/media/anime/Y", &map), r"\\nas\anime\Y");
+        assert_eq!(map_to_server(r"\\nas\anime\Y\g.mkv", &map), "/media/anime/Y/g.mkv");
+        assert_eq!(map_to_local("/downloads", &map), r"Z:\Downloads");
+        assert_eq!(map_to_server(r"Z:\DownloadsX\f.mkv", &map), r"Z:\DownloadsX\f.mkv");
+        // A drive root keeps its separator.
+        let root = parse_path_map(r"/dl=D:\").unwrap();
+        assert_eq!(map_to_local("/dl/a/b.mkv", &root), r"D:\a\b.mkv");
+        assert_eq!(map_to_server(r"D:\a\b.mkv", &root), "/dl/a/b.mkv");
+        // The server side stays POSIX.
+        assert!(parse_path_map(r"Z:\x=/mnt").is_err());
+    }
+
+    #[test]
+    fn windows_roots_and_episode_paths_match() {
+        let roots = vec![r"Z:\Anime".to_string()];
+        assert!(path_under_roots(r"Z:\Anime\Frieren\01.mkv", &roots));
+        assert!(!path_under_roots(r"Z:\Anime2\Frieren\01.mkv", &roots));
+        let files = vec![TorrentFile { path: "Frieren/01.mkv".into(), size: 1 }];
+        assert!(episode_in_torrent(r"Z:\Anime\", &files, r"Z:\Anime\Frieren\01.mkv"));
+        assert!(!episode_in_torrent(r"Z:\Anime", &files, r"Z:\Anime\Frieren\02.mkv"));
     }
 
     #[test]

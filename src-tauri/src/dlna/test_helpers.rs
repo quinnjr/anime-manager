@@ -1,3 +1,6 @@
+// The PATH and fake-ffmpeg helpers serve tests that only run on unix.
+#![cfg_attr(windows, allow(dead_code))]
+
 /// PATH scoped to one directory for the probe tests below. The suite runs
 /// single-threaded (`cargo test -- --test-threads=1` per CLAUDE.md), so
 /// mutating the process-global PATH here is safe; Drop restores the
@@ -17,10 +20,11 @@ impl ScopedPath {
     /// one while `cp`/`sh` still resolve.
     pub(crate) fn prepend(dir: &std::path::Path) -> Self {
         let old = std::env::var("PATH").ok();
-        let next = match &old {
-            Some(o) => format!("{}:{o}", dir.display()),
-            None => dir.display().to_string(),
-        };
+        let mut dirs = vec![dir.to_path_buf()];
+        if let Some(o) = &old {
+            dirs.extend(std::env::split_paths(o));
+        }
+        let next = std::env::join_paths(dirs).unwrap();
         unsafe { std::env::set_var("PATH", &next) };
         Self(old)
     }
@@ -40,10 +44,12 @@ impl Drop for ScopedPath {
 /// Fake ffmpeg: answers `-version`, otherwise copies `-i SRC` to the last
 /// arg (the `<dst>.tmp`), like a transcode that preserves bytes.
 /// `sleep_secs` delays the copy so concurrent attempts actually overlap.
+#[cfg(unix)]
 pub(crate) fn fake_ffmpeg_dir() -> tempfile::TempDir {
     fake_ffmpeg_dir_with_sleep(0)
 }
 
+#[cfg(unix)]
 pub(crate) fn fake_ffmpeg_dir_with_sleep(sleep_ms: u64) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -160,6 +166,7 @@ pub(crate) async fn stop_test_server(s: TestServer) {
 
 /// Fake ffmpeg that answers `-version` but fails every transcode with
 /// exit 1, so `ensure_remux`/`serve_remux` take the 500 path.
+#[cfg(unix)]
 pub(crate) fn fake_failing_ffmpeg_dir() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -181,6 +188,7 @@ pub(crate) fn fake_failing_ffmpeg_dir() -> tempfile::TempDir {
 /// Fake ffprobe: records its argv to `<dir>/ffprobe_args`, prints
 /// `stdout_json`, and exits `exit_code`. Lets the ASS branch be covered
 /// through `has_ass_subtitles`/`build_ffmpeg_cmd` without a real ffprobe.
+#[cfg(unix)]
 pub(crate) fn fake_ffprobe_dir(stdout_json: &str, exit_code: i32) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(

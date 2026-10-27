@@ -73,8 +73,10 @@ impl Machine {
         sync::round(&self.db, &mut self.rt, true).unwrap()
     }
 
+    /// Joined component by component, so the result uses the separator the scanner
+    /// stored on this platform (`\` on Windows).
     fn abs(&self, rel: &str) -> String {
-        self.root.join(rel).to_str().unwrap().to_string()
+        rel.split('/').fold(self.root.clone(), |p, c| p.join(c)).to_str().unwrap().to_string()
     }
 
     fn ep_id(&self, rel: &str) -> i64 {
@@ -239,7 +241,7 @@ fn corrupt_device_file_skipped() {
     let mut b = Machine::joined(s.path(), "dev-b", &SHOW);
     a.watch(SHOW[0]);
     a.round();
-    let bad = s.path().join("devices/dev-x.json");
+    let bad = s.path().join("devices").join("dev-x.json");
     fs::write(&bad, r#"{"format":1,"device_id":"dev-x","rec"#).unwrap();
     b.round();
     assert_eq!(b.status(SHOW[0]), "played");

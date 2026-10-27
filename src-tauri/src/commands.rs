@@ -297,7 +297,7 @@ pub async fn dlna_set_options(
 
 #[tauri::command]
 pub fn add_root(state: State<'_, AppState>, path: String) -> Result<Root> {
-    state.db.add_root(&path)
+    state.db.add_root(&crate::paths::normalize_root(&path))
 }
 
 #[tauri::command]
@@ -787,11 +787,19 @@ fn decide_player(
 /// Probe a player binary with `--version`, requiring exit success. Bounded by
 /// a short timeout so a hanging binary can't hang Play: the probe runs on a
 /// thread and anything slower than 5s counts as missing.
+///
+/// On Windows a located file is enough: `vlc.exe` is a GUI binary that opens
+/// a window for `--version` rather than printing and exiting.
 fn probe_binary(bin: &str) -> bool {
+    if cfg!(windows) {
+        return player::locate_binary(bin).is_some();
+    }
     let bin = bin.to_string();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let ok = std::process::Command::new(&bin)
+        let mut cmd = std::process::Command::new(&bin);
+        player::no_console_window(&mut cmd);
+        let ok = cmd
             .arg("--version")
             .output()
             .map(|o| o.status.success())
@@ -816,8 +824,15 @@ pub async fn play(app: AppHandle, state: State<'_, AppState>, episode_id: i64) -
     let ep = db.get_episode(episode_id)?;
     player::ensure_file_present(&ep.path)?;
     let wanted = player::player_backend(&db);
-    let mpv_bin = player::mpv_binary(&db);
-    let vlc_bin = player::vlc_binary(&db);
+    // Resolve to a full path first: on Windows VLC is never on PATH, it lives in
+    // Program Files. An unresolved name passes through so the error names it.
+    let resolve = |bin: String| {
+        player::locate_binary(&bin)
+            .and_then(|p| p.to_str().map(str::to_string))
+            .unwrap_or(bin)
+    };
+    let mpv_bin = resolve(player::mpv_binary(&db));
+    let vlc_bin = resolve(player::vlc_binary(&db));
     let decision = decide_player(wanted, &mpv_bin, &vlc_bin, probe_binary)
         .map_err(crate::error::AppError::Player)?;
     let backend = decision.backend;
@@ -1396,6 +1411,9 @@ mod tests {
         assert_eq!(port, 28987);
     }
 
+    // Windows lets the probe's wildcard bind coexist with these loopback holds
+    // (no SO_EXCLUSIVEADDRUSE), so a held port does not read as occupied there.
+    #[cfg(unix)]
     #[tokio::test]
     async fn dlna_port_probe_bumps_past_occupied_port() {
         let (base, mut held) = hold_port_block().await;
@@ -1406,6 +1424,9 @@ mod tests {
         assert_eq!(bound, base + 1);
     }
 
+    // Windows lets the probe's wildcard bind coexist with these loopback holds
+    // (no SO_EXCLUSIVEADDRUSE), so a held port does not read as occupied there.
+    #[cfg(unix)]
     #[tokio::test]
     async fn dlna_port_probe_errors_when_range_full() {
         let (base, _held) = hold_port_block().await;
@@ -1421,6 +1442,7 @@ mod tests {
     /// intermittently as soon as the full suite ran next to ordinary network
     /// activity: `bind(0)` hands out an ephemeral port, and by the time the test
     /// rebinds it something else owns it.
+    #[cfg(unix)]
     async fn hold_port_block() -> (u16, Vec<tokio::net::TcpListener>) {
         const FIRST: u16 = 61_000;
         for base in FIRST..FIRST + 512 {
