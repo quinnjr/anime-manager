@@ -80,6 +80,7 @@ pub fn run() {
             assist: Arc::new(llm::AssistQueue::default()),
             dlna: commands::DlnaState::default(),
             sync: Arc::new(std::sync::Mutex::new(sync::SyncRuntime::default())),
+            sync_view: Arc::new(std::sync::Mutex::new(sync::RuntimeView::default())),
         })
         .setup(|app| {
             sync_commands::spawn_poller(app.handle().clone());

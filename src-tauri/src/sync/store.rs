@@ -5,7 +5,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
-use super::clock::{observe, tick, Stamp};
+use super::clock::{now_ms, observe, tick, Stamp};
 use super::keys::{locate, SyncKey, SYNCED_SETTINGS};
 use crate::error::{AppError, Result};
 
@@ -67,12 +67,6 @@ pub fn atomically<T>(c: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T>
     }
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 fn encode_value(v: &Option<Value>) -> Result<Option<String>> {
     v.as_ref()

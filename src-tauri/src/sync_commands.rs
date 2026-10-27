@@ -16,7 +16,7 @@ use crate::error::{AppError, Result};
 use crate::models::*;
 use crate::sync::apply::Applied;
 use crate::sync::folder::{self, FolderState};
-use crate::sync::{self, SyncRuntime};
+use crate::sync::{self, RuntimeView, SyncRuntime};
 
 /// Status plus what a round or command changed in the live library.
 pub type Done = (SyncStatus, Applied);
@@ -25,11 +25,16 @@ fn fail(msg: impl Into<String>) -> AppError {
     AppError::Parse(msg.into())
 }
 
-fn lock(rt: &Mutex<SyncRuntime>) -> MutexGuard<'_, SyncRuntime> {
-    rt.lock().unwrap_or_else(|e| e.into_inner())
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn status_with(db: &Db, rt: &SyncRuntime) -> Result<SyncStatus> {
+    status_from(db, &rt.view())
+}
+
+/// The status from the database plus a runtime view. Reads no folder.
+pub fn status_from(db: &Db, rt: &RuntimeView) -> Result<SyncStatus> {
     let enabled = db.get_setting("sync_enabled")?.as_deref() == Some("1");
     let folder = db.get_setting("sync_folder")?;
     let device_id = db.get_setting("sync_device_id")?;
@@ -129,10 +134,13 @@ pub fn configure_with(db: &Db, rt: &mut SyncRuntime, folder: &str, enabled: bool
             match sync::join(db, rt) {
                 Ok(o) => outcome = o.applied,
                 Err(e) => {
-                    // A failed join must not leave sync running half-joined.
-                    if !was_enabled {
-                        db.delete_setting("sync_enabled")?;
+                    // A failed join must not leave sync running against a folder it never
+                    // joined: go back to the folder that was joined, or off if there was none.
+                    match old_folder.as_deref().filter(|_| was_enabled) {
+                        Some(old) => db.set_setting_unpublished("sync_folder", old)?,
+                        None => db.delete_setting("sync_enabled")?,
                     }
+                    *rt = SyncRuntime::default();
                     return Err(e);
                 }
             }
@@ -185,10 +193,13 @@ pub fn map_root_with(db: &Db, rt: &mut SyncRuntime, root_id: i64, library: Optio
     Ok((status_with(db, rt)?, outcome))
 }
 
-pub fn now_with(db: &Db, rt: &mut SyncRuntime) -> Result<Done> {
+/// A round on demand. `force_write` rewrites this machine's file even with nothing
+/// new to say (the Sync now button); window focus passes false, so switching
+/// windows never rewrites a file over a share for nothing.
+pub fn now_with(db: &Db, rt: &mut SyncRuntime, force_write: bool) -> Result<Done> {
     let mut outcome = Applied::default();
     if db.get_setting("sync_enabled")?.as_deref() == Some("1") {
-        outcome = match sync::round(db, rt, true) {
+        outcome = match sync::round(db, rt, force_write) {
             Ok(o) => o.applied,
             Err(e) => {
                 rt.error = Some(e.to_string());
@@ -227,17 +238,23 @@ pub fn tick_with(db: &Db, rt: &mut SyncRuntime, read: bool) -> Result<Done> {
     Ok((status_with(db, rt)?, applied))
 }
 
-/// Run a helper on a blocking thread with the runtime locked, then emit the events
-/// its outcome calls for. The lock is held only inside the blocking closure.
+/// Run a helper on a blocking thread with the runtime locked, refresh the status
+/// snapshot, then emit the events its outcome calls for. The lock is held only
+/// inside the blocking closure.
 async fn run(
     app: &AppHandle,
     state: &State<'_, AppState>,
     f: impl FnOnce(&Db, &mut SyncRuntime) -> Result<Done> + Send + 'static,
 ) -> Result<SyncStatus> {
-    let (db, rt) = (state.db.clone(), state.sync.clone());
-    let (status, applied) = tauri::async_runtime::spawn_blocking(move || f(&db, &mut lock(&rt)))
-        .await
-        .map_err(|e| AppError::Io(e.to_string()))??;
+    let (db, rt, view) = (state.db.clone(), state.sync.clone(), state.sync_view.clone());
+    let (status, applied) = tauri::async_runtime::spawn_blocking(move || {
+        let mut rt = lock(&rt);
+        let out = f(&db, &mut rt);
+        *lock(&view) = rt.view();
+        out
+    })
+    .await
+    .map_err(|e| AppError::Io(e.to_string()))??;
     emit(app, &status, &applied);
     Ok(status)
 }
@@ -253,12 +270,17 @@ fn emit(app: &AppHandle, status: &SyncStatus, applied: &Applied) {
     let _ = app.emit("sync-progress", status);
 }
 
+/// Reads the snapshot, never the runtime lock: a round stuck on a hung share must
+/// not freeze the Settings page.
 #[tauri::command]
 pub async fn sync_status(state: State<'_, AppState>) -> Result<SyncStatus> {
-    let (db, rt) = (state.db.clone(), state.sync.clone());
-    tauri::async_runtime::spawn_blocking(move || status_with(&db, &lock(&rt)))
-        .await
-        .map_err(|e| AppError::Io(e.to_string()))?
+    let (db, view) = (state.db.clone(), state.sync_view.clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        let view = lock(&view).clone();
+        status_from(&db, &view)
+    })
+    .await
+    .map_err(|e| AppError::Io(e.to_string()))?
 }
 
 #[tauri::command]
@@ -283,8 +305,8 @@ pub async fn sync_map_root(
 }
 
 #[tauri::command]
-pub async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<SyncStatus> {
-    run(&app, &state, now_with).await
+pub async fn sync_now(app: AppHandle, state: State<'_, AppState>, force_write: bool) -> Result<SyncStatus> {
+    run(&app, &state, move |db, rt| now_with(db, rt, force_write)).await
 }
 
 #[tauri::command]
@@ -304,7 +326,7 @@ pub fn spawn_poller(app: AppHandle) {
             let read = n.is_multiple_of(10);
             n += 1;
             let state = app.state::<AppState>();
-            let (db, rt) = (state.db.clone(), state.sync.clone());
+            let (db, rt, view) = (state.db.clone(), state.sync.clone(), state.sync_view.clone());
             let res = tauri::async_runtime::spawn_blocking(move || {
                 let mut rt = lock(&rt);
                 if !db.get_setting("sync_enabled")?.is_some_and(|v| v == "1") {
@@ -312,6 +334,7 @@ pub fn spawn_poller(app: AppHandle) {
                 }
                 let before = (rt.last_read_at, rt.last_write_at, rt.unreachable_since, rt.error.clone());
                 let (status, applied) = tick_with(&db, &mut rt, read)?;
+                *lock(&view) = rt.view();
                 let after = (rt.last_read_at, rt.last_write_at, rt.unreachable_since, rt.error.clone());
                 // Quiet flush ticks that changed nothing stay silent.
                 Ok::<_, AppError>((read || before != after).then_some((status, applied)))
@@ -583,6 +606,42 @@ mod tests {
         assert!(a.configure(share.path(), "a").is_err());
         assert_eq!(a.db.get_setting("sync_enabled").unwrap(), None);
         assert!(configure_with(&a.db, &mut a.rt, "", false, "").is_ok());
+    }
+
+    #[test]
+    fn failed_join_after_a_folder_change_goes_back_to_the_joined_folder() {
+        let (s1, s2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut a = M::new(&SHOW);
+        a.configure(s1.path(), "a").unwrap();
+        a.db.with(|c| Ok(c.execute_batch("DROP TABLE sync_records")?)).unwrap();
+        assert!(a.configure(s2.path(), "a").is_err());
+        assert_eq!(a.db.get_setting("sync_folder").unwrap().as_deref(), s1.path().to_str());
+        assert_eq!(a.db.get_setting("sync_enabled").unwrap().as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn focus_sync_does_not_rewrite_an_unchanged_file() {
+        let share = tempfile::tempdir().unwrap();
+        let mut a = M::new(&SHOW);
+        a.configure(share.path(), "a").unwrap();
+        a.rt.last_write_at = Some(1);
+        now_with(&a.db, &mut a.rt, false).unwrap();
+        assert_eq!(a.rt.last_write_at, Some(1), "nothing new, so nothing written");
+        now_with(&a.db, &mut a.rt, true).unwrap();
+        assert_ne!(a.rt.last_write_at, Some(1), "Sync now forces the write");
+    }
+
+    #[test]
+    fn status_reads_a_snapshot_not_the_runtime() {
+        let share = tempfile::tempdir().unwrap();
+        let mut a = M::new(&SHOW);
+        a.configure(share.path(), "a").unwrap();
+        let view = a.rt.view();
+        let rt = Mutex::new(std::mem::take(&mut a.rt));
+        let _held = lock(&rt);
+        let st = status_from(&a.db, &view).unwrap();
+        assert!(st.enabled);
+        assert_eq!(st.last_write_at, view.last_write_at);
     }
 
     #[test]

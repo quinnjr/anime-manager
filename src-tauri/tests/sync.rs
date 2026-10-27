@@ -595,3 +595,64 @@ fn concurrent_opposite_folds_with_equal_pins_converge() {
     // Each side pins two files the other way, so the pin counts tie.
     concurrent_folds_converge(5, 2, 2, 3);
 }
+
+/// Write a device file for `id` holding one played record for `SHOW[0]` stamped `stamp`.
+fn foreign_file(share: &Path, id: &str, stamp: &str) {
+    let mut records = std::collections::BTreeMap::new();
+    records.insert(
+        ep_key(SHOW[0]).encode(),
+        folder::WireRecord {
+            v: Some(serde_json::json!({"status": "played", "position_secs": 0.0, "duration_secs": null, "last_played_at": 1})),
+            s: stamp.into(),
+        },
+    );
+    let f = folder::DeviceFile {
+        format: folder::FORMAT,
+        device_id: id.into(),
+        device_name: format!("name-{id}"),
+        written_at: 1,
+        libraries: vec!["Anime".into()],
+        records,
+    };
+    folder::write_own(share, &f).unwrap();
+}
+
+#[test]
+fn far_future_records_are_refused_and_never_observed() {
+    let s = share();
+    let mut b = Machine::joined(s.path(), "dev-b", &SHOW);
+    let ahead = sync::clock::now_ms() + 2 * sync::MAX_AHEAD_MS;
+    foreign_file(s.path(), "dev-x", &sync::clock::Stamp { physical_ms: ahead, counter: 0, device: "dev-x".into() }.encode());
+    b.round();
+    assert_eq!(b.status(SHOW[0]), "unplayed");
+    assert_eq!(b.record(&ep_key(SHOW[0])), None);
+    let err = b.rt.error.clone().expect("refusal reported");
+    assert!(err.contains("a day ahead") && err.contains("name-dev-x"), "{err}");
+    b.watch(SHOW[1]);
+    let stamp = b.record(&ep_key(SHOW[1])).unwrap().stamp;
+    assert!(stamp.physical_ms < ahead, "the clock was dragged forward");
+}
+
+#[test]
+fn records_with_unreadable_stamps_are_reported() {
+    let s = share();
+    let mut b = Machine::joined(s.path(), "dev-b", &SHOW);
+    foreign_file(s.path(), "dev-x", "not-a-stamp");
+    b.round();
+    assert_eq!(b.record(&ep_key(SHOW[0])), None);
+    let err = b.rt.error.clone().expect("bad stamp reported");
+    assert!(err.contains("unreadable stamp"), "{err}");
+}
+
+#[test]
+fn another_machine_writing_this_machines_file_is_reported() {
+    let s = share();
+    let mut a = Machine::joined(s.path(), "dev-a", &SHOW);
+    a.round();
+    assert_eq!(a.rt.error, None);
+    // A copy of this database on another machine writes the same device file.
+    foreign_file(s.path(), "dev-a", &sync::clock::Stamp::min("dev-a").encode());
+    a.round();
+    let err = a.rt.error.clone().expect("clone reported");
+    assert!(err.contains("was the database copied"), "{err}");
+}

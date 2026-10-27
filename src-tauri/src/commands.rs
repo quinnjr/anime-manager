@@ -26,6 +26,9 @@ pub struct AppState {
     /// Library sync bookkeeping. A std mutex: rounds run on blocking threads and the lock is
     /// never held across an await.
     pub sync: Arc<std::sync::Mutex<crate::sync::SyncRuntime>>,
+    /// The runtime's last published view, so `sync_status` answers while a round holds
+    /// `sync` through slow or hung folder I/O.
+    pub sync_view: Arc<std::sync::Mutex<crate::sync::RuntimeView>>,
 }
 
 /// DLNA/UPnP direct-play server state: atomics so `dlna_status` never blocks.

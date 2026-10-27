@@ -44,7 +44,7 @@
 
   async function syncNow() {
     busy = true;
-    try { apply(await api.syncNow()); } catch (e) { toasts.error(e); }
+    try { apply(await api.syncNow(true)); } catch (e) { toasts.error(e); }
     finally { busy = false; }
   }
 

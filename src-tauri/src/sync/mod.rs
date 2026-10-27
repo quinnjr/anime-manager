@@ -42,7 +42,45 @@ pub struct SyncRuntime {
     pub last_write_at: Option<i64>,
     pub unreachable_since: Option<i64>,
     pub error: Option<String>,
+    /// The (mtime, size) this machine's own file had right after it last wrote it.
+    /// Anything else there later means another machine is writing under this id.
+    pub own_seen: Option<folder::Seen>,
 }
+
+/// The part of the runtime the status shows. Kept as a separate snapshot so the
+/// status never waits on the runtime lock, which a round holds through folder I/O.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct RuntimeView {
+    pub devices: std::collections::BTreeMap<String, DeviceInfo>,
+    pub last_read_at: Option<i64>,
+    pub last_write_at: Option<i64>,
+    pub unreachable_since: Option<i64>,
+    pub error: Option<String>,
+}
+
+impl SyncRuntime {
+    pub fn view(&self) -> RuntimeView {
+        RuntimeView {
+            devices: self.devices.clone(),
+            last_read_at: self.last_read_at,
+            last_write_at: self.last_write_at,
+            unreachable_since: self.unreachable_since,
+            error: self.error.clone(),
+        }
+    }
+
+    /// Add a problem to the status line without hiding one already there.
+    fn note(&mut self, msg: String) {
+        self.error = Some(match self.error.take() {
+            Some(e) => format!("{e} {msg}"),
+            None => msg,
+        });
+    }
+}
+
+/// A record stamped further ahead of this machine's clock than this is refused: one
+/// machine with a clock set wrong must not drag every other machine's clock forward.
+pub const MAX_AHEAD_MS: u64 = 24 * 3600 * 1000;
 
 #[derive(Debug, Default, PartialEq)]
 pub struct RoundOutcome {
@@ -104,7 +142,9 @@ fn reachable(cfg: &Config, rt: &mut SyncRuntime) -> bool {
     }
 }
 
-/// Read every other device file. Pure I/O, outside the lock.
+/// Read every other device file. Pure I/O, outside the lock. Resets `rt.error` to
+/// what this read found wrong: unreadable files, unusable records, and a sign that
+/// another machine is writing this machine's file.
 fn read(rt: &mut SyncRuntime, cfg: &Config) -> Vec<Record> {
     let res = folder::read_others(&cfg.folder, &cfg.device_id, &mut rt.cache);
     for f in &res.files {
@@ -117,13 +157,50 @@ fn read(rt: &mut SyncRuntime, cfg: &Config) -> Vec<Record> {
     let present = folder::list_device_ids(&cfg.folder);
     rt.cache.retain(|id, _| present.contains(id));
     rt.devices.retain(|id, _| present.contains(id));
-    rt.error = (!res.skipped.is_empty())
-        .then(|| format!("{} device file(s) unreadable: {}", res.skipped.len(), res.skipped.join(", ")));
-    res.files
-        .into_iter()
-        .flat_map(|f| f.records)
-        .filter_map(|(key, w)| Some(Record { key, value: w.v, stamp: Stamp::parse(&w.s)? }))
-        .collect()
+    rt.error = None;
+    if !res.skipped.is_empty() {
+        rt.note(format!("{} device file(s) unreadable: {}.", res.skipped.len(), res.skipped.join(", ")));
+    }
+    if let (Some(expected), Some(found)) = (&rt.own_seen, folder::own_seen(&cfg.folder, &cfg.device_id))
+        && *expected != found
+    {
+        rt.note(
+            "Another machine is writing this machine's sync file — was the database copied? \
+             Turn sync off on one of them and forget this device there, then set sync up again."
+                .into(),
+        );
+    }
+    let limit = clock::now_ms() + MAX_AHEAD_MS;
+    let (mut bad, mut ahead): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    let mut out = Vec::new();
+    for f in res.files {
+        let (mut n_bad, mut n_ahead) = (0, 0);
+        for (key, w) in f.records {
+            match Stamp::parse(&w.s) {
+                None => n_bad += 1,
+                // Refused before it is merged, so it is never observed into the clock either.
+                Some(s) if s.physical_ms > limit => n_ahead += 1,
+                Some(stamp) => out.push(Record { key, value: w.v, stamp }),
+            }
+        }
+        if n_bad > 0 {
+            bad.push(format!("{n_bad} from {}", f.device_name));
+        }
+        if n_ahead > 0 {
+            ahead.push(format!("{n_ahead} from {}", f.device_name));
+        }
+    }
+    if !bad.is_empty() {
+        rt.note(format!("Records with an unreadable stamp were ignored ({}).", bad.join(", ")));
+    }
+    if !ahead.is_empty() {
+        rt.note(format!(
+            "Records stamped more than a day ahead of this machine's clock were ignored ({}); \
+             check the date and time on that machine and on this one.",
+            ahead.join(", ")
+        ));
+    }
+    out
 }
 
 /// Merge `incoming`, then run `then` in the same transaction. Merging and
@@ -156,9 +233,11 @@ fn merge_then<T>(
     out
 }
 
-/// Apply the stored (winning) record for each key.
-fn apply_keys(c: &Connection, keys: &[String]) -> Result<apply::Applied> {
+/// Apply the stored (winning) record for each key; also returns how many stored
+/// records were unusable (a bad stamp or JSON) and so were skipped.
+fn apply_keys(c: &Connection, keys: &[String]) -> Result<(apply::Applied, usize)> {
     let mut out = apply::Applied::default();
+    let mut bad = 0;
     for key in keys {
         let r: Option<(Option<String>, String)> = c
             .query_row("SELECT value, stamp FROM sync_records WHERE key = ?1", [key], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -167,11 +246,12 @@ fn apply_keys(c: &Connection, keys: &[String]) -> Result<apply::Applied> {
         let (Some(stamp), Ok(value)) =
             (Stamp::parse(&stamp), value.map(|v| serde_json::from_str::<Value>(&v)).transpose())
         else {
+            bad += 1;
             continue;
         };
         out.absorb(apply::apply(c, &Record { key: key.clone(), value, stamp })?);
     }
-    Ok(out)
+    Ok((out, bad))
 }
 
 /// What follows an apply: a synced match may have made a duplicate pair, and a
@@ -189,16 +269,19 @@ pub(crate) fn settle(db: &Db, applied: &apply::Applied) -> Result<()> {
     Ok(())
 }
 
-/// Read others, merge, apply what changed, then `flush`.
+/// Read others, merge, apply what changed, then flush (already known reachable).
 pub fn round(db: &Db, rt: &mut SyncRuntime, force_write: bool) -> Result<RoundOutcome> {
     let Some(cfg) = config(db)? else { return Ok(RoundOutcome::default()) };
     if !reachable(&cfg, rt) {
         return Ok(RoundOutcome::default());
     }
     let incoming = read(rt, &cfg);
-    let applied = merge_then(db, rt, incoming, |c, changed| apply_keys(c, &changed))?;
+    let (applied, bad) = merge_then(db, rt, incoming, |c, changed| apply_keys(c, &changed))?;
+    if bad > 0 {
+        rt.note(format!("{bad} stored record(s) were unreadable and were not applied."));
+    }
     settle(db, &applied)?;
-    let wrote = flush(db, rt, force_write)?;
+    let wrote = write(db, rt, &cfg, force_write, false)?;
     Ok(RoundOutcome { applied, wrote })
 }
 
@@ -220,7 +303,7 @@ pub fn join(db: &Db, rt: &mut SyncRuntime) -> Result<RoundOutcome> {
         apply::apply_all(c)
     })?;
     settle(db, &applied)?;
-    let wrote = flush(db, rt, true)?;
+    let wrote = write(db, rt, &cfg, true, false)?;
     Ok(RoundOutcome { applied, wrote })
 }
 
@@ -243,9 +326,7 @@ pub fn map_root(db: &Db, root_id: i64) -> Result<apply::Applied> {
 fn offer(c: &Connection, entry: Option<Entry>) -> Result<()> {
     // A null is a default ("nothing decided"), never worth publishing at join.
     let Some((key, Some(value))) = entry else { return Ok(()) };
-    if store::get(c, &key)?.is_none() {
-        store::insert_if_absent(c, &key, Some(value), &store::tick_now(c)?)?;
-    }
+    store::insert_if_absent(c, &key, Some(value), &store::tick_now(c)?)?;
     Ok(())
 }
 
@@ -260,15 +341,6 @@ fn column<T: rusqlite::types::FromSql>(c: &Connection, sql: &str) -> Result<Vec<
 /// the share lacks. Defaults are never published. `only_root` limits episodes
 /// and overrides to that root's library (mapping a root); show, torrent and
 /// settings state is offered regardless. Callers apply and fold afterwards.
-pub fn publish_existing(db: &Db, only_root: Option<i64>) -> Result<()> {
-    db.with(|c| {
-        let tx = c.unchecked_transaction()?;
-        publish_existing_in(&tx, only_root)?;
-        tx.commit()?;
-        Ok(())
-    })
-}
-
 fn publish_existing_in(tx: &Connection, only_root: Option<i64>) -> Result<()> {
     if !store::enabled(tx)? {
         return Ok(());
@@ -347,13 +419,19 @@ fn publish_existing_in(tx: &Connection, only_root: Option<i64>) -> Result<()> {
 /// call. Returns whether a file was written.
 pub fn flush(db: &Db, rt: &mut SyncRuntime, force: bool) -> Result<bool> {
     let Some(cfg) = config(db)? else { return Ok(false) };
+    write(db, rt, &cfg, force, true)
+}
+
+/// `flush` for a known config; `probe` is false when the caller (a round) has just
+/// found the folder reachable, so it is not probed a second time.
+fn write(db: &Db, rt: &mut SyncRuntime, cfg: &Config, force: bool, probe: bool) -> Result<bool> {
     let seq = db.with(store::max_seq)?;
     let due = force || (seq > rt.last_written_seq && rt.pending_seq == Some(seq));
     if !due {
         rt.pending_seq = Some(seq);
         return Ok(false);
     }
-    if !reachable(&cfg, rt) {
+    if probe && !reachable(cfg, rt) {
         return Ok(false);
     }
     let (seq, file) = db.with(|c| {
@@ -380,5 +458,6 @@ pub fn flush(db: &Db, rt: &mut SyncRuntime, force: bool) -> Result<bool> {
     rt.last_written_seq = seq;
     rt.pending_seq = None;
     rt.last_write_at = Some(file.written_at);
+    rt.own_seen = folder::own_seen(&cfg.folder, &cfg.device_id);
     Ok(true)
 }

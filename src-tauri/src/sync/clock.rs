@@ -32,6 +32,14 @@ impl Stamp {
     }
 }
 
+/// Wall time in milliseconds since the Unix epoch (0 if the clock is before it).
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Advance for a local event. `last` is the persisted clock, `now_ms` wall time.
 pub fn tick(last: Option<&Stamp>, now_ms: u64, device: &str) -> Stamp {
     let floor = Stamp { physical_ms: now_ms, counter: 0, device: device.to_string() };

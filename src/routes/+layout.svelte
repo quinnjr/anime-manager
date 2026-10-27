@@ -169,7 +169,7 @@
     unlisteners.push(onEvent<SyncStatus>('sync-progress', (s) => (syncEnabled = s.enabled)));
     api.syncStatus().then((s) => (syncEnabled = s.enabled)).catch(() => {});
     unlisteners.push(getCurrentWindow().onFocusChanged(({ payload: focused }) => {
-      if (focused && syncEnabled) api.syncNow().catch(() => {});
+      if (focused && syncEnabled) api.syncNow(false).catch(() => {});
     }));
     api.assistProgress().then((p) => assist.apply(p)).catch(() => {});
     void autoScanPass();

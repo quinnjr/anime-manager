@@ -179,7 +179,9 @@ export const api = {
   syncConfigure: (folder: string, enabled: boolean, deviceName: string) =>
     invoke<SyncStatus>('sync_configure', { folder, enabled, deviceName }),
   syncMapRoot: (rootId: number, library: string | null) => invoke<SyncStatus>('sync_map_root', { rootId, library }),
-  syncNow: () => invoke<SyncStatus>('sync_now'),
+  /** `forceWrite` rewrites this machine's file even when nothing changed (the Sync now
+   *  button); window focus passes false. */
+  syncNow: (forceWrite: boolean) => invoke<SyncStatus>('sync_now', { forceWrite }),
   syncForgetDevice: (deviceId: string) => invoke<SyncStatus>('sync_forget_device', { deviceId }),
   dlnaStatus: () => invoke<DlnaStatus>('dlna_status'),
   dlnaSetEnabled: (enabled: boolean) => invoke<void>('dlna_set_enabled', { enabled }),
