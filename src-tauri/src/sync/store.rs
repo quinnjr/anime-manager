@@ -40,8 +40,31 @@ pub fn device_id(c: &Connection) -> Result<Option<String>> {
     setting(c, "sync_device_id")
 }
 
+/// The persisted clock. A missing or corrupt one is rebuilt from the newest stamp
+/// already stored, so this machine never reissues a stamp at or below one it used.
 fn clock(c: &Connection) -> Result<Option<Stamp>> {
-    Ok(setting(c, "sync_clock")?.and_then(|s| Stamp::parse(&s)))
+    if let Some(s) = setting(c, "sync_clock")?.and_then(|s| Stamp::parse(&s)) {
+        return Ok(Some(s));
+    }
+    let mut st = c.prepare("SELECT stamp FROM sync_records")?;
+    let stamps: Vec<String> = st.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+    Ok(stamps.iter().filter_map(|s| Stamp::parse(s)).max())
+}
+
+/// Run `f` inside a savepoint: everything it wrote lands, or none of it does.
+/// Nests inside an open transaction (or another savepoint) as well as outside one.
+pub fn atomically<T>(c: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    c.execute_batch("SAVEPOINT sync_atomic")?;
+    match f() {
+        Ok(v) => {
+            c.execute_batch("RELEASE sync_atomic")?;
+            Ok(v)
+        }
+        Err(e) => {
+            let _ = c.execute_batch("ROLLBACK TO sync_atomic; RELEASE sync_atomic");
+            Err(e)
+        }
+    }
 }
 
 fn now_ms() -> u64 {
@@ -86,8 +109,12 @@ pub fn record_local(c: &Connection, key: &SyncKey, value: Option<Value>) -> Resu
     if device_id(c)?.is_none() {
         return Ok(false);
     }
-    let stamp = tick_now(c)?;
-    upsert(c, &key.encode(), &value, &stamp)?;
+    // The clock and the record persist together, or a failed upsert would burn a stamp
+    // and a failed clock write would let the next one repeat it.
+    atomically(c, || {
+        let stamp = tick_now(c)?;
+        upsert(c, &key.encode(), &value, &stamp)
+    })?;
     Ok(true)
 }
 
@@ -538,6 +565,85 @@ mod tests {
             record_local(c, &SyncKey::Setting { name: "other".into() }, Some(json!(1)))?;
             let local = get(c, &SyncKey::Setting { name: "other".into() })?.unwrap();
             assert!(local.stamp > future.stamp);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_clock_is_rebuilt_from_the_newest_stored_stamp() {
+        let db = Db::open_memory().unwrap();
+        db.with(|c| {
+            enable(c);
+            let far = rec(now_ms() + 3_600_000, 1);
+            merge_remote(c, &far)?;
+            c.execute("UPDATE settings SET value = 'garbage' WHERE key = 'sync_clock'", [])?;
+            record_local(c, &SyncKey::Setting { name: "other".into() }, Some(json!(1)))?;
+            assert!(get(c, &SyncKey::Setting { name: "other".into() })?.unwrap().stamp > far.stamp);
+            c.execute("DELETE FROM settings WHERE key = 'sync_clock'", [])?;
+            let before = get(c, &SyncKey::Setting { name: "other".into() })?.unwrap().stamp;
+            record_local(c, &key(), Some(json!(2)))?;
+            assert!(get(c, &key())?.unwrap().stamp > before, "a missing clock reissued an old stamp");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_failed_record_leaves_the_clock_alone() {
+        let db = Db::open_memory().unwrap();
+        db.with(|c| {
+            enable(c);
+            record_local(c, &key(), Some(json!(1)))?;
+            let clock_before = setting(c, "sync_clock")?;
+            c.execute_batch(
+                "CREATE TEMP TRIGGER no_insert BEFORE UPDATE ON sync_records BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )?;
+            assert!(record_local(c, &key(), Some(json!(2))).is_err());
+            assert_eq!(setting(c, "sync_clock")?, clock_before);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn merge_remote_bumps_seq_only_when_it_replaces() {
+        let db = Db::open_memory().unwrap();
+        db.with(|c| {
+            enable(c);
+            assert!(merge_remote(c, &rec(200, 2))?);
+            let s1 = max_seq(c)?;
+            assert!(!merge_remote(c, &rec(100, 1))?, "older loses");
+            assert!(!merge_remote(c, &rec(200, 2))?, "equal is not newer");
+            assert_eq!(max_seq(c)?, s1);
+            assert!(merge_remote(c, &rec(300, 3))?);
+            assert!(max_seq(c)? > s1);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn tombstone_round_trips() {
+        let db = Db::open_memory().unwrap();
+        db.with(|c| {
+            enable(c);
+            record_local(c, &key(), Some(json!(1)))?;
+            record_local(c, &key(), None)?;
+            let r = get(c, &key())?.unwrap();
+            assert_eq!(r.value, None);
+            let wire = serde_json::to_string(&crate::sync::folder::WireRecord { v: r.value.clone(), s: r.stamp.encode() })
+                .map_err(|e| AppError::Db(e.to_string()))?;
+            let back: crate::sync::folder::WireRecord =
+                serde_json::from_str(&wire).map_err(|e| AppError::Db(e.to_string()))?;
+            assert_eq!(back.v, None);
+            let other = Db::open_memory().unwrap();
+            other.with(|o| {
+                let incoming = Record { key: key().encode(), value: back.v.clone(), stamp: Stamp::parse(&back.s).unwrap() };
+                assert!(merge_remote(o, &incoming)?);
+                assert_eq!(get(o, &key())?, Some(incoming));
+                Ok(())
+            })?;
             Ok(())
         })
         .unwrap();
