@@ -224,20 +224,42 @@ fn episode_value_with(c: &Connection, episode_id: i64, missing_as_prev: bool) ->
     Ok(Some((SyncKey::Episode { library, relpath }, value)))
 }
 
-/// A scan-detected move: the row now at a new path carries the old path's
-/// record stamp, never a fresh one. A scan can run before this machine has read
+/// A scan-detected move: the new path gets the old path's record, value and
+/// stamp both, never a fresh stamp. A scan can run before this machine has read
 /// the share, and a fresh stamp would let its stale state beat a newer record
-/// another machine already published for the new path. The old record stays
-/// (a disappearance deletes nothing); with no old record nothing is published.
+/// another machine already published for the new path. Carrying the record's
+/// own value (not this machine's row) means two machines detecting the same move
+/// publish the same thing under the same stamp, so they cannot disagree. The old
+/// record stays (a disappearance deletes nothing); with no old record, or a
+/// tombstone there, nothing is carried. A carried record that wins is applied.
 pub fn carry_moved_episode(c: &Connection, episode_id: i64, old_path: &str) -> Result<()> {
     if device_id(c)?.is_none() {
         return Ok(());
     }
     let Some((library, relpath)) = locate(c, old_path)? else { return Ok(()) };
     let Some(old) = get(c, &SyncKey::Episode { library, relpath })? else { return Ok(()) };
-    let Some((key, value)) = episode_value(c, episode_id)? else { return Ok(()) };
-    merge_remote(c, &Record { key: key.encode(), value: Some(value), stamp: old.stamp })?;
+    let Some(value) = old.value else { return Ok(()) };
+    let path: String = c.query_row("SELECT path FROM episodes WHERE id = ?1", [episode_id], |r| r.get(0))?;
+    let Some((library, relpath)) = locate(c, &path)? else { return Ok(()) };
+    let carried = Record { key: SyncKey::Episode { library, relpath }.encode(), value: Some(value), stamp: old.stamp };
+    if merge_remote(c, &carried)? {
+        super::apply::apply(c, &carried)?;
+    }
     Ok(())
+}
+
+/// A Rename: publish the row's state at its new path and tombstone the old one.
+/// A playing or missing row has no value of its own, so the old record's value
+/// moves to the new path (freshly stamped: a rename is the user's own act).
+pub fn move_episode_record(c: &Connection, episode_id: i64, old_path: &str, new_path: &str) -> Result<()> {
+    if episode_value(c, episode_id)?.is_some() {
+        publish_episode(c, episode_id)?;
+    } else if let (Some((ol, orel)), Some((nl, nrel))) = (locate(c, old_path)?, locate(c, new_path)?)
+        && let Some(Record { value: Some(v), .. }) = get(c, &SyncKey::Episode { library: ol, relpath: orel })?
+    {
+        record_local(c, &SyncKey::Episode { library: nl, relpath: nrel }, Some(v))?;
+    }
+    tombstone_path(c, true, old_path)
 }
 
 /// Record the episode's current watched state, when it is syncable and differs from the

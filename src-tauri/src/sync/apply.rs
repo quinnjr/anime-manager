@@ -167,7 +167,9 @@ fn apply_episode(c: &Connection, id: i64, local: &str, show: i64, v: &Value) -> 
             params![id, status],
         )?,
         _ => {
-            let position = v.get("position_secs").and_then(Value::as_f64).unwrap_or(0.0);
+            // A record without a usable position is malformed: keep the local row as it is
+            // rather than rewinding it to the start.
+            let Some(position) = v.get("position_secs").and_then(Value::as_f64) else { return NOTHING };
             let duration = v.get("duration_secs").and_then(Value::as_f64);
             let last = int_field(v, "last_played_at");
             c.execute(
@@ -369,16 +371,19 @@ pub fn apply_for_episode(c: &Connection, episode_id: i64) -> Result<()> {
     // Pins and feeds are keyed on hash and label, so the ones naming this show are found by
     // value. An encoded key starts `["tag",`; `-` sorts right after `,`, so each tag is one
     // range of the primary key rather than a scan of every record.
+    // The rows come back whole, so a scan does not re-read each record by key.
+    let mut st = c.prepare("SELECT key, value, stamp FROM sync_records WHERE key >= ?1 AND key < ?2 AND value IS NOT NULL")?;
     for tag in ["tlink", "tbatch", "rss"] {
         let lo = format!("[\"{tag}\",");
         let hi = format!("[\"{tag}\"-");
-        let mut st = c.prepare("SELECT key FROM sync_records WHERE key >= ?1 AND key < ?2 AND value IS NOT NULL")?;
-        let keys: Vec<String> = st.query_map([&lo, &hi], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
-        for k in keys.iter().filter_map(|k| SyncKey::parse(k)) {
-            let Some(r) = store::get(c, &k)? else { continue };
-            let names = r.value.as_ref().is_some_and(|v| v.as_str().or_else(|| str_field(v, "title")) == Some(&title));
-            if names {
-                apply(c, &r)?;
+        let rows: Vec<(String, String, String)> =
+            st.query_map([&lo, &hi], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?;
+        for (key, value, stamp) in rows {
+            let (Ok(value), Some(stamp)) = (serde_json::from_str::<Value>(&value), super::clock::Stamp::parse(&stamp)) else {
+                continue;
+            };
+            if value.as_str().or_else(|| str_field(&value, "title")) == Some(title.as_str()) {
+                apply(c, &Record { key, value: Some(value), stamp })?;
             }
         }
     }
@@ -571,8 +576,10 @@ mod tests {
         remote(&db, SyncKey::TorrentLink { info_hash: "abc".into() }, Some(json!({"title": "Show", "season": 1, "number": 1})));
         remote(&db, SyncKey::TorrentPrefs { title: "Show".into() }, Some(json!({"save_path": null, "category": "c"})));
         remote(&db, SyncKey::Rss { label: "f".into() }, Some(json!("Show")));
+        remote(&db, SyncKey::TorrentBatch { info_hash: "def".into() },
+            Some(json!({"title": "Show", "season": 1, "first": 1, "last": 12, "resolution": null})));
         all(&db);
-        assert_eq!(count(&db, "SELECT (SELECT COUNT(*) FROM torrent_links) + (SELECT COUNT(*) FROM torrent_prefs) + (SELECT COUNT(*) FROM rss_feeds)"), 3);
+        assert_eq!(count(&db, "SELECT (SELECT COUNT(*) FROM torrent_links) + (SELECT COUNT(*) FROM torrent_prefs) + (SELECT COUNT(*) FROM rss_feeds) + (SELECT COUNT(*) FROM torrent_batches)"), 4);
         let tomb = |k: SyncKey| {
             let r = Record { key: k.encode(), value: None, stamp: Stamp { physical_ms: 2_000, counter: 0, device: "dev-b".into() } };
             db.with(|c| store::merge_remote(c, &r).map(|_| ())).unwrap();
@@ -580,8 +587,72 @@ mod tests {
         tomb(SyncKey::TorrentLink { info_hash: "abc".into() });
         tomb(SyncKey::TorrentPrefs { title: "Show".into() });
         tomb(SyncKey::Rss { label: "f".into() });
+        tomb(SyncKey::TorrentBatch { info_hash: "def".into() });
         assert!(all(&db).library_changed);
-        assert_eq!(count(&db, "SELECT (SELECT COUNT(*) FROM torrent_links) + (SELECT COUNT(*) FROM torrent_prefs) + (SELECT COUNT(*) FROM rss_feeds)"), 0);
+        assert_eq!(count(&db, "SELECT (SELECT COUNT(*) FROM torrent_links) + (SELECT COUNT(*) FROM torrent_prefs) + (SELECT COUNT(*) FROM rss_feeds) + (SELECT COUNT(*) FROM torrent_batches)"), 0);
+    }
+
+    fn later(db: &Db, key: SyncKey, value: Option<Value>) {
+        let r = Record { key: key.encode(), value, stamp: Stamp { physical_ms: 2_000, counter: 0, device: "dev-b".into() } };
+        db.with(|c| store::merge_remote(c, &r).map(|_| ())).unwrap();
+    }
+
+    #[test]
+    fn null_title_override_and_season_title_clear_them() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib");
+        db.upsert_episode(&pn("Show", 2, 1), &rf("/lib/Show/1.mkv", 1, 1)).unwrap();
+        remote(&db, SyncKey::ShowTitleOverride { title: "Show".into() }, Some(json!("Mine")));
+        remote(&db, SyncKey::SeasonTitle { title: "Show".into(), season: 2 }, Some(json!("Show Two")));
+        all(&db);
+        assert_eq!(db.get_show(sid(&db, "Show")).unwrap().display_title, "Mine");
+        later(&db, SyncKey::ShowTitleOverride { title: "Show".into() }, None);
+        later(&db, SyncKey::SeasonTitle { title: "Show".into(), season: 2 }, None);
+        assert_eq!(all(&db).shows, vec![sid(&db, "Show")]);
+        assert_eq!(db.get_show(sid(&db, "Show")).unwrap().display_title, "Show");
+        assert_eq!(db.season_title("Show", 2).unwrap(), None);
+    }
+
+    #[test]
+    fn setting_tombstone_deletes_and_disarms() {
+        let db = Db::open_memory().unwrap();
+        enable(&db);
+        db.set_setting_unpublished("llm_base_url", "http://a").unwrap();
+        db.set_setting_unpublished("torrent_base_url", "http://t").unwrap();
+        remote(&db, SyncKey::Setting { name: "llm_base_url".into() }, None);
+        remote(&db, SyncKey::Setting { name: "torrent_base_url".into() }, None);
+        let applied = all(&db);
+        assert!(applied.disarm_llm && applied.disarm_torrent);
+        assert_eq!(db.get_setting("llm_base_url").unwrap(), None);
+        assert_eq!(db.get_setting("torrent_base_url").unwrap(), None);
+    }
+
+    #[test]
+    fn first_scan_applies_a_pending_match_tombstone() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib");
+        db.upsert_episode(&pn("Show", 1, 1), &rf("/lib/Show/1.mkv", 1, 1)).unwrap();
+        let id = sid(&db, "Show");
+        db.with(|c| Ok(c.execute("UPDATE shows SET match_source = 'kitsu', anilist_id = 7 WHERE id = ?1", [id])?)).unwrap();
+        remote(&db, SyncKey::ShowMatch { title: "Show".into() }, None);
+        db.upsert_episode(&pn("Show", 1, 2), &rf("/lib/Show/2.mkv", 2, 1)).unwrap();
+        let row: (Option<String>, Option<i64>) = db.with(|c| Ok(c.query_row(
+            "SELECT match_source, anilist_id FROM shows WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?)).unwrap();
+        assert_eq!(row, (None, None));
+    }
+
+    #[test]
+    fn episode_record_without_a_position_is_skipped() {
+        let db = Db::open_memory().unwrap();
+        sync_on(&db, "/lib");
+        db.upsert_episode(&pn("Show", 1, 1), &rf("/lib/Show/1.mkv", 1, 1)).unwrap();
+        db.with(|c| Ok(c.execute("UPDATE episodes SET position_secs = 500", [])?)).unwrap();
+        remote(&db, ep("Show/1.mkv"), Some(json!({"status": "played", "position_secs": "lots", "last_played_at": 5})));
+        assert_eq!(all(&db), Applied::default());
+        assert_eq!(state(&db, "/lib/Show/1.mkv"), ("unplayed".into(), None, 500.0, None, None));
+        later(&db, ep("Show/1.mkv"), Some(json!({"status": "played", "last_played_at": 5})));
+        assert_eq!(all(&db), Applied::default());
+        assert_eq!(state(&db, "/lib/Show/1.mkv").2, 500.0);
     }
 
     #[test]

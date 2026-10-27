@@ -430,6 +430,8 @@ mod tests {
     }
 
     const SHOW: [&str; 2] = ["Show/Show - 01.mkv", "Show/Show - 02.mkv"];
+    /// The library every machine here maps its root to.
+    const LIB: &str = "Anime";
 
     struct M {
         db: Db,
@@ -457,7 +459,7 @@ mod tests {
             configure_with(&self.db, &mut self.rt, dir.to_str().unwrap(), true, name)
         }
         fn map(&mut self) -> Done {
-            map_root_with(&self.db, &mut self.rt, self.root_id, Some("Anime".into())).unwrap()
+            map_root_with(&self.db, &mut self.rt, self.root_id, Some(LIB.into())).unwrap()
         }
         fn ep_id(&self, rel: &str) -> i64 {
             let p = self.root.join(rel).to_str().unwrap().to_string();
@@ -473,7 +475,7 @@ mod tests {
                 .unwrap()
         }
         fn has_record(&self, rel: &str) -> bool {
-            let key = crate::sync::keys::SyncKey::Episode { library: "Anime".into(), relpath: rel.into() };
+            let key = crate::sync::keys::SyncKey::Episode { library: LIB.into(), relpath: rel.into() };
             self.db.with(|c| crate::sync::store::get(c, &key)).unwrap().is_some()
         }
         fn own_file_libraries(&self, share: &Path) -> Vec<String> {
