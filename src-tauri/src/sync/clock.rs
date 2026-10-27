@@ -16,9 +16,10 @@ impl Stamp {
         Stamp { physical_ms: Self::MIN_PHYSICAL, counter: 0, device: device.to_string() }
     }
 
-    /// `{physical:015}-{counter:06}-{device}`; string order equals `Ord`.
+    /// `{physical:015}-{counter:010}-{device}`; string order equals `Ord` (ten digits
+    /// hold any `u32`, so the counter never outgrows its padding).
     pub fn encode(&self) -> String {
-        format!("{:015}-{:06}-{}", self.physical_ms, self.counter, self.device)
+        format!("{:015}-{:010}-{}", self.physical_ms, self.counter, self.device)
     }
 
     pub fn parse(s: &str) -> Option<Stamp> {
@@ -56,11 +57,14 @@ fn advance(last: Option<&Stamp>, other: &Stamp, device: &str, after_other: bool)
     if after_other && other.physical_ms == physical_ms {
         counter = Some(counter.map_or(other.counter, |c| c.max(other.counter)));
     }
-    Stamp {
-        physical_ms,
-        counter: counter.map_or(0, |c| c + 1),
-        device: device.to_string(),
-    }
+    // A counter that cannot advance moves to the next millisecond instead, which still
+    // sorts after every input.
+    let (physical_ms, counter) = match counter {
+        None => (physical_ms, 0),
+        Some(u32::MAX) => (physical_ms + 1, 0),
+        Some(c) => (physical_ms, c + 1),
+    };
+    Stamp { physical_ms, counter, device: device.to_string() }
 }
 
 #[cfg(test)]
@@ -73,7 +77,8 @@ mod tests {
 
     #[test]
     fn encode_order_matches_ord() {
-        let ordered = [s(5, 0, "a"), s(5, 1, "a"), s(6, 0, "a"), s(6, 0, "b")];
+        let ordered = [s(5, 0, "a"), s(5, 1, "a"), s(5, 999_999, "a"), s(5, 1_000_000, "a"), s(5, u32::MAX, "a"),
+            s(6, 0, "a"), s(6, 0, "b")];
         for w in ordered.windows(2) {
             assert!(w[0] < w[1]);
             assert!(w[0].encode() < w[1].encode());
@@ -97,8 +102,39 @@ mod tests {
     fn observe_then_tick_orders_after_remote() {
         let remote = s(9000, 7, "x");
         let clock = observe(Some(&s(1000, 0, "d")), &remote, "d");
-        assert!(clock >= remote);
+        assert!(clock > remote);
         assert!(tick(Some(&clock), 1000, "d") > remote);
+    }
+
+    #[test]
+    fn observe_without_a_clock_lands_after_the_seen_stamp() {
+        let seen = s(9000, 7, "x");
+        assert_eq!(observe(None, &seen, "d"), s(9000, 8, "d"));
+    }
+
+    #[test]
+    fn observing_an_older_stamp_still_advances_past_the_clock() {
+        let last = s(9000, 2, "d");
+        let next = observe(Some(&last), &s(1000, 50, "x"), "d");
+        assert_eq!(next, s(9000, 3, "d"));
+        assert!(next > last);
+    }
+
+    #[test]
+    fn observing_equal_physical_takes_the_larger_counter() {
+        let next = observe(Some(&s(1000, 3, "d")), &s(1000, 7, "x"), "d");
+        assert_eq!(next, s(1000, 8, "d"));
+        assert_eq!(observe(Some(&s(1000, 9, "d")), &s(1000, 7, "x"), "d"), s(1000, 10, "d"));
+    }
+
+    #[test]
+    fn a_full_counter_moves_to_the_next_millisecond() {
+        let last = s(1000, u32::MAX, "d");
+        assert_eq!(tick(Some(&last), 500, "d"), s(1001, 0, "d"));
+        let seen = s(1000, u32::MAX, "x");
+        let next = observe(Some(&s(1000, 1, "d")), &seen, "d");
+        assert!(next > seen && next > last.clone());
+        assert_eq!(next, s(1001, 0, "d"));
     }
 
     #[test]
