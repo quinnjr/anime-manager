@@ -372,7 +372,7 @@
   }
 
   async function undo() {
-    try { const r = await api.undoRename(); toasts.push('success', `Put back ${r.renamed} file(s)`); for (const s of r.skipped.slice(0, 3)) toasts.push('info', s); }
+    try { const r = await api.undoRename(); toasts.push('success', `Put back ${r.renamed} file(s)`); for (const s of r.skipped.slice(0, 3)) toasts.push('warning', s); }
     catch (e) { toasts.error(e); }
   }
   async function purge() {
