@@ -59,7 +59,7 @@ pub struct DetectedPlayer {
     /// Where it was found; `None` when it is not installed where we looked.
     pub path: Option<String>,
     /// Whether this build can drive it. MPC-HC's control interface is Windows
-    /// window messages, which arrive with Windows support.
+    /// window messages, so only a Windows build can.
     pub supported: bool,
     /// Every place checked, for the "no player found" message.
     pub looked: Vec<String>,
@@ -242,7 +242,7 @@ pub fn decide(choice: PlayerChoice, detected: &[DetectedPlayer]) -> Result<PlayD
         let tried: Vec<String> = detected
             .iter()
             .map(|d| match &d.path {
-                Some(path) => format!("{} found at {path} but its playback arrives with Windows support", d.label),
+                Some(path) => format!("{} found at {path} but its playback needs Windows", d.label),
                 None => format!("{} (looked for {})", d.label, d.looked.join(", ")),
             })
             .collect();
@@ -255,7 +255,7 @@ pub fn decide(choice: PlayerChoice, detected: &[DetectedPlayer]) -> Result<PlayD
         PlayerChoice::Only(wanted) if wanted != backend => {
             Some(if entry(wanted).is_some_and(|d| d.found.is_some()) {
                 format!(
-                    "{} playback arrives with Windows support, using {}",
+                    "{} playback needs Windows, using {}",
                     wanted.label(),
                     backend.label()
                 )
@@ -507,7 +507,7 @@ mod tests {
         assert_eq!(got[0].path, None);
         assert_eq!(got[1].path.as_deref(), custom.to_str());
         assert!(got[0].supported && got[1].supported);
-        assert!(!got[2].supported, "MPC-HC playback arrives with Windows support");
+        assert_eq!(got[2].supported, cfg!(windows), "MPC-HC is driven over Windows window messages");
     }
 
     #[test]
@@ -557,24 +557,55 @@ mod tests {
         assert_eq!(d.notice.as_deref(), Some("VLC not found, falling back to mpv"));
     }
 
+    /// MPC-HC as a build that cannot drive it (anything but Windows) sees it.
+    fn found_unsupported(backend: PlayerBackend, path: &str) -> DetectedPlayer {
+        DetectedPlayer { supported: false, ..found(backend, path) }
+    }
+
     #[test]
     fn mpc_hc_found_but_unsupported_falls_back_saying_why() {
         let d = decide(
             PlayerChoice::Only(PlayerBackend::MpcHc),
-            &[missing(PlayerBackend::Mpv), found(PlayerBackend::Vlc, "/v/vlc"), found(PlayerBackend::MpcHc, "/p/mpc-hc64.exe")],
+            &[
+                missing(PlayerBackend::Mpv),
+                found(PlayerBackend::Vlc, "/v/vlc"),
+                found_unsupported(PlayerBackend::MpcHc, "/p/mpc-hc64.exe"),
+            ],
         )
         .unwrap();
         assert_eq!(d.candidates[0].0, PlayerBackend::Vlc);
         let notice = d.notice.unwrap();
-        assert!(notice.contains("MPC-HC playback arrives with Windows support"), "{notice}");
+        assert!(notice.contains("MPC-HC playback needs Windows"), "{notice}");
         assert!(notice.contains("VLC"), "{notice}");
         // Automatic never lands on it either.
         let err = decide(
             PlayerChoice::Auto,
-            &[missing(PlayerBackend::Mpv), missing(PlayerBackend::Vlc), found(PlayerBackend::MpcHc, "/p/mpc-hc64.exe")],
+            &[
+                missing(PlayerBackend::Mpv),
+                missing(PlayerBackend::Vlc),
+                found_unsupported(PlayerBackend::MpcHc, "/p/mpc-hc64.exe"),
+            ],
         )
         .unwrap_err();
-        assert!(err.contains("arrives with Windows support"), "{err}");
+        assert!(err.contains("needs Windows"), "{err}");
+    }
+
+    #[test]
+    fn a_supported_mpc_hc_is_used_like_any_other_player() {
+        let mpc = DetectedPlayer { supported: true, ..found(PlayerBackend::MpcHc, "/p/mpc-hc64.exe") };
+        let d = decide(
+            PlayerChoice::Auto,
+            &[missing(PlayerBackend::Mpv), missing(PlayerBackend::Vlc), mpc.clone()],
+        )
+        .unwrap();
+        assert_eq!(d.candidates, vec![(PlayerBackend::MpcHc, PathBuf::from("/p/mpc-hc64.exe"))]);
+        let d = decide(
+            PlayerChoice::Only(PlayerBackend::MpcHc),
+            &[found(PlayerBackend::Mpv, "/m/mpv"), missing(PlayerBackend::Vlc), mpc],
+        )
+        .unwrap();
+        assert_eq!(d.candidates[0].0, PlayerBackend::MpcHc);
+        assert_eq!(d.notice, None);
     }
 
     #[test]

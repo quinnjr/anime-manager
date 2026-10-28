@@ -41,6 +41,10 @@ tauri-plugin-opener = "2.5.5"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# MPC-HC's /slave control is window messages (mpc_hc.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
+
 [dev-dependencies]
 tempfile = "3"
 wiremock = "0.6"

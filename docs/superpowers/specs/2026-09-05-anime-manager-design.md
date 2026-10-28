@@ -229,7 +229,8 @@ These are load-bearing; each exists because its absence destroys user data.
   position or match: a row already flagged missing is restored to its `prev_status`. It becomes an
   episode again on the scan that first finds it non-empty. A preallocated or partially-written file
   carries a non-zero size and is not distinguished from a complete one.
-- **Untracked playback writes nothing.** If mpv's IPC socket never connects there is no position
+- **Untracked playback writes nothing.** If the player's control channel never connects (mpv's
+  IPC socket, VLC's RC port, MPC-HC's `CMD_CONNECT`) there is no position
   or duration, so the watched judgement is skipped entirely and the episode's progress is left
   exactly as it was, with an error explaining why.
 - **A cleared AniList match stays cleared.** `shows.anilist_cleared` excludes the show from
@@ -256,6 +257,18 @@ These are load-bearing; each exists because its absence destroys user data.
    state are written to the show, so its next play restores them. Emit
    `playback-changed`.
 5. On app start, any `playing` rows are reset to `unplayed` (crash recovery).
+
+**MPC-HC (Windows only)** has no socket interface; it is driven through its `/slave`
+window-message API. The app opens a hidden message-only window and launches
+`mpc-hc64 /slave <hwnd> /new /play /close /start <position ms> [/fullscreen] <path>`.
+MPC-HC announces itself with `CMD_CONNECT` (its own window handle) and its duration with
+`CMD_NOWPLAYING`; each poll sends `CMD_GETCURRENTPOSITION` and reads the `CMD_CURRENTPOSITION`
+reply, and `CMD_NOTIFYSEEK` updates the position between polls. Under `/close` MPC-HC exits at
+the end of the file without sending `CMD_NOTIFYENDOFSTREAM` (verified on 2.8.2), so, as for mpv
+and VLC, the watched judgement uses the last poll. Messages from any window other than the one
+that connected are ignored: any process on the desktop can send `WM_COPYDATA`. The API reports neither volume nor window state, so an MPC-HC run restores only
+fullscreen and records no player state: the show keeps what mpv or VLC last saved. A
+`CMD_CONNECT` that never arrives within the 5 s connect window is the untracked case of step 3.
 
 `set_status(episode_id, status)` is always available for manual override.
 mpv missing → `AppError::Player`, no state change.
