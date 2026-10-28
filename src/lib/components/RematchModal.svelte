@@ -29,7 +29,7 @@
       // Always replace: leaving the previous query's rows on screen lets the user apply a hit
       // that belongs to a different search.
       hits = res.hits;
-      for (const w of res.warnings) toasts.push('info', `Search: ${w}`);
+      for (const w of res.warnings) toasts.push('warning', `Search: ${w}`);
     } catch (e) {
       if (mine !== searchGen) return;
       hits = [];
