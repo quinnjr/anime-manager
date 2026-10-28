@@ -7,6 +7,7 @@ pub mod http;
 pub mod kitsu;
 pub mod llm;
 pub mod metadata;
+pub mod mpc_hc;
 pub mod models;
 pub mod nyaa;
 pub mod parser;

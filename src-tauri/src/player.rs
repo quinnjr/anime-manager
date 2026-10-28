@@ -97,9 +97,9 @@ impl PlayerBackend {
     }
 
     /// Whether this build can track playback in it. MPC-HC is driven through
-    /// Windows window messages, which arrive with Windows support.
+    /// Windows window messages (`mpc_hc.rs`), so only a Windows build can.
     pub fn playable_here(self) -> bool {
-        !matches!(self, PlayerBackend::MpcHc)
+        cfg!(windows) || !matches!(self, PlayerBackend::MpcHc)
     }
 }
 
@@ -235,7 +235,7 @@ impl Endpoint {
                 let l = std::net::TcpListener::bind(("127.0.0.1", 0))?;
                 Ok(Endpoint::Tcp(l.local_addr()?))
             }
-            // Refused at the top of `run`: MPC-HC is driven over window messages.
+            // MPC-HC is driven over window messages: `Control::Window`, never a socket.
             PlayerBackend::MpcHc => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
         }
     }
@@ -260,7 +260,7 @@ impl Endpoint {
             (PlayerBackend::Vlc, Endpoint::Tcp(addr)) => {
                 vec!["--rc-host".into(), addr.to_string(), "--rc-quiet".into()]
             }
-            // Never launched: `run` refuses it before an endpoint exists.
+            // Never given a socket: see `Control::player_args`.
             (PlayerBackend::MpcHc, _) => Vec::new(),
             #[cfg(windows)]
             _ => unreachable!("for_run picks the endpoint kind per backend"),
@@ -294,6 +294,66 @@ impl Endpoint {
                 .await
                 .ok()
                 .map(|s| Box::new(s) as Conn),
+        }
+    }
+}
+
+/// How one run talks to its player: a socket for mpv and VLC, or, for MPC-HC on
+/// Windows, the hidden window its `/slave` messages are sent to.
+enum Control {
+    Socket(Endpoint),
+    #[cfg(windows)]
+    Window(Option<crate::mpc_hc::Host>),
+}
+
+impl Control {
+    fn for_run(backend: PlayerBackend, episode_id: i64) -> std::io::Result<Control> {
+        #[cfg(windows)]
+        if backend == PlayerBackend::MpcHc {
+            return Ok(Control::Window(Some(crate::mpc_hc::Host::new()?)));
+        }
+        Endpoint::for_run(backend, episode_id).map(Control::Socket)
+    }
+
+    fn player_args(&self, backend: PlayerBackend) -> Vec<String> {
+        match self {
+            Control::Socket(ep) => ep.player_args(backend),
+            #[cfg(windows)]
+            Control::Window(host) => host
+                .as_ref()
+                .map(|h| vec!["/slave".into(), h.hwnd().to_string()])
+                .unwrap_or_default(),
+        }
+    }
+
+    fn clean(&self) {
+        // A match, not `if let`: on unix `Socket` is the only variant, and the
+        // pattern would be irrefutable there.
+        match self {
+            Control::Socket(ep) => ep.clean(),
+            // The window closes when its host is dropped, with the poller.
+            #[cfg(windows)]
+            Control::Window(_) => {}
+        }
+    }
+
+    async fn connect(&mut self, backend: PlayerBackend, timeout: Duration) -> Option<Poller> {
+        match self {
+            Control::Socket(ep) => match backend {
+                PlayerBackend::Mpv => Ipc::connect(ep, timeout)
+                    .await
+                    .map(|ipc| Poller::Mpv(MpvPoller { ipc })),
+                PlayerBackend::Vlc => VlcRc::connect(ep, timeout)
+                    .await
+                    .map(|rc| Poller::Vlc(VlcPoller { rc })),
+                PlayerBackend::MpcHc => None,
+            },
+            #[cfg(windows)]
+            Control::Window(host) => host
+                .take()?
+                .connect(timeout)
+                .await
+                .map(|session| Poller::Mpc(MpcPoller { session })),
         }
     }
 }
@@ -535,9 +595,34 @@ impl PollBackend for VlcPoller {
     }
 }
 
+/// MPC-HC reports position and duration only: no volume or window state, so a
+/// run leaves `st.volume` unset and the show's saved player state untouched.
+/// Under `/close` it exits at the end of the file without sending
+/// `CMD_NOTIFYENDOFSTREAM` (seen on 2.8.2), so, as with mpv and VLC, the last
+/// poll is what the watched judgement rests on.
+#[cfg(windows)]
+struct MpcPoller {
+    session: crate::mpc_hc::Session,
+}
+
+#[cfg(windows)]
+impl PollBackend for MpcPoller {
+    async fn poll_tick(&mut self, st: &mut PollState) {
+        let t = self.session.tick().await;
+        if let Some(p) = t.position {
+            st.last_pos = p;
+        }
+        if t.duration.is_some() {
+            st.duration = t.duration;
+        }
+    }
+}
+
 enum Poller {
     Mpv(MpvPoller),
     Vlc(VlcPoller),
+    #[cfg(windows)]
+    Mpc(MpcPoller),
 }
 
 impl PollBackend for Poller {
@@ -545,6 +630,8 @@ impl PollBackend for Poller {
         match self {
             Poller::Mpv(p) => p.poll_tick(st).await,
             Poller::Vlc(p) => p.poll_tick(st).await,
+            #[cfg(windows)]
+            Poller::Mpc(p) => p.poll_tick(st).await,
         }
     }
 }
@@ -654,7 +741,7 @@ async fn run<N: Fn(PlaybackChanged) + Sync>(
 ) -> std::result::Result<(), RunError> {
     if !backend.playable_here() {
         return Err(RunError::NotStarted(AppError::Player(format!(
-            "{} playback arrives with Windows support",
+            "{} playback needs Windows",
             backend.label()
         ))));
     }
@@ -666,25 +753,25 @@ async fn run<N: Fn(PlaybackChanged) + Sync>(
         None => None,
     };
     player.claim(episode_id)?;
-    let sock = Endpoint::for_run(backend, episode_id).map_err(|e| {
+    let mut control = Control::for_run(backend, episode_id).map_err(|e| {
         player.release();
         AppError::Player(format!("could not set up {}'s control socket: {e}", backend.as_str()))
     })?;
-    sock.clean();
+    control.clean();
 
     // VLC keeps its normal window through the extra RC interface; `--intf rc`
     // would replace the GUI with a console, which is not what playback wants.
     let mut cmd = Command::new(bin);
     match backend {
         PlayerBackend::Mpv => cmd
-            .args(sock.player_args(backend))
+            .args(control.player_args(backend))
             .arg(format!("--start={}", ep.position_secs))
             .arg("--force-window")
             .args(mpv_state_args(saved.as_ref())),
         PlayerBackend::Vlc => cmd
             .arg("--extraintf")
             .arg("rc")
-            .args(sock.player_args(backend))
+            .args(control.player_args(backend))
             .arg("--play-and-exit")
             // VLC takes integer seconds, so round rather than truncate: rounding
             // halves the max resume error (0.5s instead of ~1s).
@@ -693,8 +780,9 @@ async fn run<N: Fn(PlaybackChanged) + Sync>(
                 ep.position_secs.max(0.0).round() as i64
             ))
             .args(vlc_state_args(saved.as_ref())),
-        // Refused at the top of `run`; spawning the bare binary would only fail later.
-        PlayerBackend::MpcHc => &mut cmd,
+        PlayerBackend::MpcHc => cmd
+            .args(control.player_args(backend))
+            .args(crate::mpc_hc::launch_args(ep.position_secs, saved.as_ref())),
     };
     cmd.arg(&ep.path).kill_on_drop(false);
     no_console_window(cmd.as_std_mut());
@@ -731,17 +819,7 @@ async fn run<N: Fn(PlaybackChanged) + Sync>(
     // Connect per backend before the loop; `tracked` records whether the
     // control socket ever bound. A player that exits first ends the wait, so a
     // broken one is reported at once rather than after the connect timeout.
-    let connect = async {
-        match backend {
-            PlayerBackend::Mpv => Ipc::connect(&sock, Duration::from_secs(5))
-                .await
-                .map(|ipc| Poller::Mpv(MpvPoller { ipc })),
-            PlayerBackend::Vlc => VlcRc::connect(&sock, Duration::from_secs(5))
-                .await
-                .map(|rc| Poller::Vlc(VlcPoller { rc })),
-            PlayerBackend::MpcHc => None,
-        }
-    };
+    let connect = control.connect(backend, Duration::from_secs(5));
     let (mut poller, exited_early) = tokio::select! {
         p = connect => (p, None),
         status = child.wait() => (None, status.ok()),
@@ -762,7 +840,9 @@ async fn run<N: Fn(PlaybackChanged) + Sync>(
             }
         }
     }
-    sock.clean();
+    // Closes MPC-HC's host window with it.
+    drop(poller);
+    control.clean();
     player.release();
 
     if !tracked {
@@ -877,6 +957,9 @@ mod tests {
         "FAKE_VLC_GARBAGE_TIME",
         "FAKE_VLC_GARBAGE_VOLUME",
         "FAKE_VLC_FULLSCREEN_RAW",
+        "FAKE_MPC_NO_IPC",
+        "FAKE_MPC_ARGV_OUT",
+        "FAKE_MPC_STRANGER",
     ];
 
     /// Set every knob the fakes read, so a test can never inherit a stale value from
@@ -893,6 +976,8 @@ mod tests {
             std::env::set_var("FAKE_MPV_RUNTIME", runtime);
             std::env::set_var("FAKE_VLC_STOP_AT", stop_at);
             std::env::set_var("FAKE_VLC_RUNTIME", runtime);
+            std::env::set_var("FAKE_MPC_STOP_AT", stop_at);
+            std::env::set_var("FAKE_MPC_RUNTIME", runtime);
         }
     }
 
@@ -930,7 +1015,8 @@ mod tests {
         match backend {
             PlayerBackend::Mpv => fixture(),
             PlayerBackend::Vlc => vlc_fixture(),
-            PlayerBackend::MpcHc => panic!("MPC-HC has no fake player"),
+            // A Windows-only fake: it speaks MPC-HC's window messages.
+            PlayerBackend::MpcHc => fake_bin("fake_mpc_hc"),
         }
     }
 
@@ -938,7 +1024,7 @@ mod tests {
         match backend {
             PlayerBackend::Mpv => "FAKE_MPV_NO_IPC",
             PlayerBackend::Vlc => "FAKE_VLC_NO_IPC",
-            PlayerBackend::MpcHc => panic!("MPC-HC has no fake player"),
+            PlayerBackend::MpcHc => "FAKE_MPC_NO_IPC",
         }
     }
 
@@ -1268,6 +1354,7 @@ mod tests {
         assert_eq!(db.get_episode(id).unwrap().status, EpisodeStatus::Unplayed);
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn mpc_hc_is_refused_before_launch_and_leaves_the_player_free() {
         let (db, id) = seeded();
@@ -1283,7 +1370,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("arrives with Windows support"), "{err}");
+        assert!(err.to_string().contains("needs Windows"), "{err}");
         assert_eq!(player.current(), None);
         assert_eq!(db.get_episode(id).unwrap().status, EpisodeStatus::Unplayed);
     }
@@ -2094,5 +2181,96 @@ mod tests {
             vlc_state_args(Some(&state(50.0, Some(800), None, false, false))),
             vec!["--volume=128"]
         );
+    }
+
+    /// MPC-HC over its `/slave` window messages, against `fake_mpc_hc.py`.
+    #[cfg(windows)]
+    mod mpc_hc_playback {
+        use super::*;
+
+        fn play(db: &Arc<Db>, id: i64, poll_every: Duration) -> impl Future<Output = Result<()>> {
+            play_episode(
+                db.clone(),
+                Arc::new(Player::new()),
+                id,
+                PlayerBackend::MpcHc,
+                fixture_for(PlayerBackend::MpcHc),
+                |_| {},
+                poll_every,
+            )
+        }
+
+        #[tokio::test]
+        async fn finishing_marks_played() {
+            fake(PlayerBackend::MpcHc, "99", "2.0");
+            let (db, id) = seeded();
+            play(&db, id, Duration::from_millis(50)).await.unwrap();
+            let ep = db.get_episode(id).unwrap();
+            assert_eq!(ep.status, EpisodeStatus::Played);
+            assert_eq!(ep.position_secs, 0.0);
+            assert_eq!(ep.duration_secs, Some(100.0), "from CMD_NOWPLAYING, escaped pipe and all");
+        }
+
+        #[tokio::test]
+        async fn interruption_reverts_to_unplayed_keeping_position() {
+            fake(PlayerBackend::MpcHc, "40", "1.5");
+            let (db, id) = seeded();
+            play(&db, id, Duration::from_millis(200)).await.unwrap();
+            let ep = db.get_episode(id).unwrap();
+            assert_eq!(ep.status, EpisodeStatus::Unplayed);
+            assert!(ep.position_secs > 20.0 && ep.position_secs <= 40.0, "pos={}", ep.position_secs);
+            assert_eq!(ep.duration_secs, Some(100.0));
+        }
+
+        #[tokio::test]
+        async fn a_message_from_another_window_is_ignored() {
+            fake(PlayerBackend::MpcHc, "40", "1.0");
+            let _knobs = Knobs::set(&[("FAKE_MPC_STRANGER", "1")]);
+            let (db, id) = seeded();
+            play(&db, id, Duration::from_millis(100)).await.unwrap();
+            let ep = db.get_episode(id).unwrap();
+            assert_eq!(ep.status, EpisodeStatus::Unplayed, "a forged position must not mark it watched");
+            assert!(ep.position_secs <= 40.0, "pos={}", ep.position_secs);
+        }
+
+        #[tokio::test]
+        async fn without_a_connect_progress_is_untouched_and_the_reason_reported() {
+            fake(PlayerBackend::MpcHc, "99", "1.0");
+            let _guard = NoSocketGuard::set(PlayerBackend::MpcHc);
+            let (db, id) = seeded();
+            db.set_position(id, 1300.0, Some(1400.0)).unwrap();
+            let err = play(&db, id, Duration::from_millis(50)).await.unwrap_err();
+            assert!(err.to_string().contains("could not reach MPC-HC"), "{err}");
+            let ep = db.get_episode(id).unwrap();
+            assert_eq!((ep.status, ep.position_secs), (EpisodeStatus::Unplayed, 1300.0));
+        }
+
+        #[tokio::test]
+        async fn launch_resumes_in_milliseconds_and_keeps_the_shows_player_state() {
+            fake(PlayerBackend::MpcHc, "40", "1.0");
+            let (db, id) = seeded();
+            let show_id = db.show_id_for_episode(id).unwrap().unwrap();
+            let saved = state(55.0, Some(1234), Some(678), false, true);
+            db.set_show_player_state(show_id, &saved).unwrap();
+            db.set_position(id, 12.5, None).unwrap();
+            let out = std::env::temp_dir().join(format!("anime-manager-fake-mpc-argv-{}.txt", std::process::id()));
+            let _ = std::fs::remove_file(&out);
+            let _knobs = Knobs::set(&[("FAKE_MPC_ARGV_OUT", out.to_str().unwrap())]);
+
+            play(&db, id, Duration::from_millis(50)).await.unwrap();
+
+            let argv: Vec<String> = std::fs::read_to_string(&out).unwrap().lines().map(String::from).collect();
+            let at = |flag: &str| argv.iter().position(|a| a == flag);
+            let slave = at("/slave").expect("/slave");
+            assert!(argv[slave + 1].parse::<isize>().is_ok_and(|h| h != 0), "{argv:?}");
+            assert_eq!(argv[at("/start").expect("/start") + 1], "12500", "{argv:?}");
+            for flag in ["/new", "/play", "/close", "/fullscreen"] {
+                assert!(at(flag).is_some(), "{flag} missing: {argv:?}");
+            }
+            assert!(argv.last().unwrap().ends_with("anime-manager-fake.mkv"), "{argv:?}");
+            // MPC-HC reports no volume or window state, so nothing is overwritten.
+            assert_eq!(db.show_player_state(show_id).unwrap(), Some(saved));
+            let _ = std::fs::remove_file(&out);
+        }
     }
 }

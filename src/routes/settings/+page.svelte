@@ -523,7 +523,7 @@
           <span class="w-16 shrink-0">{d.label}</span>
           {#if d.path}
             <span class="tag break-all">{d.path}</span>
-            {#if !d.supported}<span class="text-muted">found; playback arrives with Windows support</span>{/if}
+            {#if !d.supported}<span class="text-muted">found; playback needs Windows</span>{/if}
           {:else}
             <span class="text-muted">not found</span>
           {/if}
