@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fake VLC: serves the RC interface over a unix socket, exits.
+"""Fake VLC: serves the RC interface over a unix socket (loopback TCP on Windows), exits.
 Mirrors fake_mpv.py: duration is always 100s; only STOP_AT and RUNTIME vary.
 Env: FAKE_VLC_STOP_AT (secs, default 95),
      FAKE_VLC_RUNTIME (wall secs to stay alive, default 1.5),
@@ -21,7 +21,7 @@ from fake_player_common import (
     env_flag,
     env_int,
     exit_if_no_ipc,
-    serve_unix,
+    serve_ipc,
     write_argv_out,
 )
 
@@ -32,8 +32,10 @@ for i, a in enumerate(args):
         sock_path = args[i + 1]
     elif a.startswith("--rc-unix="):
         sock_path = a.split("=", 1)[1]
+    elif a == "--rc-host" and i + 1 < len(args):
+        sock_path = args[i + 1]
 if sock_path is None:
-    sys.exit("--rc-unix is required (fake VLC speaks RC over a unix socket)")
+    sys.exit("--rc-unix (or --rc-host on Windows) is required")
 
 duration = 100.0  # every test reports the same duration; only STOP_AT and RUNTIME vary
 stop_at = float(os.environ.get("FAKE_VLC_STOP_AT", "95"))
@@ -87,4 +89,4 @@ def serve(conn):
 
 
 exit_if_no_ipc("FAKE_VLC_NO_IPC", runtime)
-serve_unix(sock_path, runtime, serve)
+serve_ipc(sock_path, runtime, serve)

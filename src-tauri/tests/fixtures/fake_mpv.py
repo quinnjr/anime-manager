@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fake mpv: serves the JSON IPC socket, reports a scripted time-pos, exits.
+"""Fake mpv: serves the JSON IPC socket (a named pipe on Windows), reports a scripted time-pos, exits.
 Env: FAKE_MPV_STOP_AT (secs, default 95),
      FAKE_MPV_RUNTIME (wall secs to stay alive, default 1.5),
      FAKE_MPV_NO_IPC (if set, never create the socket, simulating a wrapper that ignores
@@ -19,7 +19,7 @@ from fake_player_common import (
     env_float,
     env_int,
     exit_if_no_ipc,
-    serve_unix,
+    serve_ipc,
     write_argv_out,
 )
 
@@ -72,4 +72,4 @@ def serve(conn):
                 conn.sendall((json.dumps({"request_id": req.get("request_id", 0), "error": "success", "data": val}) + "\n").encode())
 
 exit_if_no_ipc("FAKE_MPV_NO_IPC", runtime)
-serve_unix(sock_path, runtime, serve)
+serve_ipc(sock_path, runtime, serve)

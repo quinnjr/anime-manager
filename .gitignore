@@ -6,3 +6,4 @@
 /src-tauri/gen
 /dist
 /.worktrees
+__pycache__/

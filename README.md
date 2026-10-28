@@ -6,8 +6,11 @@ Scan folders of anime, group them by show and season, play in mpv, and track wha
 Settings takes an API key for any OpenAI-compatible provider. Presets are offered for ones with a free tier — OpenRouter, Hugging Face, Groq, Google Gemini, Cerebras — and the model list is fetched from the provider itself, since free model ids rotate. A model is then consulted for folders the filename parser is unsure about during a scan, and on demand via **Inspect with AI** on any show. Decisions are stored as per-file overrides that survive rescans; nothing on disk is touched.
 
 ## Requirements
-- Linux, mpv on `$PATH` (or set the path in Settings)
+- Linux or Windows 10/11, with mpv or VLC (on `PATH`, or set the path in Settings; on Windows
+  VLC is also found in its default Program Files location)
 - Rust 1.88+ (let-chains), Node 22+, pnpm
+- Windows builds: Visual Studio 2022 Build Tools with the C++ workload and a Windows SDK, and
+  Python 3 for the player tests' fake mpv/VLC
 
 ## Develop
     pnpm install
@@ -23,10 +26,11 @@ process-global environment variables.
 ## Build
     pnpm tauri build --no-bundle          # binary only
     ./scripts/build-release.sh            # .deb, .rpm and .AppImage into dist/
+    pnpm tauri build --bundles nsis,msi   # Windows installers (run from a shell that doesn't split the comma, e.g. quote it in PowerShell)
 
 Tagged releases are built by CI and attached to the GitHub release page.
 
-Data lives in `~/.local/share/anime-manager/db.sqlite`. Files on disk are only changed by the explicit Rename feature, which is undoable.
+Data lives in `~/.local/share/anime-manager/db.sqlite` (`%APPDATA%\anime-manager\db.sqlite` on Windows). Files on disk are only changed by the explicit Rename feature, which is undoable.
 
 ## Contributing
 

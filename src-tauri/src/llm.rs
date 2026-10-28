@@ -436,23 +436,21 @@ pub fn parse_inspection(reply: &str) -> Result<FolderInspection> {
 }
 
 /// Shorten a folder to its path relative to the library root that contains it. Matching is on a
-/// path boundary, so root `/lib` does not claim `/library/Anime/X`.
+/// path boundary, so root `/lib` does not claim `/library/Anime/X`. Below a Windows root the
+/// relative part is written with `/`, so the model sees (and echoes back) one separator style.
 fn rel_to_roots(roots: &[String], folder: &str) -> String {
     let best = roots
         .iter()
-        .map(|r| r.trim_end_matches('/'))
-        .filter(|r| {
-            folder == *r
-                || folder
-                    .strip_prefix(*r)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        })
+        .map(|r| crate::paths::trim_dir(r))
+        .filter(|r| crate::paths::is_within(folder, r))
         .max_by_key(|r| r.len());
     match best {
         Some(r) => {
-            let rest = folder[r.len()..].trim_start_matches('/');
+            let rest = folder[r.len()..].trim_start_matches(crate::paths::seps_of(r));
             if rest.is_empty() {
                 folder.to_string()
+            } else if crate::paths::is_windows_abs(r) {
+                rest.replace('\\', "/")
             } else {
                 rest.to_string()
             }
@@ -861,7 +859,7 @@ pub async fn inspect_show(
 fn apply_decision(
     db: &Db,
     d: &FileDecision,
-    path: &String,
+    path: &str,
     parsed: &str,
     display: &str,
     // Season name for a file that did not carry one of its own.
@@ -873,7 +871,7 @@ fn apply_decision(
 ) -> Result<()> {
     if d.kind == KIND_IGNORE {
         db.set_override(&ParseOverride {
-            path: path.clone(),
+            path: path.to_string(),
             title: String::new(),
             season: 0,
             number: 0,
@@ -883,7 +881,7 @@ fn apply_decision(
         db.delete_episode_by_path(path)?;
         report.ignored += 1;
         report.changes.push(InspectChange {
-            path: path.clone(),
+            path: path.to_string(),
             from,
             to: "ignored".into(),
         });
@@ -919,7 +917,7 @@ fn apply_decision(
         return Ok(());
     }
     db.set_override(&ParseOverride {
-        path: path.clone(),
+        path: path.to_string(),
         title: new_title.clone(),
         season,
         number,
@@ -933,7 +931,7 @@ fn apply_decision(
     };
     db.reassign_episode(path, &new_title, season, number, season_title)?;
     report.changes.push(InspectChange {
-        path: path.clone(),
+        path: path.to_string(),
         from,
         to: format!("{new_title} S{season}E{number}"),
     });
@@ -1731,6 +1729,13 @@ mod tests {
             "X",
             "the longest matching root wins"
         );
+    }
+
+    #[test]
+    fn rel_to_roots_handles_windows_roots() {
+        let roots = vec![r"Z:\Anime".to_string()];
+        assert_eq!(rel_to_roots(&roots, r"Z:\Anime\Show\Season 2\01.mkv"), "Show/Season 2/01.mkv");
+        assert_eq!(rel_to_roots(&roots, r"Z:\AnimeX\Show"), r"Z:\AnimeX\Show");
     }
 
     #[tokio::test]

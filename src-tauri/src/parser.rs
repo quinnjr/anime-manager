@@ -157,6 +157,10 @@ pub fn parse(stem: &str, dirs: &[String]) -> Option<ParsedName> {
     parse_with_confidence(stem, dirs).map(|p| p.name)
 }
 
+/// One episode-marker rule: regex, season group, episode group, year filter, marker leads the
+/// name, low confidence. See the `markers` table in `parse_with_confidence`.
+type Marker = (&'static Lazy<Regex>, Option<usize>, usize, bool, bool, bool);
+
 pub fn parse_with_confidence(stem: &str, dirs: &[String]) -> Option<Parsed> {
     if JUNK_STEM.is_match(stem) {
         return None;
@@ -224,7 +228,7 @@ pub fn parse_with_confidence(stem: &str, dirs: &[String]) -> Option<Parsed> {
     // group holds a season, whether the year filter applies (a special's number is never a year),
     // whether the marker leads the name rather than ending the title, and whether the guess is
     // weak enough to send the folder to the LLM assist.
-    let markers: [(&Lazy<Regex>, Option<usize>, usize, bool, bool, bool); 9] = [
+    let markers: [Marker; 9] = [
         (&SXXEXX, Some(1), 2, true, false, false),
         (&NXNN, Some(1), 2, true, false, false),
         (&JP_EP, None, 1, true, false, false),

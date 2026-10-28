@@ -1,6 +1,6 @@
 [package]
 name = "anime-manager"
-version = "0.12.4"
+version = "0.13.0"
 description = "Scan an anime collection, play episodes in mpv and track what you have watched"
 authors = ["Joseph R. Quinn <quinn.josephr@gmail.com>"]
 license = "MIT"
@@ -37,6 +37,13 @@ dirs = "6"
 mdns-sd = "0.21"
 uuid = { version = "1", features = ["v4"] }
 tauri-plugin-opener = "2.5.5"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# MPC-HC's /slave control is window messages (mpc_hc.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -4,15 +4,20 @@
   import { emit } from '@tauri-apps/api/event';
   import {
     api, onEvent, LLM_PROVIDERS,
-    type Root, type ScanProgress, type ScanSummary, type LibraryStatus, type DlnaStatus
+    type Root, type ScanProgress, type ScanSummary, type LibraryStatus, type DlnaStatus, type DetectedPlayer
   } from '$lib/api';
   import { toasts } from '$lib/stores/toasts.svelte';
   import { isTestedFlag } from '$lib/llmModels';
+  import SyncSettings from '$lib/components/SyncSettings.svelte';
   import ModelPickerModal from '$lib/components/ModelPickerModal.svelte';
   import { matching } from '$lib/stores/matching.svelte';
   import { DEFAULT_AUTO_SCAN_MINS, parseValidatedAutoScanMins } from '$lib/autoScan';
-  import { normalizePlayerBackend, playerSaveValue, DEFAULT_MPV_PATH, DEFAULT_VLC_PATH } from '$lib/playerSettings';
+  import {
+    normalizePlayerChoice, playerSaveValue, playsWith, PLAYER_CHOICES,
+    DEFAULT_MPV_PATH, DEFAULT_VLC_PATH, DEFAULT_MPC_HC_PATH
+  } from '$lib/playerSettings';
   import { scanSlot } from '$lib/stores/scan.svelte';
+  import { editedSettings } from '$lib/settingsForm';
 
   let roots = $state<Root[]>([]);
   let status = $state<LibraryStatus | null>(null);
@@ -23,7 +28,19 @@
 
   let mpvPath = $state('mpv');
   let vlcPath = $state('vlc');
-  let playerBackend = $state('mpv');
+  let mpcHcPath = $state('mpc-hc64');
+  let playerBackend = $state('auto');
+  let detected = $state<DetectedPlayer[]>([]);
+  let detecting = $state(false);
+  let detectFailed = $state(false);
+  // Only the newest detection is applied, so a slow one started on page open
+  // cannot overwrite the result of one started by a later Save.
+  let detectSeq = 0;
+  const playing = $derived(playsWith(normalizePlayerChoice(playerBackend), detected));
+  // Detection reads the saved command paths; this flags typed ones it has not seen.
+  let savedPlayerPaths = $state('');
+  const playerPaths = () => [mpvPath, vlcPath, mpcHcPath].map((p) => p.trim()).join('\n');
+  const pathsUnsaved = $derived(playerPaths() !== savedPlayerPaths);
   let threshold = $state('0.9');
   let llmKey = $state('');
   let llmModel = $state('');
@@ -52,6 +69,10 @@
       torrentBaseUrl.trim().toLowerCase().startsWith('http://') &&
       !torrentAllowCleartext
   );
+
+  // What the fields held when loaded or last saved. Save writes only what differs, so a
+  // synced setting changed on another machine since the page opened is not reverted.
+  let savedValues: Record<string, string> = {};
 
   let dlnaRunning = $state(false);
   let dlnaPort = $state(0);
@@ -82,7 +103,8 @@
       const s = await api.getSettings();
       mpvPath = s.mpv_path ?? DEFAULT_MPV_PATH;
       vlcPath = s.vlc_path ?? DEFAULT_VLC_PATH;
-      playerBackend = normalizePlayerBackend(s.player_backend);
+      mpcHcPath = s.mpc_hc_path ?? DEFAULT_MPC_HC_PATH;
+      playerBackend = normalizePlayerChoice(s.player_backend);
       threshold = s.played_threshold ?? '0.9';
       llmKey = s.llm_api_key ?? '';
       llmModel = s.llm_model ?? '';
@@ -97,6 +119,8 @@
       torrentAllowCleartext = s.torrent_allow_cleartext === 'true';
       torrentTested = isTestedFlag(s.torrent_test_ok);
       provider = LLM_PROVIDERS.find((p) => p.baseUrl === llmBaseUrl)?.id ?? 'custom';
+      savedValues = formValues();
+      savedPlayerPaths = playerPaths();
       dlnaName = s.dlna_name ?? '';
       dlnaPortField = s.dlna_port ?? '28987';
       try {
@@ -110,6 +134,7 @@
   onMount(() => {
     loadLibrary();
     loadSettings();
+    detectPlayers();
     const us = [
       onEvent<ScanProgress>('scan-progress', (p) => (scanProgress = p)),
       // A background pass also emits scan-progress; without a manual scan to clear it
@@ -183,35 +208,66 @@
     if (p && p.baseUrl) llmBaseUrl = p.baseUrl;
   }
 
+  /** Every saved field as the value Save writes, in write order. */
+  function formValues(): Record<string, string> {
+    const v: Record<string, string> = {
+      mpv_path: mpvPath.trim(),
+      vlc_path: vlcPath.trim(),
+      mpc_hc_path: mpcHcPath.trim(),
+      player_backend: playerSaveValue(playerBackend),
+      played_threshold: String(Number(threshold)),
+      auto_scan_interval_mins: String(parseValidatedAutoScanMins(autoScanMins) ?? autoScanMins),
+      llm_api_key: llmKey.trim(),
+      llm_model: llmModel.trim(),
+      llm_base_url: llmBaseUrl.trim(),
+      llm_assist_on_scan: llmOnScan ? 'true' : 'false',
+      llm_delay_ms: String(Math.max(0, Number(llmDelay) || 0))
+    };
+    // A blank field leaves the stored URL alone so an ordinary Save never
+    // disconnects a configured instance; Disconnect clears the pair explicitly.
+    const torrentUrl = torrentBaseUrl.trim();
+    if (torrentUrl) v.torrent_base_url = torrentUrl;
+    v.torrent_password = torrentPassword.trim();
+    // A bad pair fails loudly here and the stored mapping is left alone.
+    v.torrent_path_map = torrentPathMap.trim();
+    v.torrent_allow_cleartext = torrentAllowCleartext ? 'true' : 'false';
+    return v;
+  }
+
   async function saveAll(): Promise<boolean> {
     const t = Number(threshold);
     if (!(t > 0 && t <= 1)) { toasts.push('error', 'Played threshold must be between 0 and 1'); return false; }
     const autoMins = parseValidatedAutoScanMins(autoScanMins);
     if (autoMins === null) { toasts.push('error', 'Auto-scan interval must be a whole number of minutes (0 turns it off)'); return false; }
     try {
-      await api.setSetting('mpv_path', mpvPath.trim());
-      await api.setSetting('vlc_path', vlcPath.trim());
-      await api.setSetting('player_backend', playerSaveValue(playerBackend));
-      await api.setSetting('played_threshold', String(t));
-      await api.setSetting('auto_scan_interval_mins', String(autoMins));
-      await api.setSetting('llm_api_key', llmKey.trim());
-      await api.setSetting('llm_model', llmModel.trim());
-      await api.setSetting('llm_base_url', llmBaseUrl.trim());
-      await api.setSetting('llm_assist_on_scan', llmOnScan ? 'true' : 'false');
-      await api.setSetting('llm_delay_ms', String(Math.max(0, Number(llmDelay) || 0)));
-      // A blank field leaves the stored URL alone so an ordinary Save never
-      // disconnects a configured instance; Disconnect clears the pair explicitly.
-      const torrentUrl = torrentBaseUrl.trim();
-      if (torrentUrl) await api.setSetting('torrent_base_url', torrentUrl);
-      await api.setSetting('torrent_password', torrentPassword.trim());
-      // A bad pair fails loudly here and the stored mapping is left alone.
-      await api.setSetting('torrent_path_map', torrentPathMap.trim());
-      await api.setSetting('torrent_allow_cleartext', torrentAllowCleartext ? 'true' : 'false');
+      const values = formValues();
+      for (const [key, value] of editedSettings(savedValues, values)) {
+        await api.setSetting(key, value);
+        savedValues[key] = value;
+      }
       await refreshTestFlag();
       await refreshTorrentFlag();
+      // A saved command path changes what detection finds.
+      savedPlayerPaths = playerPaths();
+      await detectPlayers();
       toasts.push('success', 'Settings saved');
       return true;
     } catch (e) { toasts.error(e); return false; }
+  }
+
+  /** Detection reads the saved command paths, so it reflects the last Save. */
+  async function detectPlayers() {
+    const seq = ++detectSeq;
+    detecting = true;
+    try {
+      const found = await api.detectPlayers();
+      if (seq === detectSeq) { detected = found; detectFailed = false; }
+    } catch (e) {
+      if (seq === detectSeq) detectFailed = true;
+      toasts.error(e);
+    } finally {
+      if (seq === detectSeq) detecting = false;
+    }
   }
 
   async function refreshTestFlag() {
@@ -268,6 +324,8 @@
       await api.setSetting('torrent_password', '');
       torrentBaseUrl = '';
       torrentPassword = '';
+      delete savedValues.torrent_base_url;
+      savedValues.torrent_password = '';
       await refreshTorrentFlag();
       toasts.push('success', 'Disconnected from rustorrent.');
     } catch (e) { toasts.error(e); }
@@ -421,10 +479,21 @@
       <label class="block text-sm">
         <span class="text-muted">Player</span>
         <select bind:value={playerBackend} class="field mt-1 w-full">
-          <option value="mpv">mpv</option>
-          <option value="vlc">VLC</option>
+          {#each PLAYER_CHOICES as c (c.value)}
+            <option value={c.value}>{c.label}</option>
+          {/each}
         </select>
-        <span class="tag mt-1 block">falls back to the other one when missing</span>
+        <span class="tag mt-1 block">
+          {#if detectFailed}
+            could not look for players; try Detect again
+          {:else if detected.length === 0}
+            looking for players…
+          {:else if playing}
+            plays with {playing.label}{playerBackend !== 'auto' && playing.player !== playerBackend ? ', since your pick is unavailable' : ''}
+          {:else}
+            no usable player found; install mpv or VLC, or set a path below
+          {/if}
+        </span>
       </label>
       <label class="block text-sm">
         <span class="text-muted">Counts as watched past</span>
@@ -439,7 +508,29 @@
         <span class="text-muted">VLC command</span>
         <input bind:value={vlcPath} class="field mt-1 w-full" />
       </label>
+      <label class="block text-sm">
+        <span class="text-muted">MPC-HC command</span>
+        <input bind:value={mpcHcPath} class="field mt-1 w-full" />
+      </label>
     </div>
+    <p class="mt-3 text-sm text-muted">
+      A command is looked for on PATH and in the player's usual install folder; a full path is used as typed.
+      {#if pathsUnsaved}Save to look for the commands you changed.{/if}
+    </p>
+    <ul class="mt-2 space-y-1 text-sm">
+      {#each detected as d (d.player)}
+        <li class="flex flex-wrap items-baseline gap-x-2">
+          <span class="w-16 shrink-0">{d.label}</span>
+          {#if d.path}
+            <span class="tag break-all">{d.path}</span>
+            {#if !d.supported}<span class="text-muted">found; playback needs Windows</span>{/if}
+          {:else}
+            <span class="text-muted">not found</span>
+          {/if}
+        </li>
+      {/each}
+    </ul>
+    <button class="btn mt-3" disabled={detecting} onclick={detectPlayers}>{detecting ? 'Looking…' : 'Detect again'}</button>
   </section>
 
   <!-- TV & renderers (DLNA) -->
@@ -571,6 +662,8 @@
       <span>Allow unencrypted credentials over http (needed for a plain-LAN instance)</span>
     </label>
   </section>
+
+  <SyncSettings />
 
   <!-- Destructive-ish maintenance, kept last and apart -->
   <section class="mb-10">

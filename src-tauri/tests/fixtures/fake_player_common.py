@@ -84,3 +84,98 @@ def serve_unix(sock_path, runtime, handler):
             threading.Thread(target=handler, args=(conn,), daemon=True).start()
         except socket.timeout:
             pass
+
+
+def serve_tcp(addr, runtime, handler):
+    """Like serve_unix, on a loopback TCP port given as host:port (VLC's RC
+    transport on Windows, which has no --rc-unix)."""
+    host, port = addr.rsplit(":", 1)
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind((host, int(port)))
+    srv.listen(1)
+    srv.settimeout(0.2)
+    deadline = time.time() + runtime
+    while time.time() < deadline:
+        try:
+            conn, _ = srv.accept()
+            threading.Thread(target=handler, args=(conn,), daemon=True).start()
+        except socket.timeout:
+            pass
+
+
+class _PipeConn:
+    """Just enough of a socket (recv, sendall, context manager) over one
+    connected Windows named-pipe instance for the fakes' handlers."""
+
+    def __init__(self, k32, handle):
+        self.k32 = k32
+        self.h = handle
+
+    def recv(self, n):
+        import ctypes
+        buf = ctypes.create_string_buffer(n)
+        got = ctypes.c_ulong(0)
+        if not self.k32.ReadFile(self.h, buf, n, ctypes.byref(got), None):
+            return b""
+        return buf.raw[: got.value]
+
+    def sendall(self, data):
+        import ctypes
+        done = ctypes.c_ulong(0)
+        self.k32.WriteFile(self.h, data, len(data), ctypes.byref(done), None)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.k32.CloseHandle(self.h)
+
+
+def serve_pipe(name, runtime, handler):
+    """Like serve_unix, on a Windows named pipe (mpv's IPC transport there).
+    ConnectNamedPipe blocks with no timeout, so the accept loop runs on a
+    daemon thread and the process exits once runtime has elapsed."""
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateNamedPipeW.restype = wintypes.HANDLE
+    k32.CreateNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                     wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                                     wintypes.DWORD, ctypes.c_void_p]
+    k32.ConnectNamedPipe.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    k32.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                             ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    k32.WriteFile.argtypes = [wintypes.HANDLE, ctypes.c_char_p, wintypes.DWORD,
+                              ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    PIPE_ACCESS_DUPLEX, PIPE_UNLIMITED = 0x3, 255
+    ERROR_PIPE_CONNECTED = 535
+    INVALID = wintypes.HANDLE(-1).value
+
+    def accept_loop():
+        while True:
+            h = k32.CreateNamedPipeW(name, PIPE_ACCESS_DUPLEX, 0, PIPE_UNLIMITED,
+                                     65536, 65536, 0, None)
+            if h == INVALID or h is None:
+                return
+            if not k32.ConnectNamedPipe(h, None) and ctypes.get_last_error() != ERROR_PIPE_CONNECTED:
+                k32.CloseHandle(h)
+                continue
+            threading.Thread(target=handler, args=(_PipeConn(k32, h),), daemon=True).start()
+
+    threading.Thread(target=accept_loop, daemon=True).start()
+    time.sleep(runtime)
+    sys.stdout.flush()
+    os._exit(0)
+
+
+def serve_ipc(addr, runtime, handler):
+    """Serve on whichever transport addr names: a Windows named pipe, a
+    host:port TCP address, or a unix socket path."""
+    if addr.startswith("\\\\.\\pipe\\"):
+        serve_pipe(addr, runtime, handler)
+    elif os.name == "nt":
+        serve_tcp(addr, runtime, handler)
+    else:
+        serve_unix(addr, runtime, handler)

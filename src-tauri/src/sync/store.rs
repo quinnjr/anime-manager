@@ -1,0 +1,712 @@
+//! Last-writer-wins record store. Callers hold the `Db` lock and pass the
+//! connection, so everything here is plain SQL against `sync_records` and the
+//! local `settings` rows (`sync_enabled`, `sync_device_id`, `sync_clock`).
+
+use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::Value;
+
+use super::clock::{now_ms, observe, tick, Stamp};
+use super::keys::{locate, SyncKey, SYNCED_SETTINGS};
+use crate::error::{AppError, Result};
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Record {
+    pub key: String,
+    /// `None` is a tombstone.
+    pub value: Option<Value>,
+    pub stamp: Stamp,
+}
+
+const NEXT_SEQ: &str = "(SELECT COALESCE(MAX(seq),0)+1 FROM sync_records)";
+
+fn setting(c: &Connection, name: &str) -> Result<Option<String>> {
+    Ok(c.query_row("SELECT value FROM settings WHERE key = ?1", [name], |r| r.get(0)).optional()?)
+}
+
+fn set_setting(c: &Connection, name: &str, value: &str) -> Result<()> {
+    c.execute(
+        "INSERT INTO settings(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![name, value],
+    )?;
+    Ok(())
+}
+
+pub fn enabled(c: &Connection) -> Result<bool> {
+    Ok(setting(c, "sync_enabled")?.as_deref() == Some("1"))
+}
+
+pub fn device_id(c: &Connection) -> Result<Option<String>> {
+    setting(c, "sync_device_id")
+}
+
+/// The persisted clock. A missing or corrupt one is rebuilt from the newest stamp
+/// already stored, so this machine never reissues a stamp at or below one it used.
+fn clock(c: &Connection) -> Result<Option<Stamp>> {
+    if let Some(s) = setting(c, "sync_clock")?.and_then(|s| Stamp::parse(&s)) {
+        return Ok(Some(s));
+    }
+    let mut st = c.prepare("SELECT stamp FROM sync_records")?;
+    let stamps: Vec<String> = st.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+    Ok(stamps.iter().filter_map(|s| Stamp::parse(s)).max())
+}
+
+/// Run `f` inside a savepoint: everything it wrote lands, or none of it does.
+/// Nests inside an open transaction (or another savepoint) as well as outside one.
+pub fn atomically<T>(c: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    c.execute_batch("SAVEPOINT sync_atomic")?;
+    match f() {
+        Ok(v) => {
+            c.execute_batch("RELEASE sync_atomic")?;
+            Ok(v)
+        }
+        Err(e) => {
+            let _ = c.execute_batch("ROLLBACK TO sync_atomic; RELEASE sync_atomic");
+            Err(e)
+        }
+    }
+}
+
+
+fn encode_value(v: &Option<Value>) -> Result<Option<String>> {
+    v.as_ref()
+        .map(|v| serde_json::to_string(v).map_err(|e| AppError::Db(format!("sync value: {e}"))))
+        .transpose()
+}
+
+fn upsert(c: &Connection, key: &str, value: &Option<Value>, stamp: &Stamp) -> Result<()> {
+    c.execute(
+        &format!(
+            "INSERT INTO sync_records(key, value, stamp, seq) VALUES (?1, ?2, ?3, {NEXT_SEQ})
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, stamp = excluded.stamp, seq = excluded.seq"
+        ),
+        params![key, encode_value(value)?, stamp.encode()],
+    )?;
+    Ok(())
+}
+
+fn row_to_record(key: String, value: Option<String>, stamp: String) -> Result<Record> {
+    Ok(Record {
+        key,
+        value: value
+            .map(|s| serde_json::from_str(&s).map_err(|e| AppError::Db(format!("sync value: {e}"))))
+            .transpose()?,
+        stamp: Stamp::parse(&stamp).ok_or_else(|| AppError::Db(format!("bad sync stamp: {stamp}")))?,
+    })
+}
+
+/// Local write: stamp with the persisted clock, upsert, persist the clock.
+/// A no-op (`Ok(false)`) only until sync has first been set up (no device id).
+/// Turning sync off does not stop it: records keep mirroring local truth, or
+/// re-enabling would re-apply the stale ones and undo edits made while off.
+pub fn record_local(c: &Connection, key: &SyncKey, value: Option<Value>) -> Result<bool> {
+    if device_id(c)?.is_none() {
+        return Ok(false);
+    }
+    // The clock and the record persist together, or a failed upsert would burn a stamp
+    // and a failed clock write would let the next one repeat it.
+    atomically(c, || {
+        let stamp = tick_now(c)?;
+        upsert(c, &key.encode(), &value, &stamp)
+    })?;
+    Ok(true)
+}
+
+/// Advance the persisted clock for a local event and return the new stamp.
+pub fn tick_now(c: &Connection) -> Result<Stamp> {
+    let device = device_id(c)?.ok_or_else(|| AppError::Db("sync enabled without a device id".into()))?;
+    let stamp = tick(clock(c)?.as_ref(), now_ms(), &device);
+    set_setting(c, "sync_clock", &stamp.encode())?;
+    Ok(stamp)
+}
+
+/// Remote merge: replace only when the incoming stamp is strictly newer, and
+/// fold the stamp into the local clock so later local writes sort after it.
+pub fn merge_remote(c: &Connection, r: &Record) -> Result<bool> {
+    let stored: Option<String> = c
+        .query_row("SELECT stamp FROM sync_records WHERE key = ?1", [&r.key], |row| row.get(0))
+        .optional()?;
+    let newer = match stored.as_deref().and_then(Stamp::parse) {
+        Some(s) => r.stamp > s,
+        None => true,
+    };
+    if newer {
+        upsert(c, &r.key, &r.value, &r.stamp)?;
+    }
+    if let Some(device) = device_id(c)? {
+        let next = observe(clock(c)?.as_ref(), &r.stamp, &device);
+        set_setting(c, "sync_clock", &next.encode())?;
+    }
+    Ok(newer)
+}
+
+/// Join helper: insert only when no record exists for the key.
+pub fn insert_if_absent(c: &Connection, key: &SyncKey, value: Option<Value>, stamp: &Stamp) -> Result<bool> {
+    let n = c.execute(
+        &format!(
+            "INSERT INTO sync_records(key, value, stamp, seq) VALUES (?1, ?2, ?3, {NEXT_SEQ})
+             ON CONFLICT(key) DO NOTHING"
+        ),
+        params![key.encode(), encode_value(&value)?, stamp.encode()],
+    )?;
+    Ok(n > 0)
+}
+
+pub fn get(c: &Connection, key: &SyncKey) -> Result<Option<Record>> {
+    let row: Option<(String, Option<String>, String)> = c
+        .query_row(
+            "SELECT key, value, stamp FROM sync_records WHERE key = ?1",
+            [key.encode()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    row.map(|(k, v, s)| row_to_record(k, v, s)).transpose()
+}
+
+pub fn all(c: &Connection) -> Result<Vec<Record>> {
+    let mut st = c.prepare("SELECT key, value, stamp FROM sync_records ORDER BY seq")?;
+    let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (k, v, s): (String, Option<String>, String) = row?;
+        out.push(row_to_record(k, v, s)?);
+    }
+    Ok(out)
+}
+
+pub fn max_seq(c: &Connection) -> Result<i64> {
+    Ok(c.query_row("SELECT COALESCE(MAX(seq), 0) FROM sync_records", [], |r| r.get(0))?)
+}
+
+/// Episode value and key for `episode_id`; None when the path is not under a
+/// mapped root or the status is playing/missing (runtime states never sync).
+pub fn episode_value(c: &Connection, episode_id: i64) -> Result<Option<(SyncKey, Value)>> {
+    episode_value_with(c, episode_id, false)
+}
+
+/// Like `episode_value`, but a missing row reports the judgement it keeps in
+/// `prev_status`. Joining uses it: a watched file that is unmounted right now is
+/// still watched, and `missing` itself never leaves the machine.
+pub fn episode_value_keeping_missing(c: &Connection, episode_id: i64) -> Result<Option<(SyncKey, Value)>> {
+    episode_value_with(c, episode_id, true)
+}
+
+fn episode_value_with(c: &Connection, episode_id: i64, missing_as_prev: bool) -> Result<Option<(SyncKey, Value)>> {
+    type EpisodeRow = (String, String, Option<String>, f64, Option<f64>, Option<i64>);
+    let row: Option<EpisodeRow> = c
+        .query_row(
+            "SELECT path, status, prev_status, position_secs, duration_secs, last_played_at FROM episodes WHERE id = ?1",
+            [episode_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .optional()?;
+    let Some((path, mut status, prev, position, duration, last_played)) = row else { return Ok(None) };
+    if missing_as_prev && status == "missing" {
+        let Some(prev) = prev else { return Ok(None) };
+        status = prev;
+    }
+    if status != "played" && status != "unplayed" {
+        return Ok(None);
+    }
+    let Some((library, relpath)) = locate(c, &path)? else { return Ok(None) };
+    let value = serde_json::json!({
+        "status": status,
+        "position_secs": position,
+        "duration_secs": duration,
+        "last_played_at": last_played,
+    });
+    Ok(Some((SyncKey::Episode { library, relpath }, value)))
+}
+
+/// A scan-detected move: the new path gets the old path's record, value and
+/// stamp both, never a fresh stamp. A scan can run before this machine has read
+/// the share, and a fresh stamp would let its stale state beat a newer record
+/// another machine already published for the new path. Carrying the record's
+/// own value (not this machine's row) means two machines detecting the same move
+/// publish the same thing under the same stamp, so they cannot disagree. The old
+/// record stays (a disappearance deletes nothing); with no old record, or a
+/// tombstone there, nothing is carried. A carried record that wins is applied,
+/// so like `apply_for_episode` this waits while sync is off (joining offers the
+/// moved row's own state when it is turned back on).
+pub fn carry_moved_episode(c: &Connection, episode_id: i64, old_path: &str) -> Result<()> {
+    if !enabled(c)? {
+        return Ok(());
+    }
+    let Some((library, relpath)) = locate(c, old_path)? else { return Ok(()) };
+    let Some(old) = get(c, &SyncKey::Episode { library, relpath })? else { return Ok(()) };
+    let Some(value) = old.value else { return Ok(()) };
+    let path: String = c.query_row("SELECT path FROM episodes WHERE id = ?1", [episode_id], |r| r.get(0))?;
+    let Some((library, relpath)) = locate(c, &path)? else { return Ok(()) };
+    let carried = Record { key: SyncKey::Episode { library, relpath }.encode(), value: Some(value), stamp: old.stamp };
+    if merge_remote(c, &carried)? {
+        super::apply::apply(c, &carried)?;
+    }
+    Ok(())
+}
+
+/// A Rename: publish the row's state at its new path and tombstone the old one.
+/// A playing or missing row has no value of its own, so the old record's value
+/// moves to the new path (freshly stamped: a rename is the user's own act).
+pub fn move_episode_record(c: &Connection, episode_id: i64, old_path: &str, new_path: &str) -> Result<()> {
+    if episode_value(c, episode_id)?.is_some() {
+        publish_episode(c, episode_id)?;
+    } else if let (Some((ol, orel)), Some((nl, nrel))) = (locate(c, old_path)?, locate(c, new_path)?)
+        && let Some(Record { value: Some(v), .. }) = get(c, &SyncKey::Episode { library: ol, relpath: orel })?
+    {
+        record_local(c, &SyncKey::Episode { library: nl, relpath: nrel }, Some(v))?;
+    }
+    tombstone_path(c, true, old_path)
+}
+
+/// Record the episode's current watched state, when it is syncable and differs from the
+/// stored record. Re-stamping an unchanged value would let it beat a real change made elsewhere.
+pub fn publish_episode(c: &Connection, episode_id: i64) -> Result<()> {
+    if let Some((key, value)) = episode_value(c, episode_id)? {
+        if get(c, &key)?.is_some_and(|r| r.value.as_ref() == Some(&value)) {
+            return Ok(());
+        }
+        record_local(c, &key, Some(value))?;
+    }
+    Ok(())
+}
+
+/// A row `reset_playing` just turned from playing to unplayed. When its record says
+/// played, the row goes back to played (keeping its local position) and nothing is
+/// published: playback interrupted by a crash is no judgement, and "unplayed" must never
+/// be published over "played" from here. Otherwise the last polled position is the
+/// newest thing known, so it is published when it differs from the record's (or there
+/// is no record); left unpublished, an older record would overwrite it on the next scan.
+pub fn settle_after_crash(c: &Connection, episode_id: i64) -> Result<()> {
+    let Some((key, value)) = episode_value(c, episode_id)? else { return Ok(()) };
+    let record = get(c, &key)?.and_then(|r| r.value);
+    if let Some(r) = &record {
+        if r.get("status").and_then(Value::as_str) == Some("played") {
+            c.execute("UPDATE episodes SET status = 'played' WHERE id = ?1", [episode_id])?;
+            return Ok(());
+        }
+        if r.get("position_secs") == value.get("position_secs") && r.get("duration_secs") == value.get("duration_secs") {
+            return Ok(());
+        }
+    }
+    record_local(c, &key, Some(value))?;
+    Ok(())
+}
+
+/// Write a null record for the path's episode key (`kind_ep`) or override key.
+/// A no-op when the path is not under a mapped root.
+pub fn tombstone_path(c: &Connection, kind_ep: bool, abs_path: &str) -> Result<()> {
+    let Some((library, relpath)) = locate(c, abs_path)? else { return Ok(()) };
+    let key = if kind_ep {
+        SyncKey::Episode { library, relpath }
+    } else {
+        SyncKey::Override { library, relpath }
+    };
+    record_local(c, &key, None)?;
+    Ok(())
+}
+
+fn show_title(c: &Connection, show_id: i64) -> Result<Option<String>> {
+    Ok(c.query_row("SELECT parsed_title FROM shows WHERE id = ?1", [show_id], |r| r.get(0)).optional()?)
+}
+
+/// A key and its current local value (`None` = tombstone). Each publisher records
+/// one; joining offers the same entries to the share without overwriting it.
+pub type Entry = (SyncKey, Option<Value>);
+
+fn publish(c: &Connection, entry: Option<Entry>) -> Result<()> {
+    if let Some((key, value)) = entry {
+        record_local(c, &key, value)?;
+    }
+    Ok(())
+}
+
+/// None when the path is not under a mapped root.
+pub fn override_entry(c: &Connection, abs_path: &str) -> Result<Option<Entry>> {
+    let Some((library, relpath)) = locate(c, abs_path)? else { return Ok(None) };
+    let value = c
+        .query_row(
+            "SELECT title, season, number, kind, source FROM parse_overrides WHERE path = ?1",
+            [abs_path],
+            |r| {
+                Ok(serde_json::json!({
+                    "title": r.get::<_, String>(0)?,
+                    "season": r.get::<_, i64>(1)?,
+                    "number": r.get::<_, i64>(2)?,
+                    "kind": r.get::<_, String>(3)?,
+                    "source": r.get::<_, String>(4)?,
+                }))
+            },
+        )
+        .optional()?;
+    Ok(Some((SyncKey::Override { library, relpath }, value)))
+}
+
+/// Record the override at `abs_path`, or a tombstone once it is gone. A no-op
+/// when the path is not under a mapped root.
+pub fn publish_override(c: &Connection, abs_path: &str) -> Result<()> {
+    publish(c, override_entry(c, abs_path)?)
+}
+
+/// None when the show row no longer exists (a merge loser).
+pub fn show_match_entry(c: &Connection, show_id: i64) -> Result<Option<Entry>> {
+    type MatchRow = (String, Option<String>, Option<i64>, Option<String>, Option<String>, Option<i64>, i64);
+    let row: Option<MatchRow> = c
+        .query_row(
+            "SELECT parsed_title, match_source, anilist_id, canonical_title, cover_url, total_episodes,
+                    anilist_cleared FROM shows WHERE id = ?1",
+            [show_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+        )
+        .optional()?;
+    let Some((title, source, anilist_id, canonical, cover_url, total, cleared)) = row else {
+        return Ok(None);
+    };
+    // A cleared match is a conclusion ("not this one"), so it is a value; only a
+    // show nobody has decided anything about is null.
+    let matched = (source.is_some() || cleared != 0).then(|| {
+        serde_json::json!({
+            "match_source": source,
+            "anilist_id": anilist_id,
+            "canonical_title": canonical,
+            "cover_url": cover_url,
+            "total_episodes": total,
+            "anilist_cleared": cleared,
+        })
+    });
+    Ok(Some((SyncKey::ShowMatch { title }, matched)))
+}
+
+/// Record a show's provider match. A show row that no longer exists (a merge
+/// loser) publishes nothing. Kept apart from the title override: each is its own
+/// conclusion, and re-stamping one with a stale null would overwrite another
+/// device's decision about it.
+pub fn publish_show_match(c: &Connection, show_id: i64) -> Result<()> {
+    publish(c, show_match_entry(c, show_id)?)
+}
+
+pub fn show_title_override_entry(c: &Connection, show_id: i64) -> Result<Option<Entry>> {
+    let row: Option<(String, Option<String>)> = c
+        .query_row("SELECT parsed_title, user_title_override FROM shows WHERE id = ?1", [show_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?;
+    Ok(row.map(|(title, user_title)| (SyncKey::ShowTitleOverride { title }, user_title.map(Value::from))))
+}
+
+/// Record a show's hand-set display title, or a tombstone once it is cleared.
+pub fn publish_show_title_override(c: &Connection, show_id: i64) -> Result<()> {
+    publish(c, show_title_override_entry(c, show_id)?)
+}
+
+pub fn season_title_entry(c: &Connection, show_id: i64, season: u32) -> Result<Option<Entry>> {
+    let Some(title) = show_title(c, show_id)? else { return Ok(None) };
+    let name: Option<String> = c
+        .query_row(
+            "SELECT title FROM seasons WHERE show_id = ?1 AND number = ?2",
+            params![show_id, season],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(Some((SyncKey::SeasonTitle { title, season }, name.map(Value::from))))
+}
+
+pub fn publish_season_title(c: &Connection, show_id: i64, season: u32) -> Result<()> {
+    publish(c, season_title_entry(c, show_id, season)?)
+}
+
+pub fn torrent_link_entry(c: &Connection, info_hash: &str) -> Result<Entry> {
+    let value = c
+        .query_row(
+            "SELECT s.parsed_title, l.season, l.number FROM torrent_links l JOIN shows s ON s.id = l.show_id
+             WHERE l.info_hash = ?1",
+            [info_hash],
+            |r| {
+                Ok(serde_json::json!({
+                    "title": r.get::<_, String>(0)?,
+                    "season": r.get::<_, i64>(1)?,
+                    "number": r.get::<_, i64>(2)?,
+                }))
+            },
+        )
+        .optional()?;
+    Ok((SyncKey::TorrentLink { info_hash: info_hash.into() }, value))
+}
+
+pub fn publish_torrent_link(c: &Connection, info_hash: &str) -> Result<()> {
+    publish(c, Some(torrent_link_entry(c, info_hash)?))
+}
+
+pub fn torrent_batch_entry(c: &Connection, info_hash: &str) -> Result<Entry> {
+    let value = c
+        .query_row(
+            "SELECT s.parsed_title, b.season, b.first, b.last, b.resolution FROM torrent_batches b
+             JOIN shows s ON s.id = b.show_id WHERE b.info_hash = ?1",
+            [info_hash],
+            |r| {
+                Ok(serde_json::json!({
+                    "title": r.get::<_, String>(0)?,
+                    "season": r.get::<_, i64>(1)?,
+                    "first": r.get::<_, i64>(2)?,
+                    "last": r.get::<_, i64>(3)?,
+                    "resolution": r.get::<_, Option<String>>(4)?,
+                }))
+            },
+        )
+        .optional()?;
+    Ok((SyncKey::TorrentBatch { info_hash: info_hash.into() }, value))
+}
+
+pub fn publish_torrent_batch(c: &Connection, info_hash: &str) -> Result<()> {
+    publish(c, Some(torrent_batch_entry(c, info_hash)?))
+}
+
+pub fn prefs_entry(c: &Connection, show_id: i64) -> Result<Option<Entry>> {
+    let Some(title) = show_title(c, show_id)? else { return Ok(None) };
+    let value = c
+        .query_row(
+            "SELECT save_path, category FROM torrent_prefs WHERE show_id = ?1",
+            [show_id],
+            |r| {
+                Ok(serde_json::json!({
+                    "save_path": r.get::<_, Option<String>>(0)?,
+                    "category": r.get::<_, Option<String>>(1)?,
+                }))
+            },
+        )
+        .optional()?;
+    Ok(Some((SyncKey::TorrentPrefs { title }, value)))
+}
+
+pub fn publish_prefs(c: &Connection, show_id: i64) -> Result<()> {
+    publish(c, prefs_entry(c, show_id)?)
+}
+
+pub fn rss_entry(c: &Connection, label: &str) -> Result<Entry> {
+    let title: Option<String> = c
+        .query_row(
+            "SELECT s.parsed_title FROM rss_feeds f JOIN shows s ON s.id = f.show_id WHERE f.label = ?1",
+            [label],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok((SyncKey::Rss { label: label.into() }, title.map(Value::from)))
+}
+
+pub fn publish_rss(c: &Connection, label: &str) -> Result<()> {
+    publish(c, Some(rss_entry(c, label)?))
+}
+
+/// None for any name off the allow-list (secrets, arming flags, machine paths).
+pub fn setting_entry(c: &Connection, name: &str) -> Result<Option<Entry>> {
+    if !SYNCED_SETTINGS.contains(&name) {
+        return Ok(None);
+    }
+    let value = setting(c, name)?.map(Value::from);
+    Ok(Some((SyncKey::Setting { name: name.into() }, value)))
+}
+
+/// Record an allow-listed setting's current value, or a tombstone once it is
+/// deleted. Any other name (secrets, arming flags, machine paths) is ignored.
+pub fn publish_setting(c: &Connection, name: &str) -> Result<()> {
+    publish(c, setting_entry(c, name)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Db;
+    use serde_json::json;
+
+    fn key() -> SyncKey {
+        SyncKey::Setting { name: "played_threshold".into() }
+    }
+
+    fn enable(c: &Connection) {
+        c.execute_batch(
+            "INSERT INTO settings(key, value) VALUES ('sync_enabled','1'), ('sync_device_id','dev-a')",
+        )
+        .unwrap();
+    }
+
+    fn rec(ms: u64, v: i64) -> Record {
+        Record {
+            key: key().encode(),
+            value: Some(json!(v)),
+            stamp: Stamp { physical_ms: ms, counter: 0, device: "dev-b".into() },
+        }
+    }
+
+    #[test]
+    fn record_local_noop_before_sync_was_set_up() {
+        let db = Db::open_memory().unwrap();
+        db.with(|c| {
+            c.execute("INSERT INTO settings(key, value) VALUES ('sync_enabled','1')", [])?;
+            assert!(!record_local(c, &key(), Some(json!(1)))?);
+            assert!(all(c)?.is_empty());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn record_local_keeps_recording_while_sync_is_off() {
+        let db = Db::open_memory().unwrap();
+        db.with(|c| {
+            c.execute("INSERT INTO settings(key, value) VALUES ('sync_device_id','dev-a')", [])?;
+            assert!(record_local(c, &key(), Some(json!(1)))?);
+            assert_eq!(get(c, &key())?.unwrap().value, Some(json!(1)));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn record_local_stamps_increase() {
+        let db = Db::open_memory().unwrap();
+        db.with(|c| {
+            enable(c);
+            assert!(record_local(c, &key(), Some(json!(1)))?);
+            let a = get(c, &key())?.unwrap();
+            record_local(c, &key(), Some(json!(2)))?;
+            let b = get(c, &key())?.unwrap();
+            assert!(b.stamp > a.stamp);
+            assert_eq!(b.value, Some(json!(2)));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn merge_is_lww_commutative_idempotent() {
+        let (r1, r2) = (rec(100, 1), rec(200, 2));
+        let orders: [Vec<&Record>; 3] = [vec![&r1, &r2], vec![&r2, &r1], vec![&r2, &r2, &r1]];
+        for order in orders {
+            let db = Db::open_memory().unwrap();
+            db.with(|c| {
+                for r in order {
+                    merge_remote(c, r)?;
+                }
+                assert_eq!(get(c, &key())?.unwrap().value, Some(json!(2)));
+                assert!(!merge_remote(c, &r2)?);
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn merge_observes_clock() {
+        let db = Db::open_memory().unwrap();
+        db.with(|c| {
+            enable(c);
+            let future = rec(now_ms() + 3_600_000, 9);
+            merge_remote(c, &future)?;
+            record_local(c, &SyncKey::Setting { name: "other".into() }, Some(json!(1)))?;
+            let local = get(c, &SyncKey::Setting { name: "other".into() })?.unwrap();
+            assert!(local.stamp > future.stamp);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_clock_is_rebuilt_from_the_newest_stored_stamp() {
+        let db = Db::open_memory().unwrap();
+        db.with(|c| {
+            enable(c);
+            let far = rec(now_ms() + 3_600_000, 1);
+            merge_remote(c, &far)?;
+            c.execute("UPDATE settings SET value = 'garbage' WHERE key = 'sync_clock'", [])?;
+            record_local(c, &SyncKey::Setting { name: "other".into() }, Some(json!(1)))?;
+            assert!(get(c, &SyncKey::Setting { name: "other".into() })?.unwrap().stamp > far.stamp);
+            c.execute("DELETE FROM settings WHERE key = 'sync_clock'", [])?;
+            let before = get(c, &SyncKey::Setting { name: "other".into() })?.unwrap().stamp;
+            record_local(c, &key(), Some(json!(2)))?;
+            assert!(get(c, &key())?.unwrap().stamp > before, "a missing clock reissued an old stamp");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_failed_record_leaves_the_clock_alone() {
+        let db = Db::open_memory().unwrap();
+        db.with(|c| {
+            enable(c);
+            record_local(c, &key(), Some(json!(1)))?;
+            let clock_before = setting(c, "sync_clock")?;
+            c.execute_batch(
+                "CREATE TEMP TRIGGER no_insert BEFORE UPDATE ON sync_records BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )?;
+            assert!(record_local(c, &key(), Some(json!(2))).is_err());
+            assert_eq!(setting(c, "sync_clock")?, clock_before);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn merge_remote_bumps_seq_only_when_it_replaces() {
+        let db = Db::open_memory().unwrap();
+        db.with(|c| {
+            enable(c);
+            assert!(merge_remote(c, &rec(200, 2))?);
+            let s1 = max_seq(c)?;
+            assert!(!merge_remote(c, &rec(100, 1))?, "older loses");
+            assert!(!merge_remote(c, &rec(200, 2))?, "equal is not newer");
+            assert_eq!(max_seq(c)?, s1);
+            assert!(merge_remote(c, &rec(300, 3))?);
+            assert!(max_seq(c)? > s1);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn tombstone_round_trips() {
+        let db = Db::open_memory().unwrap();
+        db.with(|c| {
+            enable(c);
+            record_local(c, &key(), Some(json!(1)))?;
+            record_local(c, &key(), None)?;
+            let r = get(c, &key())?.unwrap();
+            assert_eq!(r.value, None);
+            let wire = serde_json::to_string(&crate::sync::folder::WireRecord { v: r.value.clone(), s: r.stamp.encode() })
+                .map_err(|e| AppError::Db(e.to_string()))?;
+            let back: crate::sync::folder::WireRecord =
+                serde_json::from_str(&wire).map_err(|e| AppError::Db(e.to_string()))?;
+            assert_eq!(back.v, None);
+            let other = Db::open_memory().unwrap();
+            other.with(|o| {
+                let incoming = Record { key: key().encode(), value: back.v.clone(), stamp: Stamp::parse(&back.s).unwrap() };
+                assert!(merge_remote(o, &incoming)?);
+                assert_eq!(get(o, &key())?, Some(incoming));
+                Ok(())
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn seq_increases_on_every_upsert() {
+        let db = Db::open_memory().unwrap();
+        db.with(|c| {
+            enable(c);
+            assert_eq!(max_seq(c)?, 0);
+            record_local(c, &key(), Some(json!(1)))?;
+            let s1 = max_seq(c)?;
+            record_local(c, &key(), Some(json!(2)))?;
+            let s2 = max_seq(c)?;
+            let other = SyncKey::Setting { name: "other".into() };
+            let stamp = Stamp::min("dev-b");
+            assert!(insert_if_absent(c, &other, None, &stamp)?);
+            assert!(!insert_if_absent(c, &other, Some(json!(1)), &stamp)?);
+            let s3 = max_seq(c)?;
+            assert!(s1 >= 1 && s2 > s1 && s3 > s2);
+            Ok(())
+        })
+        .unwrap();
+    }
+}

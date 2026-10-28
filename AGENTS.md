@@ -11,7 +11,7 @@ pnpm tauri build --no-bundle                                      # release bina
 cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1
 pnpm test                                                         # vitest
 pnpm check                                                        # svelte-check
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings   # required on PRs
 ```
 
 **The Rust suite must run single-threaded.** The player tests drive `src-tauri/tests/fixtures/fake_mpv.py` through process-global environment variables (`FAKE_MPV_STOP_AT`, `FAKE_MPV_RUNTIME`, `FAKE_MPV_NO_IPC`); running them in parallel makes them read each other's values.
@@ -19,6 +19,10 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets
 Single test: `cargo test --manifest-path src-tauri/Cargo.toml parser::tests::episode_word -- --test-threads=1`, or `pnpm test src/lib/keys.test.ts`.
 
 Requires Rust 1.88+ (let-chains are used in `commands.rs`, `db.rs`, `parser.rs`) and mpv on `$PATH`.
+
+On Windows, run cargo from PowerShell, not Git Bash: Git's `/usr/bin/link` shadows the MSVC
+linker and every build script fails to link. The player tests launch the fakes through
+`fake_mpv.cmd` / `fake_vlc.cmd`, which need `py` or `python` on `PATH`.
 
 ## Branching (git-flow)
 
@@ -59,9 +63,84 @@ scanner::scan_dir → per file: db.get_override() → parser::parse_with_confide
 
 **LLM assist** (`llm.rs`) is optional and off until an API key and model are set in Settings and a Test connection has succeeded against them (`llm_test_ok`); a failed test or a new key/endpoint/model disarms the background worker again, so a broken config is never pinged on scan. Any OpenAI-compatible provider works; `LLM_PROVIDERS` in `api.ts` presets the free-tier ones and `llm_models` (picked through `ModelPickerModal`) lists what the chosen provider offers, because free model ids rotate and a hard-coded default goes stale. Scans enqueue low-confidence folders into a single in-process `AssistQueue`; one background worker drains it. `next_or_finish()` pops and clears the running flag under one lock — that atomicity is what stops folders being stranded with no worker, and `RunGuard` clears the flag on panic. `inspect_show` takes the same guard so a manual inspect cannot race the worker.
 
-**Playback** (`player.rs`) spawns mpv with `--input-ipc-server` and polls position over the JSON IPC socket. If the socket never connects, the run writes nothing back and returns an error — position and duration are unknown, so any watched judgement would be made from stale values.
+**Playback** (`player.rs`) spawns mpv with `--input-ipc-server` (or VLC with its RC interface) and polls position over the control channel. The channel is an `Endpoint`: a unix socket on Linux (named `<pid>-<episode id>.sock`, so two processes never share one); on Windows a named pipe for mpv and loopback TCP for VLC (`--rc-host`), because VLC's Windows build has no `--rc-unix`. MPC-HC (Windows only) has no socket: `mpc_hc.rs` opens a hidden message-only window on a thread of its own and launches `mpc-hc64 /slave <hwnd> /new /play /close /start <ms>`; MPC-HC reports to that window with `WM_COPYDATA` (`CMD_CONNECT`, `CMD_NOWPLAYING`, `CMD_CURRENTPOSITION`), and only the window that connected is listened to, since any process can send one. Its API reports no volume or window state, so an MPC-HC run records no show player state, and under `/close` it sends no end-of-stream notice (verified on 2.8.2), so the last poll decides watched as for the others. `fake_mpc_hc.py` speaks the same messages through ctypes, so those tests are Windows only. Players start with `CREATE_NO_WINDOW` (`no_console_window`). If the channel never connects, the run writes nothing back and returns an error — position and duration are unknown, so any watched judgement would be made from stale values.
 
-**Frontend contract.** `src/lib/api.ts` is the only place that calls `invoke`; keep the TS interfaces in step with `models.rs`. Tauri maps camelCase JS args to snake_case Rust params automatically; a command taking a struct arg (e.g. `torrent_add(args: TorrentAddArgs)`) is invoked as `invoke('torrent_add', { args })`, and the struct carries `#[serde(rename_all = "camelCase")]` for its inner fields. Events (`scan-progress`, `library-changed`, `show-updated`, `playback-changed`, `llm-assist-progress`, `llm-assist`, `torrent-changed`, `error`) are subscribed in `+layout.svelte` and the route components. Stores are Svelte 5 runes in `.svelte.ts` files.
+**Choosing the player** (`player_detect.rs`). `player_backend` is `auto` by default: the first player found in the order mpv → VLC → MPC-HC; a pick by name that is missing falls back along that order with a `notice`. Detection finds a program by location and never runs it — MPC-HC has no `--version` and VLC on Windows opens a window for one, so probing by execution would put a player on screen. A typed path is used exactly; a bare name is searched on `PATH`, then, for the default name only, in the Windows install folders (built from `ProgramFiles` and friends, so the list is empty on Linux and testable anywhere by injecting the environment). On Windows (`cfg!(windows)`, never `PATHEXT`, which a Linux shell can inherit from WSL) a bare name means `<name>.exe`, then `.com` as a last resort — never the extensionless file, which cannot launch, and `mpv.com` is a console wrapper. Because nothing is run at detection, a player that is installed but broken is caught at Play: `play_with_fallback` walks every usable player in order and moves to the next only when one *never started* (spawn failed, or before its control channel opened it exited 126/127, by a signal, or on Windows with a loader NTSTATUS such as `STATUS_DLL_NOT_FOUND`). Any other early failure means it ran and gave up — mpv exits 2 on a file it cannot play — and ends the attempt, as does a player that ran untracked: another would fail on the same file or replay the episode. MPC-HC's `playable_here()` is true only on Windows; elsewhere it is detected but `play_episode` refuses it before claiming the player, and the fallback says playback needs Windows.
+
+**Frontend contract.** `src/lib/api.ts` is the only place that calls `invoke`; keep the TS interfaces in step with `models.rs`. Tauri maps camelCase JS args to snake_case Rust params automatically; a command taking a struct arg (e.g. `torrent_add(args: TorrentAddArgs)`) is invoked as `invoke('torrent_add', { args })`, and the struct carries `#[serde(rename_all = "camelCase")]` for its inner fields. Events (`scan-progress`, `library-changed`, `show-updated`, `playback-changed`, `llm-assist-progress`, `llm-assist`, `torrent-changed`, `sync-progress`, `error`) are subscribed in `+layout.svelte` and the route components. Stores are Svelte 5 runes in `.svelte.ts` files.
+
+## Library sync
+
+`sync/` shares watched state and library conclusions between machines through a plain folder on a
+share (`sync/folder.rs`); each machine scans its own files and only conclusions travel, never
+listings, covers or secrets. Commands: `sync_status`, `sync_configure`, `sync_map_root`,
+`sync_now`, `sync_forget_device`; the `sync-progress` event reports rounds. The spec is
+`docs/superpowers/specs/2026-10-26-library-sync-design.md`.
+
+**Record model.** Everything lives in `sync_records(key, value, stamp, seq)`. Keys are JSON arrays
+(`sync/keys.rs`), episodes and overrides keyed on `(library, relpath)` with `/` separators so a
+Windows client can join later, shows on `parsed_title`. Stamps are a hybrid logical clock
+(`sync/clock.rs`), absorbed on every read so a machine with a slow wall clock still orders new
+edits after what it has seen and a fast one cannot win what it did not write later. Merge is LWW
+with a strictly-greater stamp, which makes it commutative and idempotent: files may be read in any
+order, any number of times. Each machine writes only its own `devices/<id>.json`, a full snapshot
+of its merged view, so forgetting a device loses none of its contributions. Torrent records
+(`tlink`, `tbatch`) carry the show as a field named `title`, which holds the `parsed_title`.
+
+**Publishing happens in `db.rs` write methods**, through `sync::store::publish_*`, never in the
+commands above them: a write path that forgets to publish silently stops syncing, and putting it
+beside the SQL is the only place every caller passes through. `publish_show_match` and
+`publish_show_title_override` are separate so a write re-stamps only the field it changed;
+re-stamping the sibling would let an old title override beat a newer one on another machine.
+`publish_setting` is the settings allow-list gate: any name off `SYNCED_SETTINGS` publishes
+nothing, so secrets and arming flags cannot leak through a generic `set_setting`. A write that
+changes nothing publishes nothing (`set_setting`, `set_status`, `publish_episode` compare first):
+Settings saves only edited fields, and an unchanged value with a fresh stamp would revert a newer
+edit made elsewhere. Records keep mirroring local writes while sync is off once a device id
+exists (`record_local` gates on the id, not `sync_enabled`), or re-enabling would re-apply stale
+records over edits made while off; only what a scan applies (`apply_for_episode`, a move's carry)
+stays gated on enabled, since a root mapped while off has not yet offered its own state.
+**Apply** (`sync::apply`) writes live tables with its own SQL and never republishes: going through
+the db.rs methods would stamp every incoming record afresh and the machines would echo each other
+forever.
+
+**Paths.** A scan-detected move carries the old record, value and stamp both, to the new path,
+never a fresh stamp and never this machine's row, and carries nothing when the old path had no
+record or a tombstone: a move is not a judgement, a fresh stamp would beat a real watch made
+elsewhere, and two machines detecting one move must publish the same thing. A Rename moves the
+record (a playing or missing row moves its old record's value) and tombstones the old path.
+Unmapped roots publish nothing and are not matched.
+
+**Rounds and joining.** A round merges the share and applies the result in one transaction; a
+failure clears the read cache so the next round retries instead of believing it already saw it.
+Joining a share, or mapping a root onto one, reads before it publishes: merge the share, publish
+local state only for keys the share lacks (insert-if-absent; episodes stamped by `last_played_at`,
+missing rows publishing `prev_status`), then apply, all in one transaction. A newcomer's stale
+match, override or `llm_model` therefore never overrides the share, while its more recently watched
+episodes still win on real viewing times. The poller (`sync_commands::spawn_poller`) flushes
+pending local writes on a debounced 3 s tick and runs a read round every 30 s; window focus
+triggers `sync_now` with `force_write: false` (the Sync now button forces the write).
+`sync_status` reads a `RuntimeView` snapshot, never the runtime lock a round holds through
+folder I/O, so a hung share cannot freeze Settings.
+
+**Folder safety.** Only `sync_configure` may initialise a folder (`folder::prepare(dir, create)`),
+and only one newly chosen: rounds treat a folder without the marker as unreachable, because the
+sync folder may be the mount point and an unmounted share is an empty directory there. Records
+stamped more than a day ahead (`MAX_AHEAD_MS`) are refused before they are observed, so one bad
+clock cannot drag every machine forward. A change to this machine's own device file that it did
+not write is reported as a copied database (two machines sharing a device id).
+
+**Fold survivor.** `merge_duplicate_shows` picks the survivor by most `merge` pins, ties broken
+on `parsed_title`; only a group with no pins at all falls back to episode count first. Never row
+id or, once a fold exists anywhere, local episode counts: both differ per machine, and two machines
+that folded opposite ways before reading each other would keep re-pinning against each other.
+
+**Local only.** Roots, `sync_libraries`, the sync folder, device id/name/clock, player paths, DLNA,
+`torrent_path_map`, scan interval, the secrets `llm_api_key` and `torrent_password`, covers,
+`rename_log`, scan statistics, per-show volume. Only an allow-list of settings syncs. **Arming
+does not travel:** when a synced `llm_base_url`/`llm_model` or `torrent_base_url` arrives different,
+the receiver disarms `llm_test_ok`/`torrent_test_ok`, because a test that passed on one machine
+says nothing about another.
 
 ## rustorrent integration
 
@@ -114,7 +193,10 @@ state splits. Two mechanisms close that, in order of trust:
 
 - `db::merge_duplicate_shows` folds rows already matched to the same `(match_source, anilist_id)`.
   That is evidence, not a guess, so it needs no model and runs automatically after every matching
-  pass. The survivor is the row with the most episodes; a `user_title_override` and any artwork or
+  pass. The survivor is picked the same way on every synced machine, or machines with different
+  episode counts would undo each other's folds: once any `merge` pin names a title in the group,
+  most pins wins and `parsed_title` ascending breaks a tie; a group nobody has folded yet prefers
+  most episodes, then `parsed_title` (never row id). A `user_title_override` and any artwork or
   counts only a folded row carried are kept. Seasons are `UNIQUE(show_id, number)`, so episodes
   move season by season into the survivor's season of that number rather than the season row moving.
   Rows with no shared id are deliberately left alone — titles alone are not evidence.
@@ -175,6 +257,22 @@ is a sequence, so numbering would decorate rather than inform.
 
 ## Platform quirks
 
+**Paths carry their own separator.** Stored paths are whatever the scanner produced, so a Windows
+install holds `Z:\Anime\Show\01.mkv`. Every prefix test and join goes through `paths.rs`
+(`dir_prefix`, `is_within`, `trim_dir`) — mirrored in `src/lib/paths.ts` — which reads the style
+from the string rather than `cfg(windows)`, so both rules are tested on every host and a
+backslash stays an ordinary file-name character in a Linux path. A hard-coded `'/'` in a prefix
+test is a bug on Windows that fails silently: missing-file detection simply never fires.
+`add_root` normalises a Windows root to backslashes; the torrent path map translates POSIX server
+paths to a Windows local side (`/downloads=Z:\Downloads`) and converts separators on the way.
+Sync relpaths are always `/`-separated on the wire.
+
+On Windows every child process (`ffmpeg`, `ffprobe`, the player) gets `CREATE_NO_WINDOW` via
+`player::no_console_window`, or a console window flashes up from the GUI app. The fake-ffmpeg DLNA
+tests and the DLNA port-probe tests are `#[cfg(unix)]`: the fakes are `/bin/sh` scripts that
+Windows' `ffmpeg.exe`-only PATH lookup cannot find, and Windows lets a wildcard bind coexist with
+a loopback one.
+
 WebKitGTK draws native widgets for form controls: a `<select>` honours `color` but ignores
 `background`, so paper-white text landed on the platform's near-white control and vanished.
 `select.field` in `app.css` sets `appearance: none` and draws its own chevron. Any new native
@@ -205,6 +303,13 @@ These exist because their absence destroyed data in review. Do not "simplify" th
 - **`merge_duplicate_shows` writes a `parse_overrides` row for every path it moves.** The files on disk still parse to the folded row's title, so without the pin the next scan recreates that row and the episodes walk back out: the fold would last until the next scan and no further. Only the title is re-pointed; a season or kind already decided for a path stays.
 - **A whole-show LLM decision is keyed on the path below the library root, not the basename.** Every rip names its first episode `01.mkv`, so a basename is ambiguous exactly where the feature is aimed — a decision meant for `Season 2/01.mkv` would also move `Season 1/01.mkv`.
 - The whole-show path never falls back to the reply's show-level `season` for a file that gave none. That number is one value for a multi-season show; using it would collapse every season into one on a lazy reply.
+- **A synced record is never deleted by a disappearance.** Missing files, purges and pruning are local; only an explicit user action (or a Rename's tombstone) changes an episode record.
+- **`missing` and `playing` never leave the machine.** They describe a mount and a process, not the user's judgement; a missing row publishes its `prev_status`.
+- **An unreadable device file is skipped, not emptied.** A half-written or corrupt file must not read as "this machine has no state".
+- **Only the owning machine writes its device file**, atomically (temp, fsync, rename); two writers on a share corrupt it.
+- **Joining never overrides the share's conclusions.** A newcomer reads before it publishes and only fills keys the share lacks; its episodes compete on real viewing times.
+- **Apply never republishes, and a scan-detected move never takes a fresh stamp.** Either would let a restamped copy beat a real edit made elsewhere.
+- **Merge and apply are one transaction.** A half-applied round with a warm read cache would never retry.
 
 ## Validating parser changes
 
@@ -220,7 +325,14 @@ It prints one tab-separated line per file, `OK / title / S<n> / E<n> / group / p
 
 `scripts/build-release.sh` produces the `.deb`, `.rpm` and `.AppImage` into `dist/` with a
 `SHA256SUMS.txt`; `.github/workflows/release.yml` does the same on a `v*` tag push and uploads
-them to the GitHub release. Both run the test suites first.
+them to the GitHub release. Its `windows` job then builds the NSIS `-setup.exe` and `.msi` on
+`windows-latest` with a separate `SHA256SUMS-windows.txt`. Both run the test suites first.
+`.github/workflows/ci.yml` runs on every push to `develop`/`main` and every pull request:
+`clippy (linux)` and `clippy (windows)` with `-D warnings` (required checks on `develop`; their
+names are what branch protection matches, so renaming the job drops the requirement), the
+test suites on Linux and Windows, then the Windows installers as a workflow artifact, so a
+Windows break shows up on the PR rather than on the tag. Windows cargo steps run under `pwsh`,
+not bash, for the same `link` reason as locally.
 
 AppImage bundling needs two environment variables that the script sets and CI sets in part:
 

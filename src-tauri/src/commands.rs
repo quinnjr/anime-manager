@@ -6,6 +6,7 @@ use crate::metadata::{self, Providers};
 use crate::models::*;
 use crate::nyaa::{self, Nyaa, SourceComparison, WantedEpisode};
 use crate::player::{self, Player};
+use crate::player_detect;
 use crate::rename;
 use crate::torrent;
 use std::collections::HashMap;
@@ -23,6 +24,12 @@ pub struct AppState {
     /// DLNA/UPnP direct-play server. Off until the user enables it in Settings;
     /// the single app instance owns the port while running.
     pub dlna: DlnaState,
+    /// Library sync bookkeeping. A std mutex: rounds run on blocking threads and the lock is
+    /// never held across an await.
+    pub sync: Arc<std::sync::Mutex<crate::sync::SyncRuntime>>,
+    /// The runtime's last published view, so `sync_status` answers while a round holds
+    /// `sync` through slow or hung folder I/O.
+    pub sync_view: Arc<std::sync::Mutex<crate::sync::RuntimeView>>,
 }
 
 /// DLNA/UPnP direct-play server state: atomics so `dlna_status` never blocks.
@@ -43,7 +50,7 @@ pub const SETTING_DLNA_PORT: &str = "dlna_port";
 pub const SETTING_DLNA_UUID: &str = "dlna_uuid";
 
 /// Best-effort machine name without a new crate: $HOSTNAME, else /etc/hostname.
-fn hostname() -> Option<String> {
+pub(crate) fn hostname() -> Option<String> {
     std::env::var("HOSTNAME")
         .ok()
         .map(|h| h.trim().to_string())
@@ -291,7 +298,7 @@ pub async fn dlna_set_options(
 
 #[tauri::command]
 pub fn add_root(state: State<'_, AppState>, path: String) -> Result<Root> {
-    state.db.add_root(&path)
+    state.db.add_root(&crate::paths::normalize_root(&path))
 }
 
 #[tauri::command]
@@ -527,13 +534,14 @@ fn settings_map(db: &Db) -> Result<HashMap<String, String>> {
     );
     // Effective config: blank stored paths fall back to the binary name, so the
     // settings page echoes what playback will actually run.
-    m.insert("mpv_path".into(), player::mpv_binary(db));
-    m.insert("vlc_path".into(), player::vlc_binary(db));
-    // Effective, normalised backend: an unknown stored value parses to mpv, which
-    // is what playback will actually run, so echo that rather than the raw row.
+    for backend in player_detect::PLAYER_ORDER {
+        m.insert(backend.path_key().into(), player::player_command(db, backend));
+    }
+    // Effective, normalised choice: an unknown stored value parses to Automatic,
+    // which is what playback will actually do, so echo that rather than the raw row.
     m.insert(
         "player_backend".into(),
-        player::player_backend(db).as_str().into(),
+        player_detect::player_choice(db).as_str().into(),
     );
     m.insert(
         "llm_api_key".into(),
@@ -711,89 +719,10 @@ pub fn purge_missing(state: State<'_, AppState>) -> Result<usize> {
     state.db.purge_missing()
 }
 
-/// Pick the player binary for a run: the configured backend first, then the
-/// other one as a fallback. Pure so the preference order is unit-testable;
-/// `play` passes a `--version` probe. Returns the backend actually used.
-fn resolve_player(
-    backend: player::PlayerBackend,
-    mpv_bin: &str,
-    vlc_bin: &str,
-    probe: impl Fn(&str) -> bool,
-) -> Option<(player::PlayerBackend, String)> {
-    let (first, second) = match backend {
-        player::PlayerBackend::Mpv => (
-            (player::PlayerBackend::Mpv, mpv_bin),
-            (player::PlayerBackend::Vlc, vlc_bin),
-        ),
-        player::PlayerBackend::Vlc => (
-            (player::PlayerBackend::Vlc, vlc_bin),
-            (player::PlayerBackend::Mpv, mpv_bin),
-        ),
-    };
-    if probe(first.1) {
-        Some((first.0, first.1.to_string()))
-    } else if probe(second.1) {
-        Some((second.0, second.1.to_string()))
-    } else {
-        None
-    }
-}
-
-/// The synchronous Play preamble as a pure, testable decision: the wanted
-/// backend first via [`resolve_player`], falling back to the other one.
-/// `notice` is `Some("…falling back…")` only on fallback, for the
-/// informational `notice` channel; `Err` is the "no player found…" message
-/// `play` surfaces as an error toast.
-#[derive(Debug)]
-struct PlayDecision {
-    backend: player::PlayerBackend,
-    bin: String,
-    notice: Option<String>,
-}
-
-fn decide_player(
-    wanted: player::PlayerBackend,
-    mpv_bin: &str,
-    vlc_bin: &str,
-    probe: impl Fn(&str) -> bool,
-) -> std::result::Result<PlayDecision, String> {
-    match resolve_player(wanted, mpv_bin, vlc_bin, probe) {
-        Some((backend, bin)) => {
-            let notice = (backend != wanted).then(|| {
-                format!(
-                    "{} not found, falling back to {}",
-                    wanted.as_str(),
-                    backend.as_str()
-                )
-            });
-            Ok(PlayDecision {
-                backend,
-                bin,
-                notice,
-            })
-        }
-        None => Err(format!(
-            "no player found: mpv missing at '{mpv_bin}' and vlc missing at '{vlc_bin}'; install one or set its path in settings"
-        )),
-    }
-}
-
-/// Probe a player binary with `--version`, requiring exit success. Bounded by
-/// a short timeout so a hanging binary can't hang Play: the probe runs on a
-/// thread and anything slower than 5s counts as missing.
-fn probe_binary(bin: &str) -> bool {
-    let bin = bin.to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let ok = std::process::Command::new(&bin)
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        let _ = tx.send(ok);
-    });
-    rx.recv_timeout(std::time::Duration::from_secs(5))
-        .unwrap_or(false)
+/// Every player in the order Automatic tries them, found or not, for Settings.
+#[tauri::command]
+pub fn detect_players(state: State<'_, AppState>) -> Vec<player_detect::DetectedPlayer> {
+    player_detect::detect(&state.db, &|k| std::env::var_os(k), cfg!(windows))
 }
 
 #[tauri::command]
@@ -809,27 +738,27 @@ pub async fn play(app: AppHandle, state: State<'_, AppState>, episode_id: i64) -
     // file immediately as a toast, rather than after the background task's socket timeout.
     let ep = db.get_episode(episode_id)?;
     player::ensure_file_present(&ep.path)?;
-    let wanted = player::player_backend(&db);
-    let mpv_bin = player::mpv_binary(&db);
-    let vlc_bin = player::vlc_binary(&db);
-    let decision = decide_player(wanted, &mpv_bin, &vlc_bin, probe_binary)
+    let detected = player_detect::detect(&db, &|k| std::env::var_os(k), cfg!(windows));
+    let decision = player_detect::decide(player_detect::player_choice(&db), &detected)
         .map_err(crate::error::AppError::Player)?;
-    let backend = decision.backend;
-    let bin = decision.bin;
+    let candidates = decision.candidates;
     let notice = decision.notice;
     let app2 = app.clone();
+    let app3 = app.clone();
     tauri::async_runtime::spawn(async move {
         if let Some(notice) = notice {
             let _ = app.emit("notice", notice);
         }
-        if let Err(e) = player::play_episode(
+        if let Err(e) = player::play_with_fallback(
             db,
             player,
             episode_id,
-            backend,
-            &bin,
+            &candidates,
             move |ev| {
                 let _ = app2.emit("playback-changed", ev);
+            },
+            move |notice| {
+                let _ = app3.emit("notice", notice);
             },
             std::time::Duration::from_secs(5),
         )
@@ -1111,6 +1040,7 @@ mod tests {
             "played_threshold",
             "mpv_path",
             "vlc_path",
+            "mpc_hc_path",
             "player_backend",
             "llm_api_key",
             "llm_model",
@@ -1173,85 +1103,26 @@ mod tests {
     }
 
     #[test]
-    fn resolve_player_prefers_the_configured_backend() {
-        let (backend, bin) = resolve_player(player::PlayerBackend::Vlc, "mpv", "vlc", |_| true)
-            .expect("a probe that always passes picks something");
-        assert_eq!(backend, player::PlayerBackend::Vlc);
-        assert_eq!(bin, "vlc");
-    }
-
-    #[test]
-    fn resolve_player_falls_back_to_the_other_backend() {
-        let got = resolve_player(player::PlayerBackend::Vlc, "mpv", "vlc", |b| {
-            b == "mpv"
-        });
-        let (backend, bin) = got.expect("mpv is available");
-        assert_eq!(backend, player::PlayerBackend::Mpv);
-        assert_eq!(bin, "mpv");
-    }
-
-    #[test]
-    fn resolve_player_is_none_when_neither_backend_exists() {
-        assert!(
-            resolve_player(player::PlayerBackend::Mpv, "mpv", "vlc", |_| false).is_none()
-        );
-    }
-
-    #[test]
-    fn decide_player_errors_naming_both_binaries_when_none_found() {
-        let err = decide_player(
-            player::PlayerBackend::Mpv,
-            "/none/mpv",
-            "/none/vlc",
-            |_| false,
-        )
-        .expect_err("no probe passes, so there is no player");
-        assert!(err.contains("no player found"), "{err}");
-        assert!(err.contains("/none/mpv"), "{err}");
-        assert!(err.contains("/none/vlc"), "{err}");
-    }
-
-    #[test]
-    fn decide_player_prefers_wanted_with_no_notice() {
-        let d = decide_player(player::PlayerBackend::Vlc, "mpv", "vlc", |_| true).unwrap();
-        assert_eq!(d.backend, player::PlayerBackend::Vlc);
-        assert_eq!(d.bin, "vlc");
-        assert_eq!(d.notice, None);
-    }
-
-    #[test]
-    fn decide_player_falls_back_to_mpv_with_notice() {
-        let d = decide_player(player::PlayerBackend::Vlc, "mpv", "vlc", |b| b == "mpv").unwrap();
-        assert_eq!(d.backend, player::PlayerBackend::Mpv);
-        assert_eq!(d.bin, "mpv");
-        let notice = d.notice.expect("fallback carries a notice");
-        assert!(notice.contains("vlc"), "{notice}");
-        assert!(notice.contains("mpv"), "{notice}");
-    }
-
-    #[test]
-    fn decide_player_falls_back_to_vlc() {
-        let d = decide_player(player::PlayerBackend::Mpv, "mpv", "vlc", |b| b == "vlc").unwrap();
-        assert_eq!(d.backend, player::PlayerBackend::Vlc);
-        assert_eq!(d.bin, "vlc");
-    }
-
-    #[test]
     fn effective_player_defaults_echo_what_playback_runs() {
         // get_settings needs a Tauri State so it can't be unit-tested directly;
         // assert via the same player:: helpers get_settings now echoes instead.
         let db = Db::open_memory().unwrap();
-        assert_eq!(player::player_backend(&db), player::PlayerBackend::Mpv);
-        assert_eq!(player::mpv_binary(&db), "mpv");
-        assert_eq!(player::vlc_binary(&db), "vlc");
+        let echoed = settings_map(&db).unwrap();
+        assert_eq!(echoed.get("player_backend").map(String::as_str), Some("auto"));
+        assert_eq!(echoed.get("mpv_path").map(String::as_str), Some("mpv"));
+        assert_eq!(echoed.get("vlc_path").map(String::as_str), Some("vlc"));
+        assert_eq!(echoed.get("mpc_hc_path").map(String::as_str), Some("mpc-hc64"));
         // Blank stored paths normalise to the binary name…
         db.set_setting("vlc_path", "").unwrap();
-        assert_eq!(player::vlc_binary(&db), "vlc");
+        assert_eq!(player::player_command(&db, player::PlayerBackend::Vlc), "vlc");
         // …while a real custom path is honoured.
         db.set_setting("vlc_path", "/usr/bin/vlc").unwrap();
-        assert_eq!(player::vlc_binary(&db), "/usr/bin/vlc");
+        assert_eq!(player::player_command(&db, player::PlayerBackend::Vlc), "/usr/bin/vlc");
         db.set_setting("player_backend", "vlc").unwrap();
-        assert_eq!(player::player_backend(&db), player::PlayerBackend::Vlc);
+        assert_eq!(
+            settings_map(&db).unwrap().get("player_backend").map(String::as_str),
+            Some("vlc")
+        );
     }
 
     #[test]
@@ -1390,39 +1261,57 @@ mod tests {
         assert_eq!(port, 28987);
     }
 
+    // Windows lets the probe's wildcard bind coexist with these loopback holds
+    // (no SO_EXCLUSIVEADDRUSE), so a held port does not read as occupied there.
+    #[cfg(unix)]
     #[tokio::test]
     async fn dlna_port_probe_bumps_past_occupied_port() {
-        let want = pick_unbound_test_port().await;
-        let _held =
-            tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], want)))
-                .await
-                .unwrap();
-        let (_listener, bound) = bind_free_dlna_port(want).await.unwrap();
-        assert_eq!(bound, want + 1);
+        let (base, mut held) = hold_port_block().await;
+        // Keep the first port occupied and let the rest go, so the probe has to
+        // skip `base` and land on `base + 1`.
+        held.truncate(1);
+        let (_listener, bound) = bind_free_dlna_port(base).await.unwrap();
+        assert_eq!(bound, base + 1);
     }
 
+    // Windows lets the probe's wildcard bind coexist with these loopback holds
+    // (no SO_EXCLUSIVEADDRUSE), so a held port does not read as occupied there.
+    #[cfg(unix)]
     #[tokio::test]
     async fn dlna_port_probe_errors_when_range_full() {
-        let want = pick_unbound_test_port().await;
-        let mut held = Vec::new();
-        for p in want..=want + DLNA_PORT_TRIES {
-            held.push(
-                tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], p)))
-                    .await
-                    .unwrap(),
-            );
-        }
-        assert!(bind_free_dlna_port(want).await.is_err());
+        let (base, _held) = hold_port_block().await;
+        assert!(bind_free_dlna_port(base).await.is_err());
     }
 
-    /// An ephemeral-bound port, released again: free in practice, stable
-    /// enough as a probe base since the tests hold what they need.
-    async fn pick_unbound_test_port() -> u16 {
-        tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+    /// A whole `DLNA_PORT_TRIES + 1` run of ports, already bound and handed back
+    /// so each test decides which to keep occupied.
+    ///
+    /// The run starts above `ip_local_port_range` (32768-60999 on Linux) on
+    /// purpose. A port released inside that range is fair game for any other
+    /// socket on the machine, so picking a probe base there made these tests fail
+    /// intermittently as soon as the full suite ran next to ordinary network
+    /// activity: `bind(0)` hands out an ephemeral port, and by the time the test
+    /// rebinds it something else owns it.
+    #[cfg(unix)]
+    async fn hold_port_block() -> (u16, Vec<tokio::net::TcpListener>) {
+        const FIRST: u16 = 61_000;
+        for base in FIRST..FIRST + 512 {
+            let mut held = Vec::new();
+            for p in base..=base + DLNA_PORT_TRIES {
+                match tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], p)))
+                    .await
+                {
+                    Ok(listener) => held.push(listener),
+                    Err(_) => break,
+                }
+            }
+            if held.len() == DLNA_PORT_TRIES as usize + 1 {
+                return (base, held);
+            }
+        }
+        panic!(
+            "no free {}-port block for the DLNA probe tests",
+            DLNA_PORT_TRIES + 1
+        );
     }
 }

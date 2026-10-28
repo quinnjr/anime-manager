@@ -2,7 +2,8 @@
   import '../app.css';
   import { onMount } from 'svelte';
   import { beforeNavigate } from '$app/navigation';
-  import { api, onEvent, type PlaybackChanged, type AppError, type InspectReport, type AssistProgress, type MatchProgress } from '$lib/api';
+  import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { api, onEvent, type SyncStatus, type PlaybackChanged, type AppError, type InspectReport, type AssistProgress, type MatchProgress } from '$lib/api';
   import { saveShelfScroll } from '$lib/shelfScroll';
   import { playback } from '$lib/stores/playback.svelte';
   import { assist, assistErrorMessages } from '$lib/stores/assist.svelte';
@@ -162,6 +163,14 @@
         for (const m of messages) toasts.push('error', m);
       })
     ];
+    // Sync is pulled on focus too, so switching back from the other machine is current
+    // without waiting for the 30 s poll. Only when enabled; failures show in Settings.
+    let syncEnabled = false;
+    unlisteners.push(onEvent<SyncStatus>('sync-progress', (s) => (syncEnabled = s.enabled)));
+    api.syncStatus().then((s) => (syncEnabled = s.enabled)).catch(() => {});
+    unlisteners.push(getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+      if (focused && syncEnabled) api.syncNow(false).catch(() => {});
+    }));
     api.assistProgress().then((p) => assist.apply(p)).catch(() => {});
     void autoScanPass();
     watchTimer = setInterval(() => { void watchPass(); }, WATCH_INTERVAL_MS);

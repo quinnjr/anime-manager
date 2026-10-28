@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import type { PlayerChoice } from './playerSettings';
 
 export type EpisodeStatus = 'unplayed' | 'playing' | 'played' | 'missing';
 export interface AppError { kind: 'Io' | 'Db' | 'Parse' | 'Network' | 'Player'; message: string }
@@ -108,6 +109,17 @@ export interface RssSubscribeResult { label: string; url: string; resolved_path:
 /** Mirrors the Rust ControlOp enum: unit variants serialise as bare strings, so
  *  Remove keeps its snake_case payload field exactly as serde expects it. */
 export type TorrentControlOp = 'Start' | 'Pause' | 'Recheck' | { Remove: { delete_files: boolean } };
+export interface SyncRootMap { root_id: number; root_path: string; library: string | null }
+export interface SyncDevice { id: string; name: string; written_at: number; is_self: boolean }
+export interface SyncStatus {
+  enabled: boolean; folder: string | null; device_id: string | null; device_name: string | null;
+  roots: SyncRootMap[]; known_libraries: string[]; devices: SyncDevice[];
+  last_read_at: number | null; last_write_at: number | null; unreachable_since: number | null; error: string | null;
+}
+/** Mirrors `player_detect::DetectedPlayer`: one player, found or not, in Automatic's order. */
+export interface DetectedPlayer {
+  player: Exclude<PlayerChoice, 'auto'>; label: string; path: string | null; supported: boolean; looked: string[];
+}
 export interface BatchRangeArg { first: number; last: number; resolution?: string | null }
 export interface TorrentAddArgs {
   torrentUrl?: string | null; infoHash?: string | null;
@@ -121,7 +133,8 @@ export type SettingsMap = Record<string, string> & {
   auto_scan_interval_mins?: string;
   mpv_path?: string;
   vlc_path?: string;
-  player_backend?: 'mpv' | 'vlc';
+  mpc_hc_path?: string;
+  player_backend?: PlayerChoice;
   played_threshold?: string;
   library_sort?: ShowSort;
   dlna_name?: string;
@@ -147,6 +160,7 @@ export const api = {
   listShows: (filter = '', sort: ShowSort = 'title') => invoke<ShowCard[]>('list_shows', { filter, sort }),
   getShow: (id: number) => invoke<ShowDetail>('get_show', { id }),
   play: (episodeId: number) => invoke<void>('play', { episodeId }),
+  detectPlayers: () => invoke<DetectedPlayer[]>('detect_players'),
   setStatus: (episodeId: number, status: EpisodeStatus) => invoke<void>('set_status', { episodeId, status }),
   rematch: (showId: number, matchId: number | null, source: MetadataSource | null = null) =>
     invoke<ShowDetail>('rematch', { showId, matchId, source }),
@@ -168,6 +182,14 @@ export const api = {
   clearAiDecisions: () => invoke<number>('clear_ai_decisions'),
   matchLibrary: () => invoke<number>('match_library'),
   setShowTitle: (showId: number, title: string | null) => invoke<ShowDetail>('set_show_title', { showId, title }),
+  syncStatus: () => invoke<SyncStatus>('sync_status'),
+  syncConfigure: (folder: string, enabled: boolean, deviceName: string) =>
+    invoke<SyncStatus>('sync_configure', { folder, enabled, deviceName }),
+  syncMapRoot: (rootId: number, library: string | null) => invoke<SyncStatus>('sync_map_root', { rootId, library }),
+  /** `forceWrite` rewrites this machine's file even when nothing changed (the Sync now
+   *  button); window focus passes false. */
+  syncNow: (forceWrite: boolean) => invoke<SyncStatus>('sync_now', { forceWrite }),
+  syncForgetDevice: (deviceId: string) => invoke<SyncStatus>('sync_forget_device', { deviceId }),
   dlnaStatus: () => invoke<DlnaStatus>('dlna_status'),
   dlnaSetEnabled: (enabled: boolean) => invoke<void>('dlna_set_enabled', { enabled }),
   dlnaSetOptions: (name: string, port: number) => invoke<void>('dlna_set_options', { name, port }),

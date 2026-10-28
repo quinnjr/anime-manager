@@ -67,8 +67,9 @@ pub fn remux_cache_dir() -> std::path::PathBuf {
 /// One `ffmpeg -version` probe; called once at server startup and cached in
 /// the connection context, never per request.
 pub fn ffmpeg_available() -> bool {
-    std::process::Command::new("ffmpeg")
-        .arg("-version")
+    let mut cmd = std::process::Command::new("ffmpeg");
+    crate::player::no_console_window(&mut cmd);
+    cmd.arg("-version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -135,7 +136,9 @@ pub fn evict_remux_cache(cache: &std::path::Path, cap_bytes: u64) {
 /// burned into the picture, while anything else passes through as mov_text.
 /// ffprobe absent or failing means mov_text, never a hard error.
 pub(crate) fn has_ass_subtitles(src: &std::path::Path) -> bool {
-    let out = std::process::Command::new("ffprobe")
+    let mut cmd = std::process::Command::new("ffprobe");
+    crate::player::no_console_window(&mut cmd);
+    let out = cmd
         .args(["-v", "error", "-nostdin", "-show_streams", "-of", "json"])
         .arg(src)
         .output();
@@ -154,6 +157,13 @@ pub(crate) fn has_ass_subtitles(src: &std::path::Path) -> bool {
 /// hostile file name injects extra filters.
 pub(crate) fn escape_filter_path(p: &std::path::Path) -> String {
     let s = p.to_string_lossy();
+    // ffmpeg takes forward slashes on Windows, which spares a backslash two
+    // levels of filter escaping; on Linux a backslash is a file-name character.
+    let s: std::borrow::Cow<str> = if crate::paths::is_windows_abs(&s) {
+        s.replace('\\', "/").into()
+    } else {
+        s
+    };
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
         if matches!(c, '\\' | '\'' | ':' | ',' | '[' | ']' | ';' | '=') {
@@ -194,6 +204,7 @@ pub(crate) fn build_ffmpeg_cmd(
     tmp: &std::path::Path,
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("ffmpeg");
+    crate::player::no_console_window(cmd.as_std_mut());
     cmd.args(["-y", "-nostdin", "-i"])
         .arg(src)
         .args(["-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac"]);
@@ -230,6 +241,10 @@ fn publish_remux(
     Ok(dst.to_path_buf())
 }
 
+/// Blocking twin of `ensure_remux_async`, kept for the tests that drive the
+/// transcode directly; the serve path only uses the async one.
+#[cfg(test)]
+#[cfg_attr(windows, allow(dead_code))] // its tests use unix-only fakes
 pub(crate) fn ensure_remux(
     src: &std::path::Path,
     dst: &std::path::Path,
@@ -376,6 +391,8 @@ pub(crate) fn sweep_stale_tmps(dir: &std::path::Path, dst: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
+    // Most helpers serve the unix-only fake-ffmpeg tests.
+    #[cfg_attr(windows, allow(unused_imports))]
     use crate::dlna::test_helpers::*;
 
     #[test]
@@ -430,17 +447,14 @@ mod tests {
         // In-progress writes and non-mp4 files are never counted or deleted.
         std::fs::write(dir.path().join("wip.tmp"), vec![7u8; 100]).unwrap();
         std::fs::write(dir.path().join("note.txt"), vec![7u8; 100]).unwrap();
-        let stamp = |n: &str, d: &str| {
-            let out = std::process::Command::new("touch")
-                .args(["-d", d])
-                .arg(dir.path().join(n))
-                .output()
+        let stamp = |n: &str, secs: u64| {
+            let f = std::fs::File::options().write(true).open(dir.path().join(n)).unwrap();
+            f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
                 .unwrap();
-            assert!(out.status.success());
         };
-        stamp("old.mp4", "2001-01-01 00:00:00");
-        stamp("mid.mp4", "2002-01-01 00:00:00");
-        stamp("new.mp4", "2003-01-01 00:00:00");
+        stamp("old.mp4", 978_307_200); // 2001-01-01
+        stamp("mid.mp4", 1_009_843_200); // 2002-01-01
+        stamp("new.mp4", 1_041_379_200); // 2003-01-01
         crate::dlna::evict_remux_cache(dir.path(), 20);
         assert!(!dir.path().join("old.mp4").exists());
         assert!(dir.path().join("mid.mp4").exists());
@@ -452,6 +466,8 @@ mod tests {
         assert!(dir.path().join("new.mp4").exists());
     }
 
+    // The fakes are /bin/sh scripts, and Windows resolves `ffmpeg` only as ffmpeg.exe.
+    #[cfg(unix)]
     #[test]
     fn ffmpeg_probe_sees_fake_on_path_and_fails_closed() {
         let empty = tempfile::tempdir().unwrap();
@@ -462,6 +478,8 @@ mod tests {
         assert!(crate::dlna::ffmpeg_available());
     }
 
+    // The fakes are /bin/sh scripts, and Windows resolves `ffmpeg` only as ffmpeg.exe.
+    #[cfg(unix)]
     #[test]
     fn ensure_remux_writes_cache_and_reuses_it() {
         let fake = fake_ffmpeg_dir();
@@ -497,6 +515,8 @@ mod tests {
         }
     }
 
+    // The fakes are /bin/sh scripts, and Windows resolves `ffmpeg` only as ffmpeg.exe.
+    #[cfg(unix)]
     #[test]
     fn concurrent_remux_same_dst_yields_one_valid_file() {
         // ~200ms of overlap is plenty for 4 threads to collide on the lock;
@@ -524,6 +544,8 @@ mod tests {
         assert_no_tmp_leftovers(dir.path());
     }
 
+    // The fakes are /bin/sh scripts, and Windows resolves `ffmpeg` only as ffmpeg.exe.
+    #[cfg(unix)]
     #[tokio::test]
     async fn transcode_timeout_kills_child_and_cleans_tmp() {
         // The fake sleeps 5s; the 300ms timeout must kill it, reap it, and
@@ -543,6 +565,8 @@ mod tests {
         assert_no_tmp_leftovers(dir.path());
     }
 
+    // The fakes are /bin/sh scripts, and Windows resolves `ffmpeg` only as ffmpeg.exe.
+    #[cfg(unix)]
     #[tokio::test]
     async fn retry_after_timeout_starts_a_fresh_encode() {
         // A timed-out attempt must release the per-dst lock and clean its tmp
@@ -641,6 +665,8 @@ mod tests {
         }
     }
 
+    // The fakes are /bin/sh scripts, and Windows resolves `ffmpeg` only as ffmpeg.exe.
+    #[cfg(unix)]
     #[test]
     fn ensure_remux_failure_cleans_tmp() {
         let fake = fake_failing_ffmpeg_dir();
@@ -655,6 +681,8 @@ mod tests {
         assert_no_tmp_leftovers(dir.path());
     }
 
+    // The fakes are /bin/sh scripts, and Windows resolves `ffmpeg` only as ffmpeg.exe.
+    #[cfg(unix)]
     #[test]
     fn ass_subtitles_select_burn_in_over_mov_text() {
         let src = std::path::Path::new("/lib/ASS Show/01.mkv");
