@@ -3,9 +3,8 @@ import type { AppError } from '$lib/api';
 export type ToastKind = 'info' | 'warning' | 'error' | 'success';
 export interface Toast { id: number; kind: ToastKind; message: string }
 
-/** How long a kind stays before it dismisses itself. Errors and successes stay until clicked:
- *  an error must be read, and a success often reports counts the user wants to check. */
-export const LIFETIME_MS: Partial<Record<ToastKind, number>> = { info: 5000, warning: 8000 };
+/** How long a kind stays before it dismisses itself. Errors stay until clicked: they must be read. */
+export const LIFETIME_MS: Partial<Record<ToastKind, number>> = { info: 5000, success: 6000, warning: 8000 };
 /** What a timer resumes with at least, so a toast does not vanish the moment the pointer leaves. */
 export const RESUME_GRACE_MS = 1500;
 

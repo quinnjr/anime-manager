@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { toasts, LIFETIME_MS, RESUME_GRACE_MS } from './toasts.svelte';
 
 const INFO = LIFETIME_MS.info!;
+const SUCCESS = LIFETIME_MS.success!;
 const WARNING = LIFETIME_MS.warning!;
 
 describe('toasts', () => {
@@ -30,22 +31,24 @@ describe('toasts', () => {
     expect(toasts.list[0].message).toBe('m3');
   });
 
-  it('dismisses info and warning on their own, warning later', () => {
+  it('dismisses info, success and warning on their own, each after its own lifetime', () => {
     toasts.push('info', 'i');
+    toasts.push('success', 's');
     toasts.push('warning', 'w');
     vi.advanceTimersByTime(INFO - 1);
-    expect(toasts.list.map((t) => t.message)).toEqual(['i', 'w']);
+    expect(toasts.list.map((t) => t.message)).toEqual(['i', 's', 'w']);
     vi.advanceTimersByTime(1);
+    expect(toasts.list.map((t) => t.message)).toEqual(['s', 'w']);
+    vi.advanceTimersByTime(SUCCESS - INFO);
     expect(toasts.list.map((t) => t.message)).toEqual(['w']);
-    vi.advanceTimersByTime(WARNING - INFO);
+    vi.advanceTimersByTime(WARNING - SUCCESS);
     expect(toasts.list).toEqual([]);
   });
 
-  it('keeps errors and successes until clicked', () => {
+  it('keeps errors until clicked', () => {
     toasts.push('error', 'e');
-    toasts.push('success', 's');
     vi.advanceTimersByTime(10 * WARNING);
-    expect(toasts.list.length).toBe(2);
+    expect(toasts.list.length).toBe(1);
   });
 
   it('holds the countdown while paused and resumes with what was left', () => {

@@ -4,7 +4,7 @@
   const edge = { info: 'border-l-muted', warning: 'border-l-sub', error: 'border-l-alarm', success: 'border-l-live' };
 </script>
 
-<!-- Pointer or keyboard focus on the stack holds the info/warning countdowns while it is read. -->
+<!-- Pointer or keyboard focus on the stack holds the auto-dismiss countdowns while it is read. -->
 <div
   class="fixed right-5 bottom-5 z-50 flex w-80 flex-col gap-2"
   role="region"
