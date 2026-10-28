@@ -12,6 +12,7 @@ pub mod nyaa;
 pub mod parser;
 pub mod paths;
 pub mod player;
+pub mod player_detect;
 pub mod rename;
 pub mod scanner;
 pub mod sync;
@@ -99,6 +100,7 @@ pub fn run() {
             commands::set_setting,
             commands::purge_missing,
             commands::play,
+            commands::detect_players,
             commands::search_metadata,
             commands::rematch,
             commands::preview_rename,

@@ -46,6 +46,7 @@ name = "anime-manager"
 version = "0.12.4"
 dependencies = [
  "dirs",
+ "libc",
  "mdns-sd",
  "once_cell",
  "regex",
