@@ -6,12 +6,12 @@ Status: approved in brainstorming
 ## Goal
 
 A desktop app (Tauri 2 + Svelte 5 + Tailwind 4) that scans local folders for anime
-episodes, normalizes them into Show → Season → Episode, plays them in mpv, tracks
+episodes, normalizes them into Show → Season → Episode, plays them in an external player, tracks
 played/unplayed state automatically (including reverting to unplayed when playback is
 interrupted), and can optionally rename files on disk to a canonical layout.
 
-Platform for v1: Linux. The player is mpv, VLC or MPC-HC, detected as described under
-Playback (overridable in settings).
+Platforms: Linux and Windows. The player is mpv, VLC or MPC-HC (Windows only), detected as
+described under Playback (overridable in settings).
 
 ## Non-goals (v1)
 
@@ -301,21 +301,23 @@ and says so in a `notice`. The choice and the command paths (`mpv_path`, `vlc_pa
 
 Detection (`player_detect.rs`) finds a player by location and never runs it — MPC-HC has no
 `--version`, and VLC on Windows opens a window for one. A command containing a path separator
-is that file and nothing else; a bare name is searched on `PATH` (with `PATHEXT` on Windows),
-then, for the player's default name only (in any case, with or without `.exe`), in its usual
-Windows install folders. On Windows (the build target, not `PATHEXT`) a bare name means `<name>.exe`, then `<name>.com`; an
+is that file (on Windows, that file with `.exe` added when it has no extension); a bare name is
+searched on `PATH`, then, for the player's default name only (in any case, with or without
+`.exe`), in its usual Windows install folders. On Windows (the build target, never `PATHEXT`,
+which a Linux shell can inherit from WSL) a bare name means `<name>.exe`, then `<name>.com`; an
 extensionless file is never chosen. It runs on every Play, when Settings opens, after a Save,
 and from Detect again.
 
 Since detection runs nothing, a broken install is caught at Play: every usable player is tried
-in order, moving on only when one never started (it could not be spawned, or exited 126/127 or
-by a signal before its control socket opened), with a `notice` for each hand-over. Any other
-exit means it ran and gave up (mpv exits 2 on a file it cannot play), and a player that ran
-untracked also ends the attempt: another would fail on the same file or replay the episode.
+in order, moving on only when one never started (it could not be spawned, or before its control
+channel opened it exited 126/127, by a signal, or on Windows with a loader NTSTATUS such as
+`STATUS_DLL_NOT_FOUND`), with a `notice` for each hand-over. Any other exit means it ran and
+gave up (mpv exits 2 on a file it cannot play), and a player that ran untracked also ends the
+attempt: another would fail on the same file or replay the episode.
 
-MPC-HC is detected and can be picked, but nothing drives it yet: its control interface is
-Windows window messages (`/slave`), and driving it must keep the untracked-playback rule.
-Until then a play never lands on it.
+MPC-HC plays only on Windows, where it is driven over `/slave` as described above. Elsewhere it
+is detected but never chosen: Automatic skips it, and picking it by name falls back along the
+order with a `notice` that its playback needs Windows.
 
 ## Metadata providers
 
