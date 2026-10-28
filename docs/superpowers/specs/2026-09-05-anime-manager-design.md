@@ -10,7 +10,8 @@ episodes, normalizes them into Show → Season → Episode, plays them in mpv, t
 played/unplayed state automatically (including reverting to unplayed when playback is
 interrupted), and can optionally rename files on disk to a canonical layout.
 
-Platform for v1: Linux. mpv is resolved from `$PATH` (overridable in settings).
+Platform for v1: Linux. The player is mpv, VLC or MPC-HC, detected as described under
+Playback (overridable in settings).
 
 ## Non-goals (v1)
 
@@ -64,6 +65,12 @@ shows       (id, parsed_title UNIQUE, anilist_id, match_source, canonical_title,
              -- next play. player_volume NULL means nothing recorded yet, so mpv's own
              -- defaults still apply. A duplicate-show fold adopts the folded row's set only
              -- when the survivor has none of its own; otherwise the survivor's is kept.
+             -- Fold survivor within a group of rows sharing (match_source, anilist_id): once
+             -- any parse_overrides(source='merge') row pins a title in the group, the title
+             -- most pinned wins, ties broken by parsed_title ascending, and episode counts are
+             -- ignored; a group with no pins prefers most episodes, then parsed_title ascending.
+             -- Never row id or (once pinned) local counts: they differ per machine, and with sync
+             -- two machines must pick the same survivor or they undo each other.
 seasons     (id, show_id → shows, number, UNIQUE(show_id, number))
 episodes    (id, season_id → seasons, number, path UNIQUE, size, mtime,
              release_group, resolution, crc,
@@ -234,17 +241,28 @@ These are load-bearing; each exists because its absence destroys user data.
   exactly as it was, with an error explaining why.
 - **A cleared AniList match stays cleared.** `shows.anilist_cleared` excludes the show from
   auto-matching until the user picks a match by hand.
+- **A record is never deleted by a disappearance.** Missing files, purges and pruning are local;
+  only an explicit user action changes a synced episode record.
+- **`missing` and `playing` never leave the machine.** They describe a mount and a process, not
+  the user's judgement.
+- **An unreadable device file is skipped, not emptied.** A half-written or corrupt file must not
+  read as "this machine has no state".
+- **Sync keys shows on `parsed_title`.** Same reason as the existing identity rule.
+- **Only the owning machine writes its device file.**
+- **Joining never overrides the share's conclusions.** A newcomer reads before it publishes and
+  only fills keys the share lacks; its episodes compete on real viewing times.
 
 ## Playback
 
 1. `play(episode_id)`: reject if another episode is `playing`. Set `playing`, emit
    `playback-changed`.
-2. Spawn `mpv --input-ipc-server=<runtime_dir>/anime-manager/<id>.sock
+2. Spawn `mpv --input-ipc-server=<runtime_dir>/anime-manager/<pid>-<id>.sock
    --start=<position_secs> --force-window [<show player state>] <path>`. The player state
    restores the show's last `--volume`, and exactly one of `--fullscreen`,
    `--window-maximized` or `--geometry` (fullscreen wins over maximized, which wins over
    size). It is omitted entirely until a play has recorded it. `runtime_dir` is
-   `$XDG_RUNTIME_DIR` or `/tmp`.
+   `$XDG_RUNTIME_DIR` or `/tmp`. On Windows the control channel is a named pipe for mpv and
+   loopback TCP (`--rc-host`) for VLC, and players start without a console window.
 3. Background task connects to the socket (retry for 5 s), issues
    `get_property time-pos`, `duration`, `volume`, `osd-width`/`osd-height`,
    `window-maximized`, `window-minimized` and `fullscreen` every 5 s, persists
@@ -258,7 +276,33 @@ These are load-bearing; each exists because its absence destroys user data.
 5. On app start, any `playing` rows are reset to `unplayed` (crash recovery).
 
 `set_status(episode_id, status)` is always available for manual override.
-mpv missing → `AppError::Player`, no state change.
+No usable player → `AppError::Player` naming every place checked, no state change.
+
+### Choosing the player
+
+`player_backend` is `auto` (the default, and what any missing or unknown value means), or one
+of `mpv`, `vlc`, `mpc-hc`. Automatic plays with the first player found in the order
+mpv → VLC → MPC-HC; a player picked by name that is missing falls back along that same order
+and says so in a `notice`. The choice and the command paths (`mpv_path`, `vlc_path`,
+`mpc_hc_path`) are per machine and never sync.
+
+Detection (`player_detect.rs`) finds a player by location and never runs it — MPC-HC has no
+`--version`, and VLC on Windows opens a window for one. A command containing a path separator
+is that file and nothing else; a bare name is searched on `PATH` (with `PATHEXT` on Windows),
+then, for the player's default name only (in any case, with or without `.exe`), in its usual
+Windows install folders. On Windows (the build target, not `PATHEXT`) a bare name means `<name>.exe`, then `<name>.com`; an
+extensionless file is never chosen. It runs on every Play, when Settings opens, after a Save,
+and from Detect again.
+
+Since detection runs nothing, a broken install is caught at Play: every usable player is tried
+in order, moving on only when one never started (it could not be spawned, or exited 126/127 or
+by a signal before its control socket opened), with a `notice` for each hand-over. Any other
+exit means it ran and gave up (mpv exits 2 on a file it cannot play), and a player that ran
+untracked also ends the attempt: another would fail on the same file or replay the episode.
+
+MPC-HC is detected and can be picked, but nothing drives it yet: its control interface is
+Windows window messages (`/slave`), and driving it must keep the untracked-playback rule.
+Until then a play never lands on it.
 
 ## Metadata providers
 
