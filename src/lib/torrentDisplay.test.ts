@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { TorrentEntry } from '$lib/api';
+import type { TorrentEntry } from '#lib/api.ts';
 import { batchSendKey, formatEta, formatSpeed, isSavePathInsideRoots, matchBatch, sendButtonState, torrentBadge, torrentsForShow } from './torrentDisplay';
 
 describe('torrentBadge', () => {

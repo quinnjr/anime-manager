@@ -1,10 +1,10 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, onEvent, SHOW_SORTS, LIBRARY_SORT_KEY, type ShowCard as ShowCardT, type ShowSort } from '$lib/api';
-  import { isTypingTarget } from '$lib/keys';
-  import { toasts } from '$lib/stores/toasts.svelte';
-  import { saveShelfScroll, restoreAfterLoad } from '$lib/shelfScroll';
-  import ShowCard from '$lib/components/ShowCard.svelte';
+  import { api, onEvent, SHOW_SORTS, LIBRARY_SORT_KEY, type ShowCard as ShowCardT, type ShowSort } from '#lib/api.ts';
+  import { isTypingTarget } from '#lib/keys.ts';
+  import { toasts } from '#lib/stores/toasts.svelte.ts';
+  import { saveShelfScroll, restoreAfterLoad } from '#lib/shelfScroll.ts';
+  import ShowCard from '#lib/components/ShowCard.svelte';
 
   let shows = $state<ShowCardT[]>([]);
   let filter = $state('');

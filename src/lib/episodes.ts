@@ -1,4 +1,4 @@
-import type { Episode, SeasonDetail } from '$lib/api';
+import type { Episode, SeasonDetail } from '#lib/api.ts';
 
 /** One episode number, and every file that claims to be it. */
 export interface EpisodeGroup {

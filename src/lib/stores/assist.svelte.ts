@@ -1,4 +1,4 @@
-import type { AssistProgress, InspectReport } from '$lib/api';
+import type { AssistProgress, InspectReport } from '#lib/api.ts';
 
 let current = $state<AssistProgress>({ done: 0, total: 0, folder: '', running: false });
 

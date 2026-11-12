@@ -1,7 +1,7 @@
 <script lang="ts">
-  import EpisodeRow from '$lib/components/EpisodeRow.svelte';
-  import { groupEpisodes } from '$lib/episodes';
-  import type { SeasonDetail } from '$lib/api';
+  import EpisodeRow from '#lib/components/EpisodeRow.svelte';
+  import { groupEpisodes } from '#lib/episodes.ts';
+  import type { SeasonDetail } from '#lib/api.ts';
 
   // The keyboard cursor arrives as the highlighted episode's id, not a position: an index would
   // only agree with the caller's list while both sides flattened the seasons the same way.

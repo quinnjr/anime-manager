@@ -2,20 +2,20 @@
   import { onMount } from 'svelte';
   import { page } from '$app/state';
   import { goto } from '$app/navigation';
-  import { api, onEvent, type ShowDetail, type RenameTarget, type ResolutionRow, type RssFeedView, type RssSubscribeResult, type SourceComparison, type TorrentAddArgs, type TorrentControlOp, type TorrentEntry, type TorrentPrefs, type WantedEpisode, type WantedHit } from '$lib/api';
+  import { api, onEvent, type ShowDetail, type RenameTarget, type ResolutionRow, type RssFeedView, type RssSubscribeResult, type SourceComparison, type TorrentAddArgs, type TorrentControlOp, type TorrentEntry, type TorrentPrefs, type WantedEpisode, type WantedHit } from '#lib/api.ts';
   import { openUrl } from '@tauri-apps/plugin-opener';
-  import { toasts } from '$lib/stores/toasts.svelte';
-  import { playback } from '$lib/stores/playback.svelte';
-  import { isTypingTarget } from '$lib/keys';
-  import RematchModal from '$lib/components/RematchModal.svelte';
-  import RenameModal from '$lib/components/RenameModal.svelte';
-  import Cover from '$lib/components/Cover.svelte';
-  import { flatten } from '$lib/episodes';
-  import { extractResolution, formatSize, formatSourceComparison, parseBatchRange, summariseWanted } from '$lib/nyaaDisplay';
-  import { batchSendKey, isSavePathInsideRoots, matchBatch, sendButtonState, torrentsForShow } from '$lib/torrentDisplay';
-  import { errMessage } from '$lib/errors';
-  import SeasonList from '$lib/components/SeasonList.svelte';
-  import TorrentRow from '$lib/components/TorrentRow.svelte';
+  import { toasts } from '#lib/stores/toasts.svelte.ts';
+  import { playback } from '#lib/stores/playback.svelte.ts';
+  import { isTypingTarget } from '#lib/keys.ts';
+  import RematchModal from '#lib/components/RematchModal.svelte';
+  import RenameModal from '#lib/components/RenameModal.svelte';
+  import Cover from '#lib/components/Cover.svelte';
+  import { flatten } from '#lib/episodes.ts';
+  import { extractResolution, formatSize, formatSourceComparison, parseBatchRange, summariseWanted } from '#lib/nyaaDisplay.ts';
+  import { batchSendKey, isSavePathInsideRoots, matchBatch, sendButtonState, torrentsForShow } from '#lib/torrentDisplay.ts';
+  import { errMessage } from '#lib/errors.ts';
+  import SeasonList from '#lib/components/SeasonList.svelte';
+  import TorrentRow from '#lib/components/TorrentRow.svelte';
 
   const id = $derived(Number(page.params.id));
   let show = $state<ShowDetail | null>(null);
@@ -225,10 +225,11 @@
 
   // Always a fresh navigation to the shelf: the previous history entry is often not the
   // shelf (merge redirects, settings, reload-kept history), and scroll position is
-  // restored from sessionStorage when the shelf repopulates either way. noScroll opts out
-  // of SvelteKit's built-in scroll-to-top so it cannot contend with that restore.
+  // restored from sessionStorage when the shelf repopulates either way. `reset: false`
+  // (SvelteKit 3's replacement for noScroll) opts out of the built-in scroll-to-top so
+  // it cannot contend with that restore.
   async function goBack(): Promise<void> {
-    await goto('/', { noScroll: true }).catch((e) => toasts.error(e));
+    await goto('/', { reset: false }).catch((e) => toasts.error(e));
   }
 
   async function saveTitle() {

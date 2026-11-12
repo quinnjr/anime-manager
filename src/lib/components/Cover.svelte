@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { coverSources, type HasCover } from '$lib/cover';
+  import { coverSources, type HasCover } from '#lib/cover.ts';
 
   let { show, class: klass = '' }: { show: HasCover; class?: string } = $props();
 

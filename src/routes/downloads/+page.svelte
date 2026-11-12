@@ -1,10 +1,10 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, onEvent, type TorrentControlOp, type TorrentEntry } from '$lib/api';
-  import { toasts } from '$lib/stores/toasts.svelte';
-  import { errMessage } from '$lib/errors';
-  import { TORRENT_POLL_MS, torrentPollDelay } from '$lib/torrentPoll';
-  import TorrentRow from '$lib/components/TorrentRow.svelte';
+  import { api, onEvent, type TorrentControlOp, type TorrentEntry } from '#lib/api.ts';
+  import { toasts } from '#lib/stores/toasts.svelte.ts';
+  import { errMessage } from '#lib/errors.ts';
+  import { TORRENT_POLL_MS, torrentPollDelay } from '#lib/torrentPoll.ts';
+  import TorrentRow from '#lib/components/TorrentRow.svelte';
 
   let torrents = $state<TorrentEntry[]>([]);
   let loading = $state(false);
