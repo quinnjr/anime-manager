@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { SourceComparison, WantedHit } from '$lib/api';
+import type { SourceComparison, WantedHit } from '#lib/api.ts';
 import { formatSize, formatSourceComparison, parseBatchRange, summariseWanted } from './nyaaDisplay';
 
 const hit = (title: string): WantedHit => ({

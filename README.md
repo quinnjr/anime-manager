@@ -8,7 +8,7 @@ Settings takes an API key for any OpenAI-compatible provider. Presets are offere
 ## Requirements
 - Linux or Windows 10/11, with mpv or VLC (on `PATH`, or set the path in Settings; on Windows
   VLC is also found in its default Program Files location)
-- Rust 1.88+ (let-chains), Node 22+, pnpm
+- Rust 1.97+, Node 22+, pnpm
 - Windows builds: Visual Studio 2022 Build Tools with the C++ workload and a Windows SDK, and
   Python 3 for the player tests' fake mpv/VLC
 

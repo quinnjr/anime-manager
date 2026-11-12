@@ -6,8 +6,9 @@ authors = ["Joseph R. Quinn <quinn.josephr@gmail.com>"]
 license = "MIT"
 repository = ""
 edition = "2024"
-# let-chains are used throughout (commands.rs, db.rs, parser.rs)
-rust-version = "1.88"
+# Edition 2024 resolves MSRV-aware: a dependency needing a newer Rust than
+# this is held back by `cargo update`, so raise it to pick those up.
+rust-version = "1.97"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -16,27 +17,27 @@ name = "anime_manager_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2.6.3", features = [] }
+tauri-build = { version = "2.7.4", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["protocol-asset"] }
-tauri-plugin-dialog = "2"
-tauri-plugin-single-instance = "2"
+tauri = { version = "2.12", features = ["protocol-asset"] }
+tauri-plugin-dialog = "2.8"
+tauri-plugin-single-instance = "2.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.42", features = ["bundled"] }
 walkdir = "2"
 regex = "1"
 once_cell = "1"
-sha1 = "0.10"
+sha1 = "0.11"
 serde-xml-fast = "2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "multipart", "query"] }
 tokio = { version = "1", features = ["process", "net", "io-util", "time", "sync", "macros"] }
 thiserror = "2"
-dirs = "6"
+dirs = "7"
 mdns-sd = "0.21"
 uuid = { version = "1", features = ["v4"] }
-tauri-plugin-opener = "2.5.5"
+tauri-plugin-opener = "2.7.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

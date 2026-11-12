@@ -1,4 +1,4 @@
-import type { MatchProgress } from '$lib/api';
+import type { MatchProgress } from '#lib/api.ts';
 
 const idle: MatchProgress = { done: 0, total: 0, title: '', phase: '', changed: null, running: false };
 let current = $state<MatchProgress>(idle);

@@ -1,6 +1,6 @@
 <script lang="ts">
-  import type { ShowCard } from '$lib/api';
-  import Cover from '$lib/components/Cover.svelte';
+  import type { ShowCard } from '#lib/api.ts';
+  import Cover from '#lib/components/Cover.svelte';
   let { show }: { show: ShowCard } = $props();
 </script>
 

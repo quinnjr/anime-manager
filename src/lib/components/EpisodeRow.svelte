@@ -1,9 +1,9 @@
 <script lang="ts">
-  import { api, type Episode } from '$lib/api';
-  import { playback } from '$lib/stores/playback.svelte';
-  import { toasts } from '$lib/stores/toasts.svelte';
+  import { api, type Episode } from '#lib/api.ts';
+  import { playback } from '#lib/stores/playback.svelte.ts';
+  import { toasts } from '#lib/stores/toasts.svelte.ts';
   import { revealItemInDir } from '@tauri-apps/plugin-opener';
-  import { basename } from '$lib/paths';
+  import { basename } from '#lib/paths.ts';
 
   let { episode, highlighted = false, onRename }: { episode: Episode; highlighted?: boolean; onRename: () => void } = $props();
 

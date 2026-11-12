@@ -1,4 +1,4 @@
-import type { LinkedBatch, LinkedTo, TorrentEntry } from '$lib/api';
+import type { LinkedBatch, LinkedTo, TorrentEntry } from '#lib/api.ts';
 import { isWithin } from './paths';
 
 /** Sending-state key for a pack send, shared by the strip button and the

@@ -1,4 +1,4 @@
-import type { AppError } from '$lib/api';
+import type { AppError } from '#lib/api.ts';
 
 export type ToastKind = 'info' | 'warning' | 'error' | 'success';
 export interface Toast { id: number; kind: ToastKind; message: string }

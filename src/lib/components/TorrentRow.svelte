@@ -1,7 +1,7 @@
 <script lang="ts">
-  import type { TorrentControlOp, TorrentEntry } from '$lib/api';
-  import { formatEta, formatSpeed, torrentBadge } from '$lib/torrentDisplay';
-  import { formatSize } from '$lib/nyaaDisplay';
+  import type { TorrentControlOp, TorrentEntry } from '#lib/api.ts';
+  import { formatEta, formatSpeed, torrentBadge } from '#lib/torrentDisplay.ts';
+  import { formatSize } from '#lib/nyaaDisplay.ts';
 
   let {
     entry,

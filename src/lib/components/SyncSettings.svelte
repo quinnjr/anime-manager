@@ -1,9 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { ask, open } from '@tauri-apps/plugin-dialog';
-  import { api, onEvent, type SyncStatus } from '$lib/api';
-  import { lastWrote, otherDevices, syncHealth, whenText } from '$lib/sync';
-  import { toasts } from '$lib/stores/toasts.svelte';
+  import { api, onEvent, type SyncStatus } from '#lib/api.ts';
+  import { lastWrote, otherDevices, syncHealth, whenText } from '#lib/sync.ts';
+  import { toasts } from '#lib/stores/toasts.svelte.ts';
 
   let status = $state<SyncStatus | null>(null);
   let folder = $state('');

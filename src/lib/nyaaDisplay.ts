@@ -1,4 +1,4 @@
-import type { SourceComparison, WantedEpisode } from '$lib/api';
+import type { SourceComparison, WantedEpisode } from '#lib/api.ts';
 
 export interface BatchRange { first: number; last: number }
 

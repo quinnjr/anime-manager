@@ -1,8 +1,8 @@
 <script lang="ts">
   import { untrack } from 'svelte';
-  import { api, type MetadataHit, type MetadataSource } from '$lib/api';
-  import { toasts } from '$lib/stores/toasts.svelte';
-  import ModalShell from '$lib/components/ModalShell.svelte';
+  import { api, type MetadataHit, type MetadataSource } from '#lib/api.ts';
+  import { toasts } from '#lib/stores/toasts.svelte.ts';
+  import ModalShell from '#lib/components/ModalShell.svelte';
 
   let { showId, initialQuery, open = $bindable(false), onDone }: { showId: number; initialQuery: string; open?: boolean; onDone: () => void } = $props();
   let query = $state('');

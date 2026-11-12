@@ -18,7 +18,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings  
 
 Single test: `cargo test --manifest-path src-tauri/Cargo.toml parser::tests::episode_word -- --test-threads=1`, or `pnpm test src/lib/keys.test.ts`.
 
-Requires Rust 1.88+ (let-chains are used in `commands.rs`, `db.rs`, `parser.rs`) and mpv on `$PATH`.
+Requires Rust 1.97+ (the MSRV in `src-tauri/Cargo.toml`; Cargo's MSRV-aware resolver holds back any dependency that needs newer) and mpv on `$PATH`.
 
 On Windows, run cargo from PowerShell, not Git Bash: Git's `/usr/bin/link` shadows the MSVC
 linker and every build script fails to link. The player tests launch the fakes through
