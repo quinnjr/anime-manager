@@ -3,21 +3,21 @@
   import { onMount } from 'svelte';
   import { beforeNavigate } from '$app/navigation';
   import { getCurrentWindow } from '@tauri-apps/api/window';
-  import { api, onEvent, type SyncStatus, type PlaybackChanged, type AppError, type InspectReport, type AssistProgress, type MatchProgress } from '$lib/api';
-  import { saveShelfScroll } from '$lib/shelfScroll';
-  import { playback } from '$lib/stores/playback.svelte';
-  import { assist, assistErrorMessages } from '$lib/stores/assist.svelte';
-  import { matching } from '$lib/stores/matching.svelte';
-  import { toasts } from '$lib/stores/toasts.svelte';
+  import { api, onEvent, type SyncStatus, type PlaybackChanged, type AppError, type InspectReport, type AssistProgress, type MatchProgress } from '#lib/api.ts';
+  import { saveShelfScroll } from '#lib/shelfScroll.ts';
+  import { playback } from '#lib/stores/playback.svelte.ts';
+  import { assist, assistErrorMessages } from '#lib/stores/assist.svelte.ts';
+  import { matching } from '#lib/stores/matching.svelte.ts';
+  import { toasts } from '#lib/stores/toasts.svelte.ts';
   import {
     DEFAULT_AUTO_SCAN_MINS, RETRY_SOON_MINS,
     parseAutoScanMins, planPass, toTimeoutMs, withTimeout, SCAN_TIMEOUT_MS
-  } from '$lib/autoScan';
-  import { detectCompletions, QUIET_WINDOW_MS, WATCH_INTERVAL_MS, watchGatesPass, type WatchBaseline } from '$lib/torrentWatch';
-  import { isTestedFlag } from '$lib/llmModels';
-  import { scanSlot } from '$lib/stores/scan.svelte';
-  import type { ScanSummary } from '$lib/api';
-  import Toasts from '$lib/components/Toasts.svelte';
+  } from '#lib/autoScan.ts';
+  import { detectCompletions, QUIET_WINDOW_MS, WATCH_INTERVAL_MS, watchGatesPass, type WatchBaseline } from '#lib/torrentWatch.ts';
+  import { isTestedFlag } from '#lib/llmModels.ts';
+  import { scanSlot } from '#lib/stores/scan.svelte.ts';
+  import type { ScanSummary } from '#lib/api.ts';
+  import Toasts from '#lib/components/Toasts.svelte';
 
   let { children } = $props();
 

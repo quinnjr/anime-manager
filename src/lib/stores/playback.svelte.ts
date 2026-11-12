@@ -1,4 +1,4 @@
-import type { EpisodeStatus, PlaybackChanged } from '$lib/api';
+import type { EpisodeStatus, PlaybackChanged } from '#lib/api.ts';
 
 export interface EpState { status: EpisodeStatus; position_secs: number; duration_secs: number | null }
 

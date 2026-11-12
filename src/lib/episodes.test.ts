@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { groupEpisodes, flatten } from './episodes';
-import type { Episode, SeasonDetail } from '$lib/api';
+import type { Episode, SeasonDetail } from '#lib/api.ts';
 
 const ep = (over: Partial<Episode>): Episode => ({
   id: 0, season_id: 1, number: 1, path: '/x.mkv', size: 1, mtime: 0,

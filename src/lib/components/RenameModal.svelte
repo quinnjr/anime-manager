@@ -1,8 +1,8 @@
 <script lang="ts">
-  import { api, type RenamePlan, type RenameTarget } from '$lib/api';
-  import { toasts } from '$lib/stores/toasts.svelte';
-  import ModalShell from '$lib/components/ModalShell.svelte';
-  import { basename } from '$lib/paths';
+  import { api, type RenamePlan, type RenameTarget } from '#lib/api.ts';
+  import { toasts } from '#lib/stores/toasts.svelte.ts';
+  import ModalShell from '#lib/components/ModalShell.svelte';
+  import { basename } from '#lib/paths.ts';
 
   let { target, open = $bindable(false), onDone }: { target: RenameTarget | null; open?: boolean; onDone: () => void } = $props();
   let plan = $state<RenamePlan | null>(null);

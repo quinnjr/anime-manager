@@ -1,4 +1,4 @@
-import type { TorrentWatchStatus } from '$lib/api';
+import type { TorrentWatchStatus } from '#lib/api.ts';
 
 /** Poll cadence for pinned-torrent status (layout-owned timer). */
 export const WATCH_INTERVAL_MS = 60_000;

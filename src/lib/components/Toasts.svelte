@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { toasts } from '$lib/stores/toasts.svelte';
+  import { toasts } from '#lib/stores/toasts.svelte.ts';
   // A rule in the state colour, so kind is legible without a coloured slab.
   const edge = { info: 'border-l-muted', warning: 'border-l-sub', error: 'border-l-alarm', success: 'border-l-live' };
 </script>

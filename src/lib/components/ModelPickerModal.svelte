@@ -1,9 +1,9 @@
 <script lang="ts">
   import { untrack } from 'svelte';
-  import { api } from '$lib/api';
-  import { toasts } from '$lib/stores/toasts.svelte';
-  import { filterModels } from '$lib/llmModels';
-  import ModalShell from '$lib/components/ModalShell.svelte';
+  import { api } from '#lib/api.ts';
+  import { toasts } from '#lib/stores/toasts.svelte.ts';
+  import { filterModels } from '#lib/llmModels.ts';
+  import ModalShell from '#lib/components/ModalShell.svelte';
 
   let {
     apiKey, baseUrl, current, open = $bindable(false), onPick

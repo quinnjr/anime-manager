@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { matching } from './matching.svelte';
 
-const step = (over: Partial<import('$lib/api').MatchProgress> = {}) => ({
+const step = (over: Partial<import('#lib/api.ts').MatchProgress> = {}) => ({
   done: 3, total: 255, title: 'Yuru Yuri', phase: 'matching', changed: 7, running: true, ...over
 });
 

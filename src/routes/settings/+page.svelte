@@ -5,19 +5,19 @@
   import {
     api, onEvent, LLM_PROVIDERS,
     type Root, type ScanProgress, type ScanSummary, type LibraryStatus, type DlnaStatus, type DetectedPlayer
-  } from '$lib/api';
-  import { toasts } from '$lib/stores/toasts.svelte';
-  import { isTestedFlag } from '$lib/llmModels';
-  import SyncSettings from '$lib/components/SyncSettings.svelte';
-  import ModelPickerModal from '$lib/components/ModelPickerModal.svelte';
-  import { matching } from '$lib/stores/matching.svelte';
-  import { DEFAULT_AUTO_SCAN_MINS, parseValidatedAutoScanMins } from '$lib/autoScan';
+  } from '#lib/api.ts';
+  import { toasts } from '#lib/stores/toasts.svelte.ts';
+  import { isTestedFlag } from '#lib/llmModels.ts';
+  import SyncSettings from '#lib/components/SyncSettings.svelte';
+  import ModelPickerModal from '#lib/components/ModelPickerModal.svelte';
+  import { matching } from '#lib/stores/matching.svelte.ts';
+  import { DEFAULT_AUTO_SCAN_MINS, parseValidatedAutoScanMins } from '#lib/autoScan.ts';
   import {
     normalizePlayerChoice, playerSaveValue, playsWith, PLAYER_CHOICES,
     DEFAULT_MPV_PATH, DEFAULT_VLC_PATH, DEFAULT_MPC_HC_PATH
-  } from '$lib/playerSettings';
-  import { scanSlot } from '$lib/stores/scan.svelte';
-  import { editedSettings } from '$lib/settingsForm';
+  } from '#lib/playerSettings.ts';
+  import { scanSlot } from '#lib/stores/scan.svelte.ts';
+  import { editedSettings } from '#lib/settingsForm.ts';
 
   let roots = $state<Root[]>([]);
   let status = $state<LibraryStatus | null>(null);
